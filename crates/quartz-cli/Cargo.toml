@@ -1,0 +1,17 @@
+[package]
+name = "quartz-cli"
+description = "Quartz 命令行：离线可跑的启动计划/实例/渲染路由演示"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "qz"
+path = "src/main.rs"
+
+[dependencies]
+quartz-core = { path = "../quartz-core" }
+clap.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+reqwest.workspace = true

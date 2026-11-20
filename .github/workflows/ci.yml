@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  core:
+    name: fmt + clippy + test (core/cli/ffi)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: fmt
+        run: cargo fmt --check
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: test
+        run: cargo test --workspace
+
+  # 五端构建矩阵（M1 起启用，占位说明如下）：
+  # android: ubuntu runner + tauri android-target（NDK），cargo check --target aarch64-linux-android
+  # ios:     macos runner（静态 JVM 交叉构建链）
+  # macos:   macos-14（Apple Silicon），cargo test + tauri build
+  # windows: windows-11-arm runner（WoA），验证 windows-aarch64 JVM 与 Dozen pack
+  # harmony: 自托管鸿蒙构建机（DevEco CLI），ArkWeb 壳 + NAPI-RS 构建
+
+  ui:
+    name: UI typecheck
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/shell-tauri/ui
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm install
+      - run: npm run build

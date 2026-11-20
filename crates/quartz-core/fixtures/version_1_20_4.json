@@ -1,0 +1,152 @@
+{
+  "_note": "合成样例数据：结构与 1.20.4 版本 JSON 一致，哈希/URL 为占位，仅供离线测试",
+  "id": "1.20.4",
+  "type": "release",
+  "mainClass": "net.minecraft.client.main.Main",
+  "releaseTime": "2023-12-07T10:03:44+00:00",
+  "arguments": {
+    "game": [
+      "--username",
+      "${auth_player_name}",
+      "--version",
+      "${version_name}",
+      "--gameDir",
+      "${game_directory}",
+      "--assetsDir",
+      "${assets_root}",
+      "--assetIndex",
+      "${assets_index_name}",
+      "--uuid",
+      "${auth_uuid}",
+      "--accessToken",
+      "${auth_access_token}",
+      "--userType",
+      "${user_type}",
+      "--versionType",
+      "${version_type}",
+      {
+        "rules": [{ "action": "allow", "features": { "is_demo_user": true } }],
+        "value": ["--demo"]
+      },
+      {
+        "rules": [{ "action": "allow", "features": { "has_custom_resolution": true } }],
+        "value": ["--width", "${resolution_width}", "--height", "${resolution_height}"]
+      }
+    ],
+    "jvm": [
+      "-Djava.library.path=${natives_directory}",
+      "-Djna.tmpdir=${natives_directory}",
+      "-Djogl.tmpdir=${natives_directory}",
+      {
+        "rules": [{ "action": "allow", "os": { "arch": "x86" } }],
+        "value": "-Xss1M"
+      },
+      "-Xmx${memory_mb}M",
+      "-cp",
+      "${classpath}"
+    ]
+  },
+  "libraries": [
+    {
+      "name": "com.mojang:brigadier:1.1.8",
+      "downloads": {
+        "artifact": {
+          "path": "com/mojang/brigadier/1.1.8/brigadier-1.1.8.jar",
+          "url": "https://libraries.minecraft.net/com/mojang/brigadier/1.1.8/brigadier-1.1.8.jar",
+          "sha1": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "size": 78432
+        }
+      }
+    },
+    {
+      "name": "com.mojang:datafixerupper:7.0.8",
+      "downloads": {
+        "artifact": {
+          "path": "com/mojang/datafixerupper/7.0.8/datafixerupper-7.0.8.jar",
+          "url": "https://libraries.minecraft.net/com/mojang/datafixerupper/7.0.8/datafixerupper-7.0.8.jar",
+          "sha1": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "size": 742580
+        }
+      }
+    },
+    {
+      "name": "org.slf4j:slf4j-api:2.0.1",
+      "url": "https://libraries.minecraft.net/",
+      "downloads": {
+        "artifact": {
+          "path": "org/slf4j/slf4j-api/2.0.1/slf4j-api-2.0.1.jar",
+          "url": "https://libraries.minecraft.net/org/slf4j/slf4j-api/2.0.1/slf4j-api-2.0.1.jar",
+          "sha1": "cccccccccccccccccccccccccccccccccccccccc",
+          "size": 61143
+        }
+      }
+    },
+    {
+      "name": "org.lwjgl:lwjgl:3.3.1",
+      "downloads": {
+        "artifact": {
+          "path": "org/lwjgl/lwjgl/3.3.1/lwjgl-3.3.1.jar",
+          "url": "https://libraries.minecraft.net/org/lwjgl/lwjgl/3.3.1/lwjgl-3.3.1.jar",
+          "sha1": "dddddddddddddddddddddddddddddddddddddddd",
+          "size": 790271
+        },
+        "classifiers": {
+          "natives-macos": {
+            "path": "org/lwjgl/lwjgl/3.3.1/lwjgl-3.3.1-natives-macos.jar",
+            "url": "https://libraries.minecraft.net/org/lwjgl/lwjgl/3.3.1/lwjgl-3.3.1-natives-macos.jar",
+            "sha1": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "size": 42143
+          },
+          "natives-macos-arm64": {
+            "path": "org/lwjgl/lwjgl/3.3.1/lwjgl-3.3.1-natives-macos-arm64.jar",
+            "url": "https://libraries.minecraft.net/org/lwjgl/lwjgl/3.3.1/lwjgl-3.3.1-natives-macos-arm64.jar",
+            "sha1": "ffffffffffffffffffffffffffffffffffffffff",
+            "size": 39182
+          },
+          "natives-windows": {
+            "path": "org/lwjgl/lwjgl/3.3.1/lwjgl-3.3.1-natives-windows.jar",
+            "url": "https://libraries.minecraft.net/org/lwjgl/lwjgl/3.3.1/lwjgl-3.3.1-natives-windows.jar",
+            "sha1": "aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111",
+            "size": 118461
+          },
+          "natives-linux": {
+            "path": "org/lwjgl/lwjgl/3.3.1/lwjgl-3.3.1-natives-linux.jar",
+            "url": "https://libraries.minecraft.net/org/lwjgl/lwjgl/3.3.1/lwjgl-3.3.1-natives-linux.jar",
+            "sha1": "bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222",
+            "size": 109996
+          }
+        }
+      }
+    },
+    {
+      "name": "ca.weblite:java-objc-bridge:1.0.0",
+      "rules": [{ "action": "allow", "os": { "name": "osx" } }],
+      "downloads": {
+        "artifact": {
+          "path": "ca/weblite/java-objc-bridge/1.0.0/java-objc-bridge-1.0.0.jar",
+          "url": "https://libraries.minecraft.net/ca/weblite/java-objc-bridge/1.0.0/java-objc-bridge-1.0.0.jar",
+          "sha1": "cccc3333cccc3333cccc3333cccc3333cccc3333",
+          "size": 49506
+        }
+      }
+    }
+  ],
+  "assetIndex": {
+    "id": "8",
+    "url": "https://piston-meta.mojang.com/v1/packages/4444444444444444444444444444444444444444/8.json",
+    "sha1": "4444444444444444444444444444444444444444",
+    "totalSize": 400000000
+  },
+  "assets": "8",
+  "javaVersion": {
+    "majorVersion": 17,
+    "component": "java-runtime-gamma"
+  },
+  "downloads": {
+    "client": {
+      "url": "https://piston-data.mojang.com/v1/objects/5555555555555555555555555555555555555555/client.jar",
+      "sha1": "5555555555555555555555555555555555555555",
+      "size": 23600000
+    }
+  }
+}

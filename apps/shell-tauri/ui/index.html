@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Quartz Launcher</title>
+    <link rel="stylesheet" href="./src/style.css" />
+  </head>
+  <body>
+    <div id="app">
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="logo">Q</div>
+          <div class="brand-text">
+            <strong>Quartz</strong>
+            <span id="os-arch">launcher</span>
+          </div>
+        </div>
+        <nav>
+          <button class="nav-item active">实例</button>
+          <button class="nav-item">下载</button>
+          <button class="nav-item">账号</button>
+          <button class="nav-item">设置</button>
+        </nav>
+        <div class="sidebar-footer">v0.1.0 · 方案 A 原型</div>
+      </aside>
+
+      <main class="main">
+        <section class="hero card">
+          <div class="hero-left">
+            <div class="field-label">当前实例</div>
+            <h1>demo</h1>
+            <div class="field-row">
+              <label class="field-label" for="mc-version">版本</label>
+              <select id="mc-version"></select>
+            </div>
+            <div class="field-row">
+              <label class="field-label" for="player">玩家</label>
+              <input id="player" value="Steve" />
+            </div>
+            <div class="field-row">
+              <label class="field-label" for="memory">内存 (MB)</label>
+              <input id="memory" type="number" value="2048" step="512" />
+            </div>
+            <button id="play" class="play-btn">生成启动计划</button>
+          </div>
+          <div class="hero-right">
+            <div class="field-label">渲染路由（renderbus）</div>
+            <div id="renderer" class="renderer">—</div>
+            <div id="renderer-note" class="muted"></div>
+          </div>
+        </section>
+
+        <section class="card log-card">
+          <div class="field-label">启动计划 / 日志</div>
+          <pre id="log">等待操作…</pre>
+        </section>
+      </main>
+    </div>
+    <script type="module" src="./src/main.ts"></script>
+  </body>
+</html>

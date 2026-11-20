@@ -1,0 +1,18 @@
+[package]
+name = "quartz-core"
+description = "Quartz Launcher 启动器核心：元数据/下载/实例/JVM 编排/认证/内容/渲染路由/输入协议（纯逻辑，零平台依赖）"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+reqwest.workspace = true
+sha1.workspace = true
+sha2.workspace = true
+md-5.workspace = true
+hex.workspace = true
+zip.workspace = true

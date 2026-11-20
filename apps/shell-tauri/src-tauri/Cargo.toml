@@ -1,0 +1,24 @@
+[package]
+name = "quartz-shell-tauri"
+description = "Quartz 桌面/移动 Tauri 2 壳层（方案 A：系统 WebView UI + Rust 核心直调）"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+
+# 独立于根 workspace：Tauri 构建依赖系统级库（Linux webkit2gtk、macOS Xcode、
+# Android NDK 等），在无图形环境/移动 CI 上由专门流水线编译（见 docs/ROADMAP.md）。
+[workspace]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+quartz-core = { path = "../../crates/quartz-core" }
+
+[lib]
+name = "quartz_shell_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]

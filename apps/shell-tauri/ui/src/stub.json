@@ -1,0 +1,23 @@
+{
+  "app_meta": { "name": "Quartz Launcher", "version": "0.1.0", "os": "android", "arch": "arm64" },
+  "versions_offline": {
+    "latest": { "release": "1.20.4", "snapshot": "24w03a" },
+    "versions": [
+      { "id": "1.20.4", "kind": "release" },
+      { "id": "1.16.5", "kind": "release" },
+      { "id": "24w03a", "kind": "snapshot" }
+    ]
+  },
+  "renderer_advice": {
+    "id": "zink",
+    "backend": "vulkan",
+    "note": "GL4.6→Vulkan，1.17++/Sodium/光影推荐档",
+    "required": "Profile32"
+  },
+  "plan_offline": {
+    "jvmArgs": ["-Xmx2048M", "-cp", "…"],
+    "mainClass": "net.minecraft.client.main.Main",
+    "memoryMb": 2048,
+    "javaMajor": 17
+  }
+}
