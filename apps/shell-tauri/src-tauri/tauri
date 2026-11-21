@@ -1,0 +1,29 @@
+#!/usr/bin/env node
+// Gradle RustPlugin 通过 `node tauri android android-studio-script` 调起 Tauri CLI。
+// 本文件把调用透传给 @tauri-apps/cli 的真实入口（npm 全局或项目本地 node_modules）。
+const fs = require("fs");
+const path = require("path");
+
+const candidates = [
+  process.env.TAURI_CLI_JS,
+  path.join(__dirname, "node_modules", "@tauri-apps", "cli", "tauri.js"),
+  path.join(
+    __dirname,
+    "..",
+    "..",
+    "ui",
+    "node_modules",
+    "@tauri-apps",
+    "cli",
+    "tauri.js"
+  ),
+  "/home/z/.npm-global/lib/node_modules/@tauri-apps/cli/tauri.js",
+];
+
+const entry = candidates.find((p) => p && fs.existsSync(p));
+if (!entry) {
+  console.error("Cannot locate @tauri-apps/cli tauri.js; set TAURI_CLI_JS env.");
+  process.exit(1);
+}
+process.argv[1] = entry;
+require(entry);

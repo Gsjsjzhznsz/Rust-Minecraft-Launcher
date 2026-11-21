@@ -2,60 +2,80 @@
 <html lang="zh-CN">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
     <title>Quartz Launcher</title>
     <link rel="stylesheet" href="./src/style.css" />
   </head>
   <body>
     <div id="app">
-      <aside class="sidebar">
-        <div class="brand">
-          <div class="logo">Q</div>
-          <div class="brand-text">
-            <strong>Quartz</strong>
-            <span id="os-arch">launcher</span>
+      <!-- 离线登录屏：输入用户名 -> 写 accounts.json -> 直接进主界面（无任何凭据前置检查） -->
+      <section id="login-screen" class="screen centered">
+        <div class="card login-card">
+          <div class="brand">
+            <div class="logo">Q</div>
+            <div class="brand-text">
+              <strong>Quartz</strong>
+              <span>Rust 版 Minecraft Java 启动器</span>
+            </div>
           </div>
+          <h1>离线登录</h1>
+          <p class="hint">输入用户名即可进入；账号仅写入本地 accounts.json，不连接微软服务。</p>
+          <label class="field-label" for="username">用户名</label>
+          <input id="username" maxlength="16" placeholder="3-16 位字母 / 数字 / 下划线" autocomplete="off" />
+          <button id="login-btn" class="primary">离线登录</button>
+          <div id="login-error" class="error hidden"></div>
         </div>
-        <nav>
-          <button class="nav-item active">实例</button>
-          <button class="nav-item">下载</button>
-          <button class="nav-item">账号</button>
-          <button class="nav-item">设置</button>
-        </nav>
-        <div class="sidebar-footer">v0.1.0 · 方案 A 原型</div>
-      </aside>
+      </section>
 
-      <main class="main">
-        <section class="hero card">
-          <div class="hero-left">
-            <div class="field-label">当前实例</div>
-            <h1>demo</h1>
-            <div class="field-row">
-              <label class="field-label" for="mc-version">版本</label>
-              <select id="mc-version"></select>
+      <!-- 主界面：游戏目录常显 + 下载游戏入口（与账号彻底解耦） -->
+      <section id="main-screen" class="screen hidden">
+        <header class="topbar">
+          <div class="brand small">
+            <div class="logo">Q</div>
+            <div class="brand-text">
+              <strong>Quartz</strong>
+              <span id="player-name">-</span>
             </div>
-            <div class="field-row">
-              <label class="field-label" for="player">玩家</label>
-              <input id="player" value="Steve" />
-            </div>
-            <div class="field-row">
-              <label class="field-label" for="memory">内存 (MB)</label>
-              <input id="memory" type="number" value="2048" step="512" />
-            </div>
-            <button id="play" class="play-btn">生成启动计划</button>
           </div>
-          <div class="hero-right">
-            <div class="field-label">渲染路由（renderbus）</div>
-            <div id="renderer" class="renderer">—</div>
-            <div id="renderer-note" class="muted"></div>
-          </div>
-        </section>
+          <button id="logout-btn" class="ghost">切换账号</button>
+        </header>
 
-        <section class="card log-card">
-          <div class="field-label">启动计划 / 日志</div>
-          <pre id="log">等待操作…</pre>
-        </section>
-      </main>
+        <main class="content">
+          <section class="card">
+            <h2>游戏目录（标准 .minecraft 布局）</h2>
+            <code id="game-dir" class="path">读取中…</code>
+            <p class="hint">versions / libraries / assets / saves / mods / resourcepacks / shaderpacks / config / logs / accounts.json</p>
+          </section>
+
+          <section class="card">
+            <h2>下载游戏</h2>
+            <div class="row">
+              <select id="version-select" disabled>
+                <option value="">版本列表加载中…</option>
+              </select>
+              <button id="download-btn" class="primary" disabled>下载</button>
+            </div>
+            <div id="version-error" class="error hidden"></div>
+            <button id="retry-versions-btn" class="ghost hidden">重试版本列表</button>
+
+            <div id="progress-wrap" class="progress-wrap hidden">
+              <div class="progress-bar"><div id="progress-fill"></div></div>
+              <div class="progress-meta">
+                <span id="progress-stage"></span>
+                <span id="progress-text">0%</span>
+              </div>
+              <div id="progress-file" class="progress-file"></div>
+            </div>
+
+            <div id="download-status" class="status"></div>
+
+            <div class="row bottom">
+              <button id="launch-btn" class="ghost">启动游戏</button>
+              <span class="hint">启动功能在 M0 收尾阶段接入（进程内 JVM + Pojav LWJGL 运行时）</span>
+            </div>
+          </section>
+        </main>
+      </section>
     </div>
     <script type="module" src="./src/main.ts"></script>
   </body>

@@ -16,6 +16,15 @@ pub const VERSION_MANIFEST_URL: &str =
     "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json";
 pub const LIBRARIES_BASE: &str = "https://libraries.minecraft.net/";
 
+/// 统一 HTTP 客户端（rustls TLS，15s 连接超时；供清单/版本 JSON 下载使用）。
+pub fn http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .user_agent("Quartz/0.1.0 (Rust Minecraft Launcher; offline)")
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .build()
+        .expect("failed to build http client")
+}
+
 pub async fn fetch_version_manifest(client: &reqwest::Client) -> Result<VersionManifest> {
     let text = client
         .get(VERSION_MANIFEST_URL)
@@ -117,6 +126,61 @@ pub fn collect_library_tasks(
             size,
             label: format!("lib:{}", lib.name),
         });
+    }
+    tasks
+}
+
+/// 规则过滤后的 natives 分类器下载任务（落 libraries/<maven 路径>）。
+///
+/// 兼容两种形态：
+/// 1. 旧格式 `natives: { linux: "natives-linux" }` -> classifiers[映射名]；
+/// 2. 现代版本（LWJGL 3.3+）直接取 classifiers["natives-linux"]，
+///    arm64 上下文额外取 classifiers["natives-linux-arm64"]。
+pub fn collect_native_tasks(
+    version: &VersionJson,
+    ctx: &RuntimeCtx,
+    libraries_root: &std::path::Path,
+) -> Vec<crate::download::DownloadTask> {
+    use std::collections::BTreeSet;
+    let mut tasks = Vec::new();
+    let mut seen = BTreeSet::new();
+    for lib in &version.libraries {
+        if !library_allowed(lib, ctx) {
+            continue;
+        }
+        let Some(downloads) = &lib.downloads else {
+            continue;
+        };
+        let Some(classifiers) = &downloads.classifiers else {
+            continue;
+        };
+        let mut wanted: Vec<&crate::model::Artifact> = Vec::new();
+        if let Some(natives) = &lib.natives {
+            if let Some(key) = natives.get(&ctx.os) {
+                if let Some(artifact) = classifiers.get(key) {
+                    wanted.push(artifact);
+                }
+            }
+        }
+        if let Some(artifact) = classifiers.get("natives-linux") {
+            wanted.push(artifact);
+        }
+        if ctx.arch == "arm64" {
+            if let Some(artifact) = classifiers.get("natives-linux-arm64") {
+                wanted.push(artifact);
+            }
+        }
+        for artifact in wanted {
+            if seen.insert(artifact.path.clone()) {
+                tasks.push(crate::download::DownloadTask {
+                    source: crate::download::Source::Url(artifact.url.clone()),
+                    dest: libraries_root.join(&artifact.path),
+                    hash: Some(HashSpec::sha1(artifact.sha1.clone())),
+                    size: Some(artifact.size),
+                    label: format!("native:{}", lib.name),
+                });
+            }
+        }
     }
     tasks
 }

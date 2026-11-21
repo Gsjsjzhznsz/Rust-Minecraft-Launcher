@@ -8,6 +8,8 @@
 
 pub mod microsoft;
 
+use crate::error::{Error, Result};
+use crate::paths;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -68,6 +70,80 @@ pub fn offline_account(name: &str) -> Account {
         refresh_token: None,
         user_type: Some("legacy".to_string()),
     }
+}
+
+// ---------------------------------------------------------------------------
+// accounts.json 持久化（离线登录 = 写账号文件 -> 直接进主界面，无任何前置检查）
+// ---------------------------------------------------------------------------
+
+/// files/accounts.json 的内容模型。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountsStore {
+    #[serde(default)]
+    pub accounts: Vec<Account>,
+    /// 当前选中账号的 UUID。
+    #[serde(default)]
+    pub selected: Option<String>,
+}
+
+/// 校验离线用户名（与正版规则一致：3-16 位字母/数字/下划线）。
+pub fn validate_username(name: &str) -> Result<String> {
+    let name = name.trim();
+    let len = name.chars().count();
+    if !(3..=16).contains(&len) {
+        return Err(Error::Other(format!(
+            "用户名长度需为 3-16 个字符（当前 {len} 个）"
+        )));
+    }
+    if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return Err(Error::Other(
+            "用户名只能包含英文字母、数字和下划线".to_string(),
+        ));
+    }
+    Ok(name.to_string())
+}
+
+/// 读取 accounts.json；文件不存在返回空 store。
+pub fn load_store() -> Result<AccountsStore> {
+    let path = paths::accounts_file();
+    if !path.exists() {
+        return Ok(AccountsStore::default());
+    }
+    let text = std::fs::read_to_string(&path)?;
+    Ok(serde_json::from_str(&text)?)
+}
+
+/// 写回 accounts.json（自动创建父目录）。
+pub fn save_store(store: &AccountsStore) -> Result<()> {
+    let path = paths::accounts_file();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let text = serde_json::to_string_pretty(store)?;
+    std::fs::write(&path, text)?;
+    Ok(())
+}
+
+/// 离线登录：按 UUID 去重写入/更新账号并置为选中，持久化到 accounts.json。
+pub fn add_offline_account(name: &str) -> Result<Account> {
+    let name = validate_username(name)?;
+    let account = offline_account(&name);
+    let mut store = load_store()?;
+    store.accounts.retain(|a| a.uuid != account.uuid);
+    store.accounts.push(account.clone());
+    store.selected = Some(account.uuid.clone());
+    save_store(&store)?;
+    Ok(account)
+}
+
+/// 当前选中的账号（无账号或文件缺失返回 None）。
+pub fn active_account() -> Result<Option<Account>> {
+    let store = load_store()?;
+    let Some(uuid) = store.selected else {
+        return Ok(None);
+    };
+    Ok(store.accounts.into_iter().find(|a| a.uuid == uuid))
 }
 
 #[cfg(test)]

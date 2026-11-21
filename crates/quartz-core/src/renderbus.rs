@@ -105,7 +105,7 @@ pub const CATALOG: &[RendererPack] = &[
     },
 ];
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct DeviceCaps {
     pub vulkan: bool,
     pub metal: bool,

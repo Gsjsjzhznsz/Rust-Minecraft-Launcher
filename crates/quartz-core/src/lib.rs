@@ -5,6 +5,7 @@
 //! - [`rules`]   规则引擎（os/arch/features）
 //! - [`meta`]    版本清单获取与下载计划推导
 //! - [`download`] 下载编排（SHA-1/256/512 校验 / 断点跳过 / 并发 / 进度事件）
+//! - [`paths`]   标准目录布局唯一权威（与官方 .minecraft / ZL2 互通）
 //! - [`instance`] 实例体系（隔离目录 + 共享仓库）
 //! - [`jvmops`]  JVM 启动计划装配（五端统一契约）
 //! - [`auth`]    账号（离线 UUID / 微软设备码 + XBL 链路）
@@ -25,6 +26,7 @@ pub mod jvmops;
 pub mod meta;
 pub mod model;
 pub mod modkit;
+pub mod paths;
 pub mod platform;
 pub mod renderbus;
 pub mod rules;

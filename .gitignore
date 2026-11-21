@@ -5,3 +5,14 @@ dist
 .quartz-root
 *.log
 .DS_Store
+# 沙箱/工具链/构建产物（不入库）
+.env
+.toolchain/
+.gradle-home/
+download/
+apps/shell-tauri/src-tauri/gen/android/.gradle
+apps/shell-tauri/src-tauri/gen/android/build
+apps/shell-tauri/src-tauri/gen/android/app/build
+apps/shell-tauri/src-tauri/gen/android/local.properties
+apps/shell-tauri/src-tauri/gen/android/.cxx
+apps/shell-tauri/src-tauri/gen/android/buildSrc/build
