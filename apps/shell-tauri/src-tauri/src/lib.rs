@@ -3,7 +3,7 @@
 //! 架构契约（方案 A）：UI（WebView/JS）只调用本文件注册的 command；
 //! command 是 quartz-core 能力的薄封装，不含业务逻辑。
 //!
-//! 本期命令契约（v3 蓝图：下载与账号彻底解耦）：
+//! 命令契约（v3 蓝图 + M0 启动接入）：
 //! - `offline_login(name)`        离线登录：MD5("OfflinePlayer:"+name) -> accounts.json
 //! - `get_account()`              当前选中账号
 //! - `list_accounts()`            全部账号 + 选中标记
@@ -14,43 +14,55 @@
 //! - `download_game(version_id)`  后台 spawn 完整下载管线，
 //!                                经 `download://progress` 事件上报 {stage,current,total,percent,file}
 //! - `get_game_dir()`             标准游戏根目录绝对路径（UI 常显）
-//! - `get_env_info()`             存储诊断：根目录 + 可写性 + 存储模式
-//! - `launch_game(version_id)`    本期占位：下载完成后再接入启动（M0 收尾）
+//! - `get_env_info()`             存储诊断：根目录 + 可写性 + 存储模式 + 完整文件权限
+//! - `get_permission_state()`     存储权限状态 {granted}
+//! - `request_storage_permission()` 触发系统权限弹窗（授权后经 focus/visibility 重检）
+//! - `reinit_storage()`           权限变化后重解析存储根 + 后台迁移旧数据
+//!                                （`quartz://migrate` 事件上报迁移进度）
+//! - `launch_preflight(version_id)` 启动前自检（版本/账号/Java 运行时）
+//! - `get_runtime_status(java_major)` JVM pack 状态（installed/version/path）
+//! - `download_runtime(java_major)` 下载 JVM 运行时 pack（`runtime://progress` 事件）
+//! - `launch_game(version_id)`    M0 已接入：JRE pack + LaunchPlan 子进程启动，
+//!                                `launch://log` / `launch://exit` 事件实时上报
+//! - `stop_game()`                终止游戏进程（SIGKILL）
 
+use quartz_core::instance::DownloadProgress;
 use quartz_core::renderbus::{self, DeviceCaps};
-use quartz_core::{auth, host_arch, instance, jvmops, meta, model, paths, platform, RuntimeCtx};
+use quartz_core::{auth, host_arch, instance, jvmops, meta, model, paths, platform, rules, runtime, RuntimeCtx};
 use serde::Serialize;
 use serde_json::json;
-use std::path::PathBuf;
-use std::sync::{Arc, OnceLock};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, State};
 
 /// 下载并发互斥：同一时刻只允许一个下载任务。
 #[derive(Default)]
 pub struct AppState {
     downloading: Arc<std::sync::Mutex<bool>>,
+    /// 运行时 pack 下载互斥。
+    runtime_busy: Arc<std::sync::atomic::AtomicBool>,
+    /// 运行中的游戏进程 pid（None = 空闲）。
+    game_pid: Arc<Mutex<Option<u32>>>,
 }
 
 // ---------------------------------------------------------------------------
-// Android 存储解析（error13 / os error 13 = EACCES 根因修复）
+// Android JNI 基础（存储解析 / 权限检测共用）
 // ---------------------------------------------------------------------------
-//
-// Android 11+ scoped storage 下直接手拼 /storage/emulated/0/Android/data/<pkg>/files
-// 在部分 ROM 上会被 FUSE 拒绝 mkdir（EACCES），必须用平台 API：
-//   1) Context.getExternalFilesDir(null) —— 外部私有目录（可被文件管理器浏览）
-//   2) 回退 Context.getFilesDir()        —— 内部私有目录（任何设备必定可写）
-// 解析结果经 paths::set_runtime_root 注入核心，后续全部落盘路径由 paths.rs 统一给出。
 
-/// 存储诊断信息（启动时确定，UI 经 get_env_info 展示）。
-#[derive(Debug, Clone)]
-pub struct StorageDiag {
-    pub mode: &'static str,
-    pub root: PathBuf,
-    pub layout_ok: bool,
-    pub layout_error: Option<String>,
+#[cfg(target_os = "android")]
+fn with_jni<T>(
+    f: impl FnOnce(&mut jni::JNIEnv, &jni::objects::JObject) -> Option<T>,
+) -> Option<T> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let ctx = ndk_context::android_context();
+        let vm = unsafe { jni::JavaVM::from_raw(ctx.vm().cast()) }.ok()?;
+        let mut env = vm.attach_current_thread().ok()?;
+        let context = unsafe { jni::objects::JObject::from_raw(ctx.context().cast()) };
+        f(&mut env, &context)
+    }))
+    .ok()
+    .flatten()
 }
-
-static STORAGE_DIAG: OnceLock<StorageDiag> = OnceLock::new();
 
 #[cfg(target_os = "android")]
 fn jni_file_path(env: &mut jni::JNIEnv, file: &jni::objects::JObject) -> Option<PathBuf> {
@@ -99,23 +111,128 @@ fn jni_internal_files_dir(env: &mut jni::JNIEnv, context: &jni::objects::JObject
     jni_file_path(env, &file)
 }
 
+// ---------------------------------------------------------------------------
+// 存储权限（完整文件权限）
+// ---------------------------------------------------------------------------
+//
+// 设计：APK 固定 targetSdk 28（Android 10 前的存储模型 + 允许 exec() 应用目录
+// 内的 JVM —— Pojav/Termux 同款方案）。READ/WRITE_EXTERNAL_STORAGE 经运行时
+// 弹窗授权后，应用对 /storage/emulated/0 拥有完整读写权限，游戏文件即可放在
+// 文件管理器可见的标准目录 /storage/emulated/0/Quartz/files。
+
+/// Android 端 WRITE_EXTERNAL_STORAGE 是否已授权（checkSelfPermission == GRANTED）。
+#[cfg(target_os = "android")]
+fn android_storage_permission_granted() -> bool {
+    use jni::objects::JValue;
+    with_jni(|env, ctx| {
+        let perm = env
+            .new_string("android.permission.WRITE_EXTERNAL_STORAGE")
+            .ok()?;
+        let granted = env
+            .call_method(
+                ctx,
+                "checkSelfPermission",
+                "(Ljava/lang/String;)I",
+                &[JValue::Object(&perm.into())],
+            )
+            .ok()?
+            .i()
+            .ok()?;
+        // PackageManager.PERMISSION_GRANTED == 0
+        Some(granted == 0)
+    })
+    .unwrap_or(false)
+}
+
+/// 存储权限是否已授权（桌面端恒真）。
+fn storage_permission_granted() -> bool {
+    #[cfg(target_os = "android")]
+    {
+        android_storage_permission_granted()
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        true
+    }
+}
+
+/// 权限状态查询。
+#[tauri::command]
+fn get_permission_state() -> serde_json::Value {
+    json!({ "granted": storage_permission_granted() })
+}
+
+/// 触发系统权限弹窗（WRITE/READ_EXTERNAL_STORAGE）。
+/// 结果不通过本命令返回：UI 在 focus/visibilitychange 时重新查询状态。
+#[tauri::command]
+fn request_storage_permission() -> Result<bool, String> {
+    #[cfg(target_os = "android")]
+    {
+        use jni::objects::JValue;
+        with_jni(|env, ctx| {
+            let write = env.new_string("android.permission.WRITE_EXTERNAL_STORAGE").ok()?;
+            let read = env.new_string("android.permission.READ_EXTERNAL_STORAGE").ok()?;
+            let write_obj: jni::objects::JObject = write.into();
+            let arr = env
+                .new_object_array(2, "java/lang/String", write_obj)
+                .ok()?;
+            let read_obj: jni::objects::JObject = read.into();
+            env.set_object_array_element(&arr, 1, read_obj).ok()?;
+            env.call_method(
+                ctx,
+                "requestPermissions",
+                "([Ljava/lang/String;I)V",
+                &[JValue::Object(&arr), JValue::Int(42)],
+            )
+            .ok()?;
+            Some(())
+        });
+        Ok(true)
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        Ok(true)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Android 存储解析（error13 / os error 13 = EACCES 根因修复 + 权限分级）
+// ---------------------------------------------------------------------------
+
+/// 存储诊断信息（启动时确定，UI 经 get_env_info 展示）。
+#[derive(Debug, Clone)]
+pub struct StorageDiag {
+    pub mode: &'static str,
+    pub root: PathBuf,
+    pub layout_ok: bool,
+    pub layout_error: Option<String>,
+}
+
+static STORAGE_DIAG: Mutex<Option<StorageDiag>> = Mutex::new(None);
+
 /// Android 平台解析真实可写目录；ndk-context 未初始化等异常一律回退硬编码路径。
+///
+/// 优先级（与授权状态联动）：
+/// 1. 已授权完整文件权限 -> 公共标准目录 /storage/emulated/0/Quartz/files（可见、卸载不丢）
+/// 2. 应用外部私有目录（getExternalFilesDir，可浏览，卸载丢失）
+/// 3. 应用内部私有目录（getFilesDir，必定可写）
 #[cfg(target_os = "android")]
 fn resolve_android_root() -> (PathBuf, &'static str) {
-    let result = std::panic::catch_unwind(|| -> Option<(PathBuf, &'static str)> {
-        let ctx = ndk_context::android_context();
-        let vm = unsafe { jni::JavaVM::from_raw(ctx.vm().cast()) }.ok()?;
-        let mut env = vm.attach_current_thread().ok()?;
-        let context = unsafe { jni::objects::JObject::from_raw(ctx.context().cast()) };
-        // 首选外部私有目录（用户可用文件管理器查看 .minecraft）
-        if let Some(p) = jni_external_files_dir(&mut env, &context) {
+    if storage_permission_granted() {
+        let public = PathBuf::from("/storage/emulated/0/Quartz/files");
+        if std::fs::create_dir_all(&public).is_ok() {
+            return (public, "public");
+        }
+        eprintln!("[quartz] 公共标准目录创建失败，回退应用私有目录");
+    }
+    let result = with_jni(|env, context| {
+        // 外部私有目录（用户可用文件管理器查看 .minecraft）
+        if let Some(p) = jni_external_files_dir(env, context) {
             return Some((p, "external"));
         }
-        // 回退内部私有目录（必定可写）
-        jni_internal_files_dir(&mut env, &context).map(|p| (p, "internal"))
-    })
-    .ok()
-    .flatten();
+        // 内部私有目录（必定可写）
+        jni_internal_files_dir(env, context).map(|p| (p, "internal"))
+    });
     result.unwrap_or_else(|| {
         (
             PathBuf::from(format!(
@@ -127,21 +244,13 @@ fn resolve_android_root() -> (PathBuf, &'static str) {
     })
 }
 
-/// Android 内部私有目录（Context.getFilesDir()，任何设备必定可写）。
+/// Android 内部私有目录（Context.getFilesDir()，任何设备必定可写；exec 可用）。
 #[cfg(target_os = "android")]
 fn resolve_android_internal() -> Option<PathBuf> {
-    std::panic::catch_unwind(|| {
-        let ctx = ndk_context::android_context();
-        let vm = unsafe { jni::JavaVM::from_raw(ctx.vm().cast()) }.ok()?;
-        let mut env = vm.attach_current_thread().ok()?;
-        let context = unsafe { jni::objects::JObject::from_raw(ctx.context().cast()) };
-        jni_internal_files_dir(&mut env, &context)
-    })
-    .ok()
-    .flatten()
+    with_jni(|env, context| jni_internal_files_dir(env, context))
 }
 
-/// 初始化游戏根目录并创建标准布局；返回诊断信息。
+/// 初始化游戏根目录与 JVM pack 目录并创建标准布局；返回诊断信息。
 fn init_storage() -> StorageDiag {
     #[cfg(target_os = "android")]
     let (root, mode) = resolve_android_root();
@@ -158,14 +267,20 @@ fn init_storage() -> StorageDiag {
     #[cfg(target_os = "android")]
     if layout.is_err() && mode != "internal" {
         eprintln!(
-            "[quartz] 外部私有目录不可写（{:?}），回退内部存储",
+            "[quartz] 当前根目录不可写（{:?}），回退内部存储",
             layout.as_ref().err()
         );
         if let Some(internal) = resolve_android_internal() {
-            let _ = paths::set_runtime_root(internal);
+            let _ = paths::set_runtime_root(internal.clone());
             layout = paths::ensure_layout();
             mode = "internal";
         }
+    }
+
+    // JVM pack 必须放在可 exec 的内部目录（FUSE noexec + targetSdk>=29 禁 exec 的约束）
+    #[cfg(target_os = "android")]
+    if let Some(internal) = resolve_android_internal() {
+        paths::set_runtime_jres_root(internal.join("jres"));
     }
 
     let diag = StorageDiag {
@@ -174,8 +289,118 @@ fn init_storage() -> StorageDiag {
         layout_ok: layout.is_ok(),
         layout_error: layout.err().map(|e| format!("{e}")),
     };
-    eprintln!("[quartz] 存储初始化：mode={} root={}", diag.mode, diag.root.display());
+    eprintln!(
+        "[quartz] 存储初始化：mode={} root={} jres={}",
+        diag.mode,
+        diag.root.display(),
+        paths::runtime_dir().display()
+    );
     diag
+}
+
+fn storage_json(diag: &StorageDiag) -> serde_json::Value {
+    json!({
+        "gameDir": diag.root.to_string_lossy(),
+        "storageMode": diag.mode,
+        "layoutOk": diag.layout_ok,
+        "layoutError": diag.layout_error,
+        "fullAccess": storage_permission_granted(),
+    })
+}
+
+/// 递归收集「源存在且目标缺失/不一致」的文件（不覆盖目标已有的同名同尺寸文件）。
+fn collect_migrate_files(src: &Path, dst: &Path, out: &mut Vec<(PathBuf, PathBuf, u64)>) {
+    let Ok(entries) = std::fs::read_dir(src) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let sp = entry.path();
+        let dp = dst.join(entry.file_name());
+        if sp.is_dir() {
+            collect_migrate_files(&sp, &dp, out);
+        } else if sp.is_file() {
+            let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+            let dst_size = std::fs::metadata(&dp).map(|m| m.len()).unwrap_or(u64::MAX);
+            if dst_size != size {
+                out.push((sp, dp, size));
+            }
+        }
+    }
+}
+
+/// 后台迁移：把旧根（私有目录）的数据搬到新根（公共标准目录），
+/// 经 `quartz://migrate` 事件上报 {percent,done,error}。
+fn migrate_root(from: PathBuf, to: PathBuf, app: AppHandle) {
+    let mut plan: Vec<(PathBuf, PathBuf, u64)> = Vec::new();
+    collect_migrate_files(&from.join(".minecraft"), &to.join(".minecraft"), &mut plan);
+    let old_accounts = from.join("accounts.json");
+    let new_accounts = to.join("accounts.json");
+    let migrate_accounts = old_accounts.exists() && !new_accounts.exists();
+    if migrate_accounts {
+        let size = std::fs::metadata(&old_accounts).map(|m| m.len()).unwrap_or(0);
+        plan.push((old_accounts, new_accounts, size));
+    }
+
+    if plan.is_empty() {
+        let _ = app.emit(
+            "quartz://migrate",
+            &json!({ "percent": 100.0, "done": true, "error": null }),
+        );
+        return;
+    }
+
+    let total: u64 = plan.iter().map(|(_, _, s)| *s).sum::<u64>().max(1);
+    eprintln!("[quartz] 开始迁移存储：{} 个文件（{} 字节）", plan.len(), total);
+    let mut copied: u64 = 0;
+    let mut last = std::time::Instant::now() - std::time::Duration::from_secs(1);
+    for (src, dst, size) in plan {
+        if let Some(parent) = dst.parent() {
+            if std::fs::create_dir_all(parent).is_err() {
+                let _ = app.emit(
+                    "quartz://migrate",
+                    &json!({ "percent": (copied as f64 / total as f64) * 100.0, "done": false,
+                             "error": format!("无法创建目录 {}", parent.display()) }),
+                );
+                return;
+            }
+        }
+        if std::fs::copy(&src, &dst).is_err() {
+            let _ = app.emit(
+                "quartz://migrate",
+                &json!({ "percent": (copied as f64 / total as f64) * 100.0, "done": false,
+                         "error": format!("复制失败：{} -> {}", src.display(), dst.display()) }),
+            );
+            return;
+        }
+        copied += size;
+        let now = std::time::Instant::now();
+        if now.duration_since(last) >= std::time::Duration::from_millis(150) {
+            last = now;
+            let _ = app.emit(
+                "quartz://migrate",
+                &json!({ "percent": (copied as f64 / total as f64) * 100.0, "done": false, "error": null }),
+            );
+        }
+    }
+    eprintln!("[quartz] 存储迁移完成");
+    let _ = app.emit(
+        "quartz://migrate",
+        &json!({ "percent": 100.0, "done": true, "error": null }),
+    );
+}
+
+/// 权限变化后重解析存储根；根变化时后台迁移旧数据（幂等，跳过目标已有文件）。
+#[tauri::command]
+fn reinit_storage(app: AppHandle) -> Result<serde_json::Value, String> {
+    let old_root = paths::game_root();
+    let diag = init_storage();
+    *STORAGE_DIAG.lock().map_err(|_| "内部状态锁异常")? = Some(diag.clone());
+    let new_root = paths::game_root();
+    if old_root != new_root && old_root.exists() {
+        let app2 = app.clone();
+        std::thread::spawn(move || migrate_root(old_root, new_root, app2));
+    }
+    Ok(storage_json(&diag))
 }
 
 // ---------------------------------------------------------------------------
@@ -194,16 +419,16 @@ fn app_meta() -> serde_json::Value {
     })
 }
 
-/// 存储诊断：根目录绝对路径、是否可写、存储模式（external/internal/desktop）。
+/// 存储诊断：根目录绝对路径、是否可写、存储模式、完整文件权限状态。
 #[tauri::command]
 fn get_env_info() -> serde_json::Value {
-    let diag = STORAGE_DIAG.get().cloned().unwrap_or_else(init_storage);
-    json!({
-        "gameDir": diag.root.to_string_lossy(),
-        "storageMode": diag.mode,
-        "layoutOk": diag.layout_ok,
-        "layoutError": diag.layout_error,
-    })
+    let diag = STORAGE_DIAG
+        .lock()
+        .map_err(|_| "内部状态锁异常")
+        .ok()
+        .and_then(|g| g.clone())
+        .unwrap_or_else(init_storage);
+    storage_json(&diag)
 }
 
 /// 渲染器建议：按平台默认能力 + 手动覆盖。
@@ -232,7 +457,7 @@ fn plan_offline(player: String, memory_mb: u32) -> Result<serde_json::Value, Str
         serde_json::from_str(quartz_core::fixtures::VERSION_1_20_4)
             .map_err(|e| e.to_string())?;
     let hal = platform::default_hal();
-    let ctx = RuntimeCtx::new(hal.os().rule_name(), host_arch());
+    let ctx = RuntimeCtx::new("linux", host_arch());
     let allowed: Vec<&model::Library> = version
         .libraries
         .iter()
@@ -458,14 +683,311 @@ fn get_game_dir() -> String {
     paths::game_root().to_string_lossy().into_owned()
 }
 
-/// 本期占位：下载完成后再接入启动（M0 收尾：进程内 JVM + Pojav LWJGL 运行时 pack）。
+// ---------------------------------------------------------------------------
+// JVM 运行时 pack（M0 启动链路）
+// ---------------------------------------------------------------------------
+
+/// JVM pack 状态：installed / version / path / 是否有下载源。
 #[tauri::command]
-fn launch_game(version_id: String) -> Result<String, String> {
-    let jar = paths::version_jar(&version_id);
-    if !jar.exists() {
-        return Err(format!("版本 {version_id} 尚未下载，请先在「下载游戏」中完成下载"));
+fn get_runtime_status(java_major: u32) -> serde_json::Value {
+    json!({
+        "installed": runtime::is_installed(java_major),
+        "version": runtime::installed_version(java_major),
+        "path": runtime::install_dir(java_major).to_string_lossy(),
+        "specAvailable": runtime::spec_for(java_major, host_arch()).is_some(),
+    })
+}
+
+/// 后台下载 JVM 运行时 pack，进度经 `runtime://progress` 上报（与下载游戏事件同构）。
+#[tauri::command]
+async fn download_runtime(java_major: u32, app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    if state
+        .runtime_busy
+        .swap(true, std::sync::atomic::Ordering::SeqCst)
+    {
+        return Err("已有运行时下载任务正在进行".to_string());
     }
-    Ok("下载完成后再接入启动：游戏启动（进程内 JVM + Pojav LWJGL 运行时）将在 M0 收尾阶段接入，当前版本仅提供账号与完整下载管线。".to_string())
+    let busy = state.runtime_busy.clone();
+    let app = app.clone();
+
+    tauri::async_runtime::spawn(async move {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<DownloadProgress>(64);
+        let forwarder_app = app.clone();
+        let forwarder = tokio::spawn(async move {
+            while let Some(ev) = rx.recv().await {
+                let _ = forwarder_app.emit("runtime://progress", &ev);
+            }
+        });
+
+        let client = meta::http_client();
+        let result = runtime::download_and_install(&client, java_major, host_arch(), tx).await;
+        if let Err(e) = &result {
+            let _ = app.emit(
+                "runtime://progress",
+                &DownloadProgress {
+                    stage: "error".to_string(),
+                    current: 0,
+                    total: 0,
+                    percent: 0.0,
+                    file: String::new(),
+                    done: false,
+                    error: Some(e.to_string()),
+                },
+            );
+        }
+        drop(result);
+        busy.store(false, std::sync::atomic::Ordering::SeqCst);
+        let _ = forwarder.await;
+    });
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// 游戏启动（M0 已接入）
+// ---------------------------------------------------------------------------
+
+/// 启动日志事件（stdout / stderr / quartz 系统行）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LaunchLog {
+    pub source: String,
+    pub line: String,
+}
+
+/// 退出事件。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LaunchExit {
+    pub code: i32,
+    pub version: String,
+}
+
+/// 启动前自检：版本文件 / Java 主版本 / 账号 / 运行时状态。
+#[tauri::command]
+fn launch_preflight(version_id: String) -> serde_json::Value {
+    let json_path = paths::version_json(&version_id);
+    let parsed = std::fs::read_to_string(&json_path)
+        .ok()
+        .and_then(|t| serde_json::from_str::<model::VersionJson>(&t).ok());
+    let java_major = parsed
+        .as_ref()
+        .map(|v| v.java_version.as_ref().map(|j| j.major_version).unwrap_or(17))
+        .unwrap_or(17);
+    let account_ok = auth::active_account().unwrap_or(None).is_some();
+    json!({
+        "versionInstalled": paths::version_jar(&version_id).exists(),
+        "versionJsonOk": parsed.is_some(),
+        "javaMajor": java_major,
+        "accountOk": account_ok,
+        "runtimeInstalled": runtime::is_installed(java_major),
+        "runtimeSpecAvailable": runtime::spec_for(java_major, host_arch()).is_some(),
+        "runtimeVersion": runtime::installed_version(java_major),
+        "runtimeDir": runtime::install_dir(java_major).to_string_lossy(),
+    })
+}
+
+/// 解析版本 JSON 并装配 LaunchPlan（版本未安装 / JSON 损坏时报错）。
+fn build_plan_for(version_id: &str) -> Result<(model::VersionJson, jvmops::LaunchPlan, u32), String> {
+    let text = std::fs::read_to_string(paths::version_json(version_id))
+        .map_err(|_| format!("版本 {version_id} 未安装（缺少版本 JSON），请先在「下载游戏」页完成下载"))?;
+    let version: model::VersionJson =
+        serde_json::from_str(&text).map_err(|e| format!("版本 JSON 解析失败：{e}"))?;
+    if !paths::version_jar(version_id).exists() {
+        return Err(format!("版本 {version_id} 的 client jar 缺失，请重新下载"));
+    }
+    let major = version
+        .java_version
+        .as_ref()
+        .map(|j| j.major_version)
+        .unwrap_or(17);
+
+    let ctx = instance::standard_rules_ctx();
+    let allowed: Vec<&model::Library> = version
+        .libraries
+        .iter()
+        .filter(|l| rules::evaluate(&l.rules, &ctx))
+        .collect();
+
+    let game_dir = paths::minecraft_dir();
+    let natives_root = game_dir.join("natives");
+    let plan = jvmops::build_launch_plan(&jvmops::PlanInputs {
+        ctx: &ctx,
+        version: &version,
+        allowed_libs: &allowed,
+        libraries_root: &paths::libraries_dir(),
+        natives_root: &natives_root,
+        assets_root: &paths::assets_dir(),
+        versions_root: &paths::versions_dir(),
+        instance_dir: &game_dir,
+        account: &auth::active_account()
+            .map_err(|e| e.to_string())?
+            .ok_or("尚未登录，请先在「账户」页添加账号")?,
+        memory_mb: 1024,
+        java_major: major,
+        java_path: None,
+        window: None,
+    })
+    .map_err(|e| format!("启动计划装配失败：{e}"))?;
+    Ok((version, plan, major))
+}
+
+/// 拉起 JVM 子进程并托管日志/退出（`launch://log` / `launch://exit` 事件）。
+///
+/// 前置：JVM pack 已安装（Android 内部目录，targetSdk 28 允许 exec）。
+/// smoke test 先跑 `java -version` 把 JRE 版本写进控制台，失败时给出明确报错。
+fn spawn_game(
+    version_id: String,
+    plan: jvmops::LaunchPlan,
+    major: u32,
+    game_pid: Arc<Mutex<Option<u32>>>,
+    app: AppHandle,
+) -> Result<(), String> {
+    use std::io::BufRead;
+    use std::process::{Command, Stdio};
+
+    let java = runtime::java_bin(major);
+    let jre_home = runtime::install_dir(major);
+    let game_dir = paths::minecraft_dir();
+
+    // ---- smoke test：JRE 可执行性 ----
+    let _ = app.emit(
+        "launch://log",
+        &LaunchLog {
+            source: "quartz".into(),
+            line: format!("[quartz] JRE {major}：{}", jre_home.display()),
+        },
+    );
+    match Command::new(&java).arg("-version").output() {
+        Ok(out) => {
+            let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+            text.push_str(&String::from_utf8_lossy(&out.stderr));
+            for line in text.lines().filter(|l| !l.trim().is_empty()).take(4) {
+                let _ = app.emit(
+                    "launch://log",
+                    &LaunchLog {
+                        source: "quartz".into(),
+                        line: format!("[quartz] {line}"),
+                    },
+                );
+            }
+        }
+        Err(e) => {
+            return Err(format!(
+                "无法执行 JVM（{e}）。JVM pack 需位于可执行目录：{}",
+                jre_home.display()
+            ))
+        }
+    }
+
+    // ---- 组装命令：jvm_args + main_class + game_args ----
+    let ld_library_path = format!(
+        "{}:{}:{}",
+        jre_home.join("lib").display(),
+        jre_home.join("lib/server").display(),
+        plan.natives_dir.display()
+    );
+    let mut cmd = Command::new(&java);
+    cmd.args(&plan.jvm_args)
+        .arg(&plan.main_class)
+        .args(&plan.game_args)
+        .current_dir(&plan.working_dir)
+        .env("HOME", &game_dir)
+        .env("JAVA_HOME", &jre_home)
+        .env("LD_LIBRARY_PATH", &ld_library_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("游戏进程启动失败：{e}"))?;
+    let pid = child.id();
+    if let Ok(mut slot) = game_pid.lock() {
+        *slot = Some(pid);
+    }
+    {
+        let app2 = app.clone();
+        let _ = app2.emit(
+            "launch://log",
+            &LaunchLog {
+                source: "quartz".into(),
+                line: format!("[quartz] 游戏进程已启动 (pid {pid})，工作目录：{}", plan.working_dir.display()),
+            },
+        );
+    }
+
+    // ---- 日志泵：stdout / stderr -> launch://log ----
+    if let Some(stdout) = child.stdout.take() {
+        let app2 = app.clone();
+        std::thread::spawn(move || {
+            for line in std::io::BufReader::new(stdout).lines().map_while(Result::ok) {
+                let _ = app2.emit("launch://log", &LaunchLog { source: "stdout".into(), line });
+            }
+        });
+    }
+    if let Some(stderr) = child.stderr.take() {
+        let app2 = app.clone();
+        std::thread::spawn(move || {
+            for line in std::io::BufReader::new(stderr).lines().map_while(Result::ok) {
+                let _ = app2.emit("launch://log", &LaunchLog { source: "stderr".into(), line });
+            }
+        });
+    }
+
+    // ---- 退出看护：wait -> launch://exit -> 清理 pid 槽位 ----
+    let game_pid_exit = game_pid;
+    std::thread::spawn(move || {
+        let code = child.wait().map(|s| s.code().unwrap_or(-1)).unwrap_or(-1);
+        if let Ok(mut slot) = game_pid_exit.lock() {
+            // stop_game 已 take 时这里已是 None，避免覆盖后续新进程
+            if slot.is_some() {
+                *slot = None;
+            }
+        }
+        let _ = app.emit(
+            "launch://exit",
+            &LaunchExit { code, version: version_id },
+        );
+    });
+    Ok(())
+}
+
+/// 真实启动：版本 JSON -> LaunchPlan -> JVM 子进程（M0 已接入）。
+/// JVM pack 缺失时返回 `RUNTIME_MISSING:<major>`，UI 自动触发运行时下载。
+#[tauri::command]
+fn launch_game(version_id: String, app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    if state.game_pid.lock().map_err(|_| "内部状态锁异常")?.is_some() {
+        return Err("已有游戏进程在运行，请先停止后再启动".to_string());
+    }
+    let (_version, plan, major) = build_plan_for(&version_id)?;
+    if !runtime::is_installed(major) {
+        return Err(format!("RUNTIME_MISSING:{major}"));
+    }
+    std::fs::create_dir_all(&plan.working_dir).ok();
+    std::fs::create_dir_all(&plan.natives_dir).ok();
+    spawn_game(version_id.clone(), plan, major, state.game_pid.clone(), app.clone())?;
+    Ok(())
+}
+
+/// 终止运行中的游戏进程（SIGKILL）。
+#[tauri::command]
+fn stop_game(state: State<'_, AppState>) -> Result<bool, String> {
+    let pid = state
+        .game_pid
+        .lock()
+        .map_err(|_| "内部状态锁异常")?
+        .take();
+    match pid {
+        Some(pid) => {
+            #[cfg(unix)]
+            unsafe {
+                libc::kill(pid as libc::pid_t, libc::SIGKILL);
+            }
+            Ok(true)
+        }
+        None => Ok(false),
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -475,9 +997,7 @@ pub fn run() {
         .setup(|_app| {
             // 启动即解析真实可写存储并创建标准目录布局（诊断信息供 UI 展示）。
             let diag = init_storage();
-            if let Err(err) = STORAGE_DIAG.set(diag) {
-                eprintln!("[quartz] 存储诊断重复初始化：{err:?}");
-            }
+            *STORAGE_DIAG.lock().expect("锁中毒") = Some(diag);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -494,7 +1014,14 @@ pub fn run() {
             download_game,
             get_game_dir,
             get_env_info,
+            get_permission_state,
+            request_storage_permission,
+            reinit_storage,
+            get_runtime_status,
+            download_runtime,
+            launch_preflight,
             launch_game,
+            stop_game,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

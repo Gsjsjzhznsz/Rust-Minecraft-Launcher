@@ -19,8 +19,22 @@ type EnvInfo = {
   storageMode: string;
   layoutOk: boolean;
   layoutError: string | null;
+  fullAccess: boolean;
 };
 type AppMeta = { name: string; version: string; os: string; arch: string };
+type Preflight = {
+  versionInstalled: boolean;
+  versionJsonOk: boolean;
+  javaMajor: number;
+  accountOk: boolean;
+  runtimeInstalled: boolean;
+  runtimeSpecAvailable: boolean;
+  runtimeVersion: string | null;
+  runtimeDir: string;
+};
+type LaunchLog = { source: string; line: string };
+type LaunchExit = { code: number; version: string };
+type MigrateMsg = { percent: number; done: boolean; error: string | null };
 
 /* ---------- DOM 工具 ---------- */
 const el = <T extends HTMLElement>(id: string): T => document.getElementById(id) as T;
@@ -90,6 +104,9 @@ let searchText = "";
 let shownCount = PAGE_SIZE;
 let busy = false;
 let currentAccount: Account | null = null;
+let fullAccess = true;
+let runtimeDownloading = false;
+let pendingLaunchVersion: string | null = null;
 
 const storage = {
   get selected(): string {
@@ -309,6 +326,33 @@ async function ensureProgressListener() {
   if (listening) return;
   listening = true;
   await listen<DownloadProgress>("download://progress", (event) => onProgress(event.payload));
+  await listen<DownloadProgress>("runtime://progress", (event) => onRuntimeProgress(event.payload));
+  await listen<LaunchLog>("launch://log", (event) => appendLog(event.payload.source, event.payload.line));
+  await listen<LaunchExit>("launch://exit", (event) => {
+    hide("stop-btn");
+    if (event.payload.code === 0) {
+      setLaunchBadge("已退出（0）", "dim");
+      toast("游戏已正常退出", "ok");
+    } else {
+      setLaunchBadge(`已退出（${event.payload.code}）`, "err");
+      toast(`游戏已退出（代码 ${event.payload.code}），详情见控制台`, "err");
+    }
+    appendLog("quartz", `[quartz] 进程退出，代码 ${event.payload.code}`);
+  });
+  await listen<MigrateMsg>("quartz://migrate", (event) => {
+    const p = event.payload;
+    if (p.error) {
+      toast(`存储迁移失败：${p.error}`, "err");
+      appendLog("quartz", `[quartz] 存储迁移失败：${p.error}`);
+      return;
+    }
+    if (p.done) {
+      toast("旧游戏数据已迁移到标准目录", "ok");
+      appendLog("quartz", "[quartz] 存储迁移完成");
+      refreshInstalled();
+      loadEnvAndMeta();
+    }
+  });
 }
 
 function progressEls(prefix: string) {
@@ -548,12 +592,16 @@ async function loadEnvAndMeta() {
     setText("game-dir", env.gameDir);
     setText("settings-game-dir", env.gameDir);
     const modeText =
-      env.storageMode === "external"
-        ? "外部私有目录（可在文件管理器查看）"
-        : env.storageMode === "internal"
-          ? "内部私有目录（应用专属）"
-          : "桌面环境";
+      env.storageMode === "public"
+        ? "公共标准目录（文件管理器可见，卸载不丢）"
+        : env.storageMode === "external"
+          ? "外部私有目录（可在文件管理器查看）"
+          : env.storageMode === "internal"
+            ? "内部私有目录（应用专属）"
+            : "桌面环境";
     setText("storage-mode", modeText);
+    fullAccess = env.fullAccess;
+    togglePermUI(env.fullAccess);
     for (const badgeId of ["storage-badge", "settings-storage-badge"]) {
       const badge = el<HTMLSpanElement>(badgeId);
       if (env.layoutOk) {
@@ -586,12 +634,212 @@ async function loadEnvAndMeta() {
   }
 }
 
-/* ---------- 启动游戏（占位） ---------- */
+/* ---------- 启动控制台 ---------- */
+const CONSOLE_MAX_LINES = 400;
+function consoleLineClass(source: string): string {
+  if (source === "stderr") return "console-line err";
+  if (source === "quartz") return "console-line sys";
+  return "console-line";
+}
+function appendLog(source: string, line: string) {
+  const box = el<HTMLDivElement>("console-box");
+  // 清掉占位行
+  const first = box.firstElementChild;
+  if (first && first.classList.contains("dim") && box.children.length === 1) first.remove();
+  const node = document.createElement("div");
+  node.className = consoleLineClass(source);
+  node.textContent = line;
+  box.appendChild(node);
+  while (box.children.length > CONSOLE_MAX_LINES) box.removeChild(box.firstElementChild!);
+  box.scrollTop = box.scrollHeight;
+}
+function setLaunchBadge(text: string, cls: "dim" | "ok" | "warn" | "err") {
+  const badge = el<HTMLSpanElement>("launch-badge");
+  badge.className = `badge badge-${cls}`;
+  badge.textContent = text;
+}
+function clearConsole() {
+  const box = el<HTMLDivElement>("console-box");
+  box.innerHTML = '<div class="console-line dim">[quartz] 启动日志将显示在这里</div>';
+}
+
+/* ---------- 完整文件权限 ---------- */
+function togglePermUI(granted: boolean) {
+  for (const id of ["perm-banner", "login-perm", "settings-perm"]) {
+    if (granted) hide(id);
+    else show(id);
+  }
+  const state = el<HTMLSpanElement>("perm-state");
+  state.textContent = granted ? "已授权（完整文件访问）" : "未授权";
+  state.style.color = granted ? "var(--ok, #4ade80)" : "var(--warn, #fbbf24)";
+}
+async function refreshPermission() {
+  let granted = true;
+  try {
+    granted = (await invoke<EnvInfo>("get_env_info")).fullAccess;
+  } catch {
+    return; // 桥接不可用时静默
+  }
+  const changed = granted !== fullAccess;
+  fullAccess = granted;
+  togglePermUI(granted);
+  if (changed && granted) {
+    // 授权成功：切换到公共标准目录 + 迁移旧数据
+    toast("已获得完整文件权限，正在切换标准目录…", "ok");
+    try {
+      const diag = await invoke<EnvInfo>("reinit_storage");
+      setText("game-dir", diag.gameDir);
+      setText("settings-game-dir", diag.gameDir);
+      appendLog("quartz", `[quartz] 存储已切换到：${diag.gameDir}`);
+      await refreshInstalled();
+    } catch (e) {
+      toast(`存储切换失败：${String(e)}`, "err");
+    }
+  }
+}
+async function requestPermission() {
+  try {
+    await invoke("request_storage_permission");
+    toast("请在系统弹窗中允许，或到系统设置开启存储权限", "");
+  } catch (e) {
+    toast(`权限请求失败：${String(e)}`, "err");
+  }
+  // 授权后回焦时自动重检
+  window.setTimeout(refreshPermission, 1200);
+  window.setTimeout(refreshPermission, 3000);
+}
+
+/* ---------- Java 运行时状态 ---------- */
+async function refreshRuntimeBadge() {
+  const badge = el<HTMLSpanElement>("runtime-badge");
+  const settingsRuntime = el<HTMLSpanElement>("settings-runtime");
+  try {
+    const st = await invoke<{ installed: boolean; version: string | null; path: string; specAvailable: boolean }>("get_runtime_status", { javaMajor: 17 });
+    if (st.installed) {
+      badge.className = "badge badge-ok";
+      badge.textContent = `Java 运行时就绪（${st.version ?? "17"}）`;
+      settingsRuntime.textContent = `就绪（${st.version ?? "17"}）`;
+    } else if (st.specAvailable) {
+      badge.className = "badge badge-warn";
+      badge.textContent = "运行时未下载（启动时自动获取）";
+      settingsRuntime.textContent = "未下载（启动时自动获取）";
+    } else {
+      badge.className = "badge badge-dim";
+      badge.textContent = "暂无下载源";
+      settingsRuntime.textContent = "暂无下载源";
+    }
+  } catch {
+    badge.className = "badge badge-dim";
+    badge.textContent = "运行时检测失败";
+    settingsRuntime.textContent = "检测失败";
+  }
+}
+
+function showRtProgress() {
+  runtimeDownloading = true;
+  show("rt-progress");
+  const fill = el<HTMLDivElement>("rt-progress-fill");
+  fill.style.width = "0%";
+  setText("rt-progress-text", "0%");
+  setText("rt-progress-stage", "准备中");
+  setText("rt-progress-file", "");
+}
+function onRuntimeProgress(p: DownloadProgress) {
+  if (!runtimeDownloading) return;
+  if (p.stage === "error") {
+    runtimeDownloading = false;
+    hide("rt-progress");
+    appendLog("quartz", `[quartz] 运行时下载失败：${p.error ?? "未知错误"}`);
+    toast("运行时下载失败，可重试", "err");
+    pendingLaunchVersion = null;
+    return;
+  }
+  if (p.stage === "done") {
+    runtimeDownloading = false;
+    hide("rt-progress");
+    appendLog("quartz", `[quartz] Java 运行时就绪：${p.file}`);
+    toast("Java 运行时就绪", "ok");
+    refreshRuntimeBadge();
+    const v = pendingLaunchVersion;
+    pendingLaunchVersion = null;
+    if (v) doLaunch(v);
+    return;
+  }
+  const fill = el<HTMLDivElement>("rt-progress-fill");
+  setText("rt-progress-stage", p.stage === "runtime-download" ? "下载" : "解包");
+  setText("rt-progress-file", p.file ?? "");
+  if (p.total > 0) {
+    fill.style.width = `${Math.min(100, p.percent).toFixed(1)}%`;
+    setText("rt-progress-text", `${p.percent.toFixed(1)}%（${bytes(p.current)} / ${bytes(p.total)}）`);
+  } else {
+    fill.style.width = "100%";
+    setText("rt-progress-text", String(p.current));
+  }
+}
+
+/* ---------- 启动游戏（M0 真实启动链路） ---------- */
+async function doLaunch(versionId: string) {
+  try {
+    setLaunchBadge("启动中…", "warn");
+    appendLog("quartz", `[quartz] 启动 Minecraft ${versionId}…`);
+    await invoke("launch_game", { versionId });
+    setLaunchBadge("运行中", "ok");
+    show("stop-btn");
+  } catch (e) {
+    const msg = String(e);
+    if (msg.startsWith("RUNTIME_MISSING:")) {
+      const major = Number(msg.split(":")[1] || 17);
+      appendLog("quartz", `[quartz] 需要 Java ${major} 运行时，开始自动下载…`);
+      showRtProgress();
+      try {
+        await invoke("download_runtime", { javaMajor: major });
+      } catch (e2) {
+        runtimeDownloading = false;
+        hide("rt-progress");
+        toast(String(e2), "err");
+        setLaunchBadge("启动失败", "err");
+      }
+      return;
+    }
+    setLaunchBadge("启动失败", "err");
+    hide("stop-btn");
+    appendLog("quartz", `[quartz] 启动失败：${msg}`);
+    toast(msg, "err");
+  }
+}
+
 async function launch() {
   const versionId = el<HTMLSelectElement>("version-select").value;
+  if (!versionId) {
+    toast("请先选择版本", "err");
+    return;
+  }
+  if (!installed.has(versionId)) {
+    toast("该版本尚未下载，请先在「下载游戏」页获取", "err");
+    return;
+  }
   try {
-    const msg = await invoke<string>("launch_game", { versionId: versionId || "" });
-    toast(msg, "ok");
+    const pf = await invoke<Preflight>("launch_preflight", { versionId });
+    if (!pf.accountOk) {
+      toast("请先在「账户」页登录", "err");
+      return;
+    }
+    if (!pf.versionInstalled) {
+      toast("版本文件缺失，请重新下载", "err");
+      return;
+    }
+    if (!pf.runtimeInstalled) {
+      if (!pf.runtimeSpecAvailable) {
+        toast(`该版本需要 Java ${pf.javaMajor}，运行时下载源暂未收录`, "err");
+        return;
+      }
+      appendLog("quartz", `[quartz] 需要 Java ${pf.javaMajor} 运行时，开始自动下载…`);
+      pendingLaunchVersion = versionId;
+      showRtProgress();
+      await invoke("download_runtime", { javaMajor: pf.javaMajor });
+      return; // 完成事件回调里继续 doLaunch
+    }
+    await doLaunch(versionId);
   } catch (e) {
     toast(String(e), "err");
   }
@@ -621,6 +869,8 @@ function enterApp() {
   loadAccounts();
   loadVersions();
   refreshInstalled();
+  refreshRuntimeBadge();
+  refreshPermission();
 }
 
 /* ---------- 事件绑定 ---------- */
@@ -673,12 +923,40 @@ function bindEvents() {
   el<HTMLInputElement>("new-account-name").addEventListener("keydown", (e) => {
     if ((e as KeyboardEvent).key === "Enter") addAccount();
   });
+
+  // 完整文件权限（登录屏 / 主界面横幅 / 设置页三处入口）
+  for (const id of ["login-perm-btn", "perm-banner-btn", "settings-perm-btn"]) {
+    el<HTMLButtonElement>(id).addEventListener("click", requestPermission);
+  }
+
+  // 启动控制台
+  el<HTMLButtonElement>("console-clear-btn").addEventListener("click", clearConsole);
+  el<HTMLButtonElement>("stop-btn").addEventListener("click", async () => {
+    try {
+      const stopped = await invoke<boolean>("stop_game");
+      if (stopped) {
+        toast("已发送终止信号", "ok");
+        appendLog("quartz", "[quartz] 已发送终止信号 (SIGKILL)");
+      } else {
+        toast("当前没有运行中的游戏", "");
+      }
+    } catch (e) {
+      toast(String(e), "err");
+    }
+  });
+
+  // 授权后回到应用时自动重检权限（覆盖从系统设置返回的场景）
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") refreshPermission();
+  });
+  window.addEventListener("focus", refreshPermission);
 }
 
 /* ---------- 启动 ---------- */
 async function boot() {
   bindEvents();
   await ensureProgressListener();
+  await refreshPermission();
   try {
     const acc = await invoke<Account | null>("get_account");
     if (acc && acc.username) {

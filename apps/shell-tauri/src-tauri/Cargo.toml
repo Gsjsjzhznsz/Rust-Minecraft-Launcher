@@ -1,7 +1,7 @@
 [package]
 name = "quartz-shell-tauri"
 description = "Quartz 桌面/移动 Tauri 2 壳层（方案 A：系统 WebView UI + Rust 核心直调）"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 license = "GPL-3.0-or-later"
 
@@ -23,6 +23,10 @@ quartz-core = { path = "../../../crates/quartz-core" }
 [target.'cfg(target_os = "android")'.dependencies]
 jni = "0.21"
 ndk-context = "0.1"
+
+# Unix：stop_game 需要 libc::kill 终止游戏子进程
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [lib]
 name = "quartz_shell_lib"

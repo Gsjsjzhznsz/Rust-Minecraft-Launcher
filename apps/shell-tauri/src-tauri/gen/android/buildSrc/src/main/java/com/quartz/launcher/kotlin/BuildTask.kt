@@ -23,6 +23,12 @@ abstract class BuildTask : DefaultTask() {
 
     @TaskAction
     fun assemble() {
+        // 空间受限环境：已通过 tauri CLI 预编译好 .so 时，设置此变量跳过 cargo
+        //（复用 target/<triple>/<profile>/libquartz_shell_lib.so）
+        if (System.getenv("QUARTZ_SKIP_CARGO_BUILD") == "1") {
+            logger.lifecycle("[quartz] QUARTZ_SKIP_CARGO_BUILD=1 —— 跳过 cargo，复用已编译的动态库")
+            return
+        }
         // 修复：全局 npm CLI 入口（原模板 `node tauri ...` 无法解析 main.js）
         val executable = """node""";
         try {

@@ -26,3 +26,5 @@ md-5 = "0.10"
 hex = "0.4"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 clap = { version = "4", features = ["derive"] }
+tar = "0.4"
+xz2 = "0.1"

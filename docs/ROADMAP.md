@@ -27,7 +27,12 @@
 
 ### M0 剩余
 
-- [ ] 两周 POC-A：Tauri 2 Android 壳 + core 跑通真实下载（piston-meta 在线）
+- [x] 两周 POC-A：Tauri 2 Android 壳 + core 跑通真实下载（piston-meta 在线）
+- [x] Android 完整文件权限：targetSdk 28 + READ/WRITE_EXTERNAL_STORAGE 运行时授权，
+      游戏根目录授权后切换 /storage/emulated/0/Quartz/files，旧数据后台迁移
+- [x] M0 启动链路：JRE17 pack 下载/解包/校验（Pojav android-openjdk，aarch64 原生 ELF）
+      + LaunchPlan 装配 + JVM 子进程启动 + launch://log / launch://exit 事件 + 启动控制台
+- [ ] 移动端画面输出：Pojav LWJGL 移植（自定义 GLFW → Android Surface 桥）—— M1 首项
 - [ ] 两周 POC-B：鸿蒙 ArkWeb 薄壳加载同一 ui-pack + NAPI 桥接（方案 A 最后一处不确定点）
 - [ ] WoA 验证：OpenJDK windows-aarch64 自构建 + 启动 1.20.4
 - [ ] UniFFI 绑定生成（Kotlin/Swift）接入 CI

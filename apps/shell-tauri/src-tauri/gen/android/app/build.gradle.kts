@@ -27,7 +27,12 @@ android {
         manifestPlaceholders["usesCleartextTraffic"] = "false"
         applicationId = "com.quartz.launcher"
         minSdk = 24
-        targetSdk = 36
+        // 固定 28（Pojav/Termux 同款约束），两个硬性理由：
+        // 1) Android 10 起 targetSdk>=29 禁止 exec() 应用主目录文件，
+        //    JVM pack 的 bin/java（M0 启动链路）将无法作为子进程拉起；
+        // 2) targetSdk<=29 走旧存储模型：READ/WRITE_EXTERNAL_STORAGE 运行时授权
+        //    即获得完整文件读写，游戏目录可用 /storage/emulated/0/Quartz/files。
+        targetSdk = 28
         versionCode = tauriProperties.getProperty("tauri.android.versionCode", "1").toInt()
         versionName = tauriProperties.getProperty("tauri.android.versionName", "1.0")
     }

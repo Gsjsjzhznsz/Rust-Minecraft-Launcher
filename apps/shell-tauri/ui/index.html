@@ -24,6 +24,10 @@
             进入启动器
           </button>
           <div id="login-error" class="alert alert-error hidden"></div>
+          <div id="login-perm" class="alert alert-warn hidden">
+            <span id="login-perm-text">未授予完整文件权限：游戏文件将保存在应用私有目录（卸载会丢失）。</span>
+            <button id="login-perm-btn" class="btn btn-sm btn-primary" style="margin-top:8px">授权完整文件权限</button>
+          </div>
           <p class="login-note">账号仅写入本地 accounts.json，不连接微软服务，登录后可随时在「账户」页添加或切换。</p>
         </div>
       </div>
@@ -60,7 +64,7 @@
             <span class="avatar avatar-sm" id="sidebar-avatar">?</span>
             <span class="mini-name" id="sidebar-account-name">未登录</span>
           </div>
-          <div class="version-tag" id="app-version">v0.1.1</div>
+          <div class="version-tag" id="app-version">v0.1.2</div>
         </div>
       </aside>
 
@@ -77,6 +81,12 @@
       </header>
 
       <main class="content">
+        <!-- 完整文件权限横幅（未授权时显示） -->
+        <div id="perm-banner" class="perm-banner hidden">
+          <span class="perm-banner-text">未授予完整文件权限：游戏文件保存在应用私有目录，卸载应用会丢失。建议授权后使用标准目录（可浏览、卸载不丢）。</span>
+          <button id="perm-banner-btn" class="btn btn-sm btn-primary">立即授权</button>
+        </div>
+
         <!-- ====== 主页 ====== -->
         <section id="page-home" class="page">
           <div class="page-head">
@@ -97,7 +107,8 @@
             </div>
             <div class="hero-meta">
               <span id="install-badge" class="badge badge-dim">检查中…</span>
-              <span class="hero-hint">启动功能将在 M0 收尾接入进程内 JVM；当前版本提供完整下载与账号管理</span>
+              <span id="runtime-badge" class="badge badge-dim">运行时检测中…</span>
+              <span class="hero-hint">M0 启动链路已接入：启动前自动准备 Java 运行时与游戏文件</span>
             </div>
           </div>
 
@@ -110,6 +121,28 @@
             <div class="progress-bar"><div id="home-progress-fill" class="progress-fill"></div></div>
             <div id="home-progress-file" class="progress-file"></div>
             <div id="home-progress-status" class="alert hidden"></div>
+          </div>
+
+          <!-- 启动控制台（M0） -->
+          <div class="card console-card">
+            <div class="card-title-row">
+              <svg class="icon" viewBox="0 0 24 24"><path d="M4 5h16v14H4z"/><path d="m7 9 3 3-3 3M12 15h5"/></svg>
+              <h3>启动控制台</h3>
+              <span id="launch-badge" class="badge badge-dim">空闲</span>
+              <span class="title-spacer"></span>
+              <button id="stop-btn" class="btn btn-sm btn-danger hidden">停止游戏</button>
+              <button id="console-clear-btn" class="btn btn-sm btn-ghost">清屏</button>
+            </div>
+            <div id="console-box" class="console-box"><div class="console-line dim">[quartz] 启动日志将显示在这里</div></div>
+            <div id="rt-progress" class="progress-card hidden">
+              <div class="progress-head">
+                <span class="progress-title">Java 运行时</span>
+                <span id="rt-progress-stage" class="progress-stage"></span>
+                <span id="rt-progress-text" class="progress-text">0%</span>
+              </div>
+              <div class="progress-bar"><div id="rt-progress-fill" class="progress-fill"></div></div>
+              <div id="rt-progress-file" class="progress-file"></div>
+            </div>
           </div>
 
           <div class="card">
@@ -200,8 +233,14 @@
             </div>
             <div class="kv"><span class="kv-key">游戏根目录</span><code class="path-line" id="settings-game-dir">读取中…</code></div>
             <div class="kv"><span class="kv-key">存储模式</span><span id="storage-mode" class="kv-val">-</span></div>
+            <div class="kv"><span class="kv-key">完整文件权限</span><span id="perm-state" class="kv-val">-</span></div>
+            <div class="kv"><span class="kv-key">Java 运行时</span><span id="settings-runtime" class="kv-val">-</span></div>
             <div class="kv"><span class="kv-key">标准布局</span><span id="layout-status" class="kv-val">-</span></div>
             <div id="storage-warn" class="alert alert-warn hidden"></div>
+            <div id="settings-perm" class="alert alert-warn hidden">
+              <span id="settings-perm-text">未授予完整文件权限。</span>
+              <button id="settings-perm-btn" class="btn btn-sm btn-primary" style="margin-top:8px">授权完整文件权限</button>
+            </div>
           </div>
 
           <div class="card">

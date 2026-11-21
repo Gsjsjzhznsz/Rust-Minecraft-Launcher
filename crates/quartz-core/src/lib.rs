@@ -30,6 +30,7 @@ pub mod paths;
 pub mod platform;
 pub mod renderbus;
 pub mod rules;
+pub mod runtime;
 pub mod uipack;
 
 /// 内嵌测试夹具（合成样例数据）。
