@@ -700,7 +700,7 @@ async function refreshPermission() {
 async function requestPermission() {
   try {
     await invoke("request_storage_permission");
-    toast("请在系统弹窗中允许，或到系统设置开启存储权限", "");
+    toast("Android 11+ 已打开「所有文件访问」设置页，请开启后返回应用；低版本请在弹窗中允许", "");
   } catch (e) {
     toast(`权限请求失败：${String(e)}`, "err");
   }

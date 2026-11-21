@@ -116,13 +116,34 @@ fn jni_internal_files_dir(env: &mut jni::JNIEnv, context: &jni::objects::JObject
 // ---------------------------------------------------------------------------
 //
 // 设计：APK 固定 targetSdk 28（Android 10 前的存储模型 + 允许 exec() 应用目录
-// 内的 JVM —— Pojav/Termux 同款方案）。READ/WRITE_EXTERNAL_STORAGE 经运行时
-// 弹窗授权后，应用对 /storage/emulated/0 拥有完整读写权限，游戏文件即可放在
-// 文件管理器可见的标准目录 /storage/emulated/0/Quartz/files。
+// 内的 JVM —— Pojav/Termux 同款方案）。
+//
+// 授权通道按系统版本分流（MainActivity.requestStorageAccess）:
+// - Android 11+（API 30+）：MANAGE_EXTERNAL_STORAGE「所有文件访问」系统设置页。
+//   不走 WRITE 弹窗的原因：targetSdk<=29 应用在 Android 11+ 经弹窗授予存储权限时，
+//   系统会杀掉应用进程刷新 FUSE 挂载视图 —— 用户视角即「授权后闪退」。
+//   所有文件访问页授权不杀进程，返回后 focus 重检即可切换标准目录。
+// - Android 10 及以下（API <= 29）：READ/WRITE_EXTERNAL_STORAGE 运行时弹窗
+//   （旧存储模型，授权即时生效不杀进程）。
+// 游戏文件即可放在文件管理器可见的标准目录 /storage/emulated/0/Quartz/files。
 
-/// Android 端 WRITE_EXTERNAL_STORAGE 是否已授权（checkSelfPermission == GRANTED）。
+/// Android 端存储权限是否已授权。
+/// 优先走壳层 Kotlin 判定（Android 11+ = isExternalStorageManager，
+/// 10- = WRITE_EXTERNAL_STORAGE 已 GRANTED）；JNI 不可用时回退纯 checkSelfPermission。
 #[cfg(target_os = "android")]
 fn android_storage_permission_granted() -> bool {
+    // 1) MainActivity.isStorageAccessGranted()（覆盖 MANAGE_EXTERNAL_STORAGE）
+    if let Some(granted) = with_jni(|env, ctx| {
+        Some(
+            env.call_method(ctx, "isStorageAccessGranted", "()Z", &[])
+                .ok()?
+                .z()
+                .ok()?,
+        )
+    }) {
+        return granted;
+    }
+    // 2) 回退：WRITE checkSelfPermission（仅覆盖旧模型，JNI 异常时尽力而为）
     use jni::objects::JValue;
     with_jni(|env, ctx| {
         let perm = env
@@ -162,12 +183,22 @@ fn get_permission_state() -> serde_json::Value {
     json!({ "granted": storage_permission_granted() })
 }
 
-/// 触发系统权限弹窗（WRITE/READ_EXTERNAL_STORAGE）。
-/// 结果不通过本命令返回：UI 在 focus/visibilitychange 时重新查询状态。
+/// 申请完整文件权限：Android 11+ 跳系统「所有文件访问」设置页（授权不杀进程），
+/// Android 10- 触发运行时弹窗。结果不通过本命令返回：UI 在 focus/visibilitychange
+/// 时重新查询状态（回到应用后自动重检）。
 #[tauri::command]
 fn request_storage_permission() -> Result<bool, String> {
     #[cfg(target_os = "android")]
     {
+        // 1) MainActivity.requestStorageAccess()：按系统版本分流（11+ 设置页 / 10- 弹窗）
+        let via_kotlin = with_jni(|env, ctx| {
+            env.call_method(ctx, "requestStorageAccess", "()V", &[]).ok()?;
+            Some(())
+        });
+        if via_kotlin.is_some() {
+            return Ok(true);
+        }
+        // 2) 回退：直接 requestPermissions 弹窗（旧路径，仅 WRITE/READ）
         use jni::objects::JValue;
         with_jni(|env, ctx| {
             let write = env.new_string("android.permission.WRITE_EXTERNAL_STORAGE").ok()?;
@@ -209,6 +240,9 @@ pub struct StorageDiag {
 }
 
 static STORAGE_DIAG: Mutex<Option<StorageDiag>> = Mutex::new(None);
+
+/// 迁移互斥：焦点/可见性事件可能连续触发多次 reinit_storage，防止并发重复拷贝。
+static MIGRATING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Android 平台解析真实可写目录；ndk-context 未初始化等异常一律回退硬编码路径。
 ///
@@ -391,14 +425,27 @@ fn migrate_root(from: PathBuf, to: PathBuf, app: AppHandle) {
 
 /// 权限变化后重解析存储根；根变化时后台迁移旧数据（幂等，跳过目标已有文件）。
 #[tauri::command]
-fn reinit_storage(app: AppHandle) -> Result<serde_json::Value, String> {
+fn reinit_storage(app: AppHandle, state: State<'_, AppState>) -> Result<serde_json::Value, String> {
     let old_root = paths::game_root();
     let diag = init_storage();
     *STORAGE_DIAG.lock().map_err(|_| "内部状态锁异常")? = Some(diag.clone());
     let new_root = paths::game_root();
-    if old_root != new_root && old_root.exists() {
+    // 游戏运行中不迁移（避免拷贝正在被 JVM 读写的文件）；同时防并发迁移。
+    let game_running = state
+        .game_pid
+        .lock()
+        .map_err(|_| "内部状态锁异常")?
+        .is_some();
+    let mut do_migrate = old_root != new_root && old_root.exists() && !game_running;
+    if do_migrate {
+        do_migrate = !MIGRATING.swap(true, std::sync::atomic::Ordering::SeqCst);
+    }
+    if do_migrate {
         let app2 = app.clone();
-        std::thread::spawn(move || migrate_root(old_root, new_root, app2));
+        std::thread::spawn(move || {
+            migrate_root(old_root, new_root, app2);
+            MIGRATING.store(false, std::sync::atomic::Ordering::SeqCst);
+        });
     }
     Ok(storage_json(&diag))
 }
@@ -850,7 +897,22 @@ fn spawn_game(
     let jre_home = runtime::install_dir(major);
     let game_dir = paths::minecraft_dir();
 
-    // ---- smoke test：JRE 可执行性 ----
+    // ---- JVM 动态库搜索路径（必须先于 smoke test 计算，两处共用） ----
+    // bionic linker 不认 RUNPATH，bin/java 找 libjli.so 完全依赖 LD_LIBRARY_PATH。
+    // 覆盖包内全部可能落点：lib（libjli.so 实测在此）、lib/jli、lib/server、
+    // lib/client（arm32 client VM）、natives 目录（游戏 so）。
+    let ld_library_path = format!(
+        "{}:{}:{}:{}:{}",
+        jre_home.join("lib").display(),
+        jre_home.join("lib/jli").display(),
+        jre_home.join("lib/server").display(),
+        jre_home.join("lib/client").display(),
+        plan.natives_dir.display()
+    );
+
+    // ---- smoke test：JRE 可执行性（与真实启动完全同环境）----
+    // 必须带 LD_LIBRARY_PATH/JAVA_HOME：Pojav android-openjdk 的 bin/java 无 RUNPATH，
+    // 裸跑必报 CANNOT LINK。自检失败直接终止启动并回显全部输出（可诊断，不静默）。
     let _ = app.emit(
         "launch://log",
         &LaunchLog {
@@ -858,11 +920,15 @@ fn spawn_game(
             line: format!("[quartz] JRE {major}：{}", jre_home.display()),
         },
     );
-    match Command::new(&java).arg("-version").output() {
-        Ok(out) => {
-            let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
-            text.push_str(&String::from_utf8_lossy(&out.stderr));
-            for line in text.lines().filter(|l| !l.trim().is_empty()).take(4) {
+    match Command::new(&java)
+        .arg("-version")
+        .env("JAVA_HOME", &jre_home)
+        .env("LD_LIBRARY_PATH", &ld_library_path)
+        .output()
+    {
+        Ok(out) if out.status.success() => {
+            let text = String::from_utf8_lossy(&out.stderr);
+            for line in text.lines().filter(|l| !l.trim().is_empty()).take(2) {
                 let _ = app.emit(
                     "launch://log",
                     &LaunchLog {
@@ -871,6 +937,22 @@ fn spawn_game(
                     },
                 );
             }
+        }
+        Ok(out) => {
+            // 自检退出码非 0：把完整输出带回给 UI（linker 报错 / JVM 初始化错误都在这里）
+            let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+            text.push_str(&String::from_utf8_lossy(&out.stderr));
+            let tail: String = text
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .collect::<Vec<_>>()
+                .join(" | ");
+            return Err(format!(
+                "JVM 自检失败（退出码 {}，LD_LIBRARY_PATH={}）：{}",
+                out.status.code().unwrap_or(-1),
+                ld_library_path,
+                if tail.is_empty() { "无输出（进程可能被信号杀死）" } else { &tail }
+            ));
         }
         Err(e) => {
             return Err(format!(
@@ -881,12 +963,6 @@ fn spawn_game(
     }
 
     // ---- 组装命令：jvm_args + main_class + game_args ----
-    let ld_library_path = format!(
-        "{}:{}:{}",
-        jre_home.join("lib").display(),
-        jre_home.join("lib/server").display(),
-        plan.natives_dir.display()
-    );
     let mut cmd = Command::new(&java);
     cmd.args(&plan.jvm_args)
         .arg(&plan.main_class)
@@ -936,14 +1012,34 @@ fn spawn_game(
     }
 
     // ---- 退出看护：wait -> launch://exit -> 清理 pid 槽位 ----
+    // 退出码语义：正常退出 = code；信号死亡 = 128+信号号（137=SIGKILL，134=SIGABRT，
+    // 之前恒报 -1 无法区分 linker abort / SIGSEGV / 被系统杀死）。
     let game_pid_exit = game_pid;
     std::thread::spawn(move || {
-        let code = child.wait().map(|s| s.code().unwrap_or(-1)).unwrap_or(-1);
+        let code = child.wait().map(|st| exit_status_code(&st)).unwrap_or(-1);
         if let Ok(mut slot) = game_pid_exit.lock() {
             // stop_game 已 take 时这里已是 None，避免覆盖后续新进程
             if slot.is_some() {
                 *slot = None;
             }
+        }
+        // 常见信号死亡的提示行（帮助用户/开发者定位）
+        if code == 137 {
+            let _ = app.emit(
+                "launch://log",
+                &LaunchLog {
+                    source: "quartz".into(),
+                    line: "[quartz] 退出码 137 = SIGKILL：常见于系统低内存回收（尝试调小内存）或 Android 12+ 幽灵进程限制".into(),
+                },
+            );
+        } else if code == 134 {
+            let _ = app.emit(
+                "launch://log",
+                &LaunchLog {
+                    source: "quartz".into(),
+                    line: "[quartz] 退出码 134 = SIGABRT：常见于动态链接失败或 JVM fatal error，见上方 stderr 输出".into(),
+                },
+            );
         }
         let _ = app.emit(
             "launch://exit",
@@ -951,6 +1047,21 @@ fn spawn_game(
         );
     });
     Ok(())
+}
+
+/// ExitStatus -> 退出码：正常退出取 code()；信号死亡取 128+signal。
+fn exit_status_code(st: &std::process::ExitStatus) -> i32 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        st.code()
+            .or_else(|| st.signal().map(|sig| 128 + sig))
+            .unwrap_or(-1)
+    }
+    #[cfg(not(unix))]
+    {
+        st.code().unwrap_or(-1)
+    }
 }
 
 /// 真实启动：版本 JSON -> LaunchPlan -> JVM 子进程（M0 已接入）。

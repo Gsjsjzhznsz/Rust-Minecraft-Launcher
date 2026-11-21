@@ -1,11 +1,14 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <uses-permission android:name="android.permission.INTERNET" />
-    <!-- 完整文件权限（targetSdk 28 旧存储模型）：授权后游戏文件写入
-         /storage/emulated/0/Quartz/files（文件管理器可见、卸载不丢）；
-         运行时弹窗由壳层 requestPermissions 触发 -->
+    <!-- Android 10- 旧存储模型（targetSdk 28）：运行时弹窗授权后获得
+         /storage/emulated/0 完整读写；弹窗由 MainActivity.requestStorageAccess 触发 -->
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
+    <!-- Android 11+「所有文件访问」（完整文件权限主通道）：
+         经系统设置页授权（授权不杀进程；存储权限弹窗在 11+ 上会杀进程刷新
+         FUSE 挂载视图，表现为授权后闪退），MainActivity 按系统版本分流 -->
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
 
     <!-- AndroidTV support -->
     <uses-feature android:name="android.software.leanback" android:required="false" />
