@@ -19,6 +19,11 @@ serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
 quartz-core = { path = "../../../crates/quartz-core" }
 
+# Android：JNI 解析真实可写存储目录（getExternalFilesDir / getFilesDir）
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"
+ndk-context = "0.1"
+
 [lib]
 name = "quartz_shell_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]

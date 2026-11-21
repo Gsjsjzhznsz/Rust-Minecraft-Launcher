@@ -2647,6 +2647,8 @@ dependencies = [
 name = "quartz-shell-tauri"
 version = "0.1.0"
 dependencies = [
+ "jni",
+ "ndk-context",
  "quartz-core",
  "serde",
  "serde_json",

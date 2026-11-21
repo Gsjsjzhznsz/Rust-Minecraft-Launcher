@@ -20,12 +20,35 @@
 
 use std::fs;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 /// Android 应用包名（与 apps/shell-tauri/src-tauri/tauri.conf.json 的 identifier 一致）。
 pub const ANDROID_PACKAGE_ID: &str = "com.quartz.launcher";
 
-/// 游戏根目录（唯一权威）。
+/// 运行时根目录覆盖（壳层启动时经平台 API 解析后注入）。
+///
+/// 背景（error13 / os error 13 = EACCES）：Android 11+ scoped storage 下，
+/// 直接手拼 `/storage/emulated/0/Android/data/<pkg>/files` 在部分 ROM 上
+/// 无法由应用创建（FUSE 拒绝 mkdir），必须经 `Context.getExternalFilesDir()`
+/// 等平台 API 取真实可写路径。壳层（src-tauri）在启动时调用本函数注入；
+/// 硬编码路径只作为最后回退。
+static RUNTIME_ROOT: OnceLock<PathBuf> = OnceLock::new();
+
+/// 注入运行时游戏根目录（仅首次生效；壳层在 ensure_layout 之前调用）。
+pub fn set_runtime_root(root: PathBuf) -> bool {
+    RUNTIME_ROOT.set(root).is_ok()
+}
+
+/// 运行时注入的根目录（未注入返回 None）。
+pub fn runtime_root() -> Option<&'static PathBuf> {
+    RUNTIME_ROOT.get()
+}
+
+/// 游戏根目录（唯一权威）。优先级：运行时注入 > 环境变量 > 平台默认。
 pub fn game_root() -> PathBuf {
+    if let Some(root) = RUNTIME_ROOT.get() {
+        return root.clone();
+    }
     if let Ok(root) = std::env::var("QUARTZ_GAME_ROOT") {
         if !root.trim().is_empty() {
             return PathBuf::from(root);
@@ -170,8 +193,11 @@ pub fn ensure_layout() -> std::io::Result<()> {
 mod tests {
     use super::*;
 
+    // 单测试函数串行执行：RUNTIME_ROOT 是进程级全局状态，
+    // 拆成多个并行测试会互相污染（先验证默认布局，再验证运行时覆盖）。
     #[test]
-    fn layout_paths_are_standard() {
+    fn layout_and_runtime_override() {
+        // —— 默认布局：全部派生路径相对同一根 —— //
         let root = game_root();
         assert!(root.ends_with(".minecraft") || root.join(".minecraft").is_absolute());
         assert_eq!(version_jar("1.20.4"), versions_dir().join("1.20.4/1.20.4.jar"));
@@ -183,5 +209,15 @@ mod tests {
         // accounts.json 与 jres 位于游戏根（而非 .minecraft 内）
         assert_eq!(accounts_file(), root.join("accounts.json"));
         assert_eq!(jres_dir(), root.join("jres"));
+
+        // —— 运行时覆盖（Android 壳层注入场景）—— //
+        let override_root = std::env::temp_dir().join("quartz-test-root");
+        assert!(set_runtime_root(override_root.clone()));
+        // 重复注入被忽略（仅首次生效）
+        assert!(!set_runtime_root(std::env::temp_dir().join("other")));
+        assert_eq!(game_root(), override_root);
+        assert_eq!(runtime_root(), Some(&override_root));
+        assert_eq!(minecraft_dir(), override_root.join(".minecraft"));
+        assert_eq!(accounts_file(), override_root.join("accounts.json"));
     }
 }

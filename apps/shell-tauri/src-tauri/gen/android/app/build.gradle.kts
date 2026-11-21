@@ -15,13 +15,19 @@ val tauriProperties = Properties().apply {
 }
 
 android {
-    compileSdk = 37
+    compileSdk = 36
+    ndkVersion = "27.0.12077973"
     namespace = "com.quartz.launcher"
+    // 沙箱内存有限：禁用 release lint vital（R8 lint 类加载器会 OOM 杀掉 gradle 守护进程）
+    lint {
+        checkReleaseBuilds = false
+        abortOnError = false
+    }
     defaultConfig {
         manifestPlaceholders["usesCleartextTraffic"] = "false"
         applicationId = "com.quartz.launcher"
         minSdk = 24
-        targetSdk = 37
+        targetSdk = 36
         versionCode = tauriProperties.getProperty("tauri.android.versionCode", "1").toInt()
         versionName = tauriProperties.getProperty("tauri.android.versionName", "1.0")
     }

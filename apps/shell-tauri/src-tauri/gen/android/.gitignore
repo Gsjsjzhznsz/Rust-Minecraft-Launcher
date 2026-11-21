@@ -17,4 +17,7 @@ key.properties
 keystore.properties
 
 /.tauri
-/tauri.settings.gradle
+/tauri.settings.gradlegen/android/app/build/
+gen/android/build/
+gen/android/.gradle/
+gen/android/local.properties

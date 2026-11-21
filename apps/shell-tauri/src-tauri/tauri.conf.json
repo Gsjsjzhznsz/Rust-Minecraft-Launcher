@@ -1,12 +1,12 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Quartz Launcher",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "identifier": "com.quartz.launcher",
   "build": {
-    "beforeDevCommand": "npm run dev --prefix ../ui",
+    "beforeDevCommand": "npm run dev --prefix ./ui",
     "devUrl": "http://localhost:5173",
-    "beforeBuildCommand": "npm run build --prefix ../ui",
+    "beforeBuildCommand": "npm run build --prefix ./ui",
     "frontendDist": "../ui/dist"
   },
   "app": {

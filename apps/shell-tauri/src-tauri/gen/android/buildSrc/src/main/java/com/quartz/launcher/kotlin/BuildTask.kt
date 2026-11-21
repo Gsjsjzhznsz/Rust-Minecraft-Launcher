@@ -23,6 +23,7 @@ abstract class BuildTask : DefaultTask() {
 
     @TaskAction
     fun assemble() {
+        // 修复：全局 npm CLI 入口（原模板 `node tauri ...` 无法解析 main.js）
         val executable = """node""";
         try {
             runTauriCli(executable)
@@ -55,7 +56,7 @@ abstract class BuildTask : DefaultTask() {
         val rootDirRel = rootDirRel ?: throw GradleException("rootDirRel cannot be null")
         val target = target ?: throw GradleException("target cannot be null")
         val release = release ?: throw GradleException("release cannot be null")
-        val args = listOf("tauri", "android", "android-studio-script");
+        val args = listOf("/home/z/.npm-global/lib/node_modules/@tauri-apps/cli/tauri.js", "android", "android-studio-script");
 
         execOperations.exec {
             workingDir(File(projectDir, rootDirRel))
