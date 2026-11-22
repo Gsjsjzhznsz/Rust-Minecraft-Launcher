@@ -214,6 +214,10 @@ pub async fn download_and_install(
     let _ = std::fs::remove_dir_all(&staging);
     std::fs::create_dir_all(&staging)?;
 
+    // 存储空间前置检查（v8 加固）：下载 + 解压副本，统一按 200MB 下限把关
+    crate::space::ensure_free(&dir, 200 * 1024 * 1024, "下载渲染层")
+        .map_err(crate::error::Error::Other)?;
+
     let report = |stage: &str, cur: u64, total: u64, file: String, done: bool| {
         let percent = if total > 0 {
             ((cur as f64 / total as f64) * 100.0).clamp(0.0, 100.0)
@@ -245,11 +249,17 @@ pub async fn download_and_install(
                     file_total = total.saturating_sub(done_bytes);
                 }
                 let mut stream = resp;
-                let mut buf =
-                    tokio::io::BufWriter::new(tokio::fs::File::create(staging.join(name)).await?);
+                let target = staging.join(name);
+                let mut buf = tokio::io::BufWriter::new(
+                    tokio::fs::File::create(&target)
+                        .await
+                        .map_err(|e| Error::Other(crate::error::io_context(&e, &target)))?,
+                );
                 use tokio::io::AsyncWriteExt;
                 while let Some(chunk) = crate::mirror::next_chunk(&mut stream).await? {
-                    buf.write_all(&chunk).await?;
+                    buf.write_all(&chunk)
+                        .await
+                        .map_err(|e| Error::Other(crate::error::io_context(&e, &target)))?;
                     done_bytes += chunk.len() as u64;
                     report(
                         "renderer-download",
@@ -270,10 +280,15 @@ pub async fn download_and_install(
             let mut stream = resp;
             {
                 use tokio::io::AsyncWriteExt;
-                let mut file =
-                    tokio::io::BufWriter::new(tokio::fs::File::create(&part).await?);
+                let mut file = tokio::io::BufWriter::new(
+                    tokio::fs::File::create(&part)
+                        .await
+                        .map_err(|e| Error::Other(crate::error::io_context(&e, &part)))?,
+                );
                 while let Some(chunk) = crate::mirror::next_chunk(&mut stream).await? {
-                    file.write_all(&chunk).await?;
+                    file.write_all(&chunk)
+                        .await
+                        .map_err(|e| Error::Other(crate::error::io_context(&e, &part)))?;
                     cur += chunk.len() as u64;
                     report(
                         "renderer-download",

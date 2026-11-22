@@ -34,6 +34,7 @@ pub mod renderbus;
 pub mod renderers;
 pub mod rules;
 pub mod runtime;
+pub mod space;
 pub mod uipack;
 
 /// 内嵌测试夹具（合成样例数据）。

@@ -8,6 +8,15 @@
     <link rel="stylesheet" href="./src/style.css" />
   </head>
   <body>
+    <!-- ============ 启动诊断横幅（上次崩溃原因 / 存储不足 / 最近启动日志尾部） ============ -->
+    <!-- 放在登录屏与主屏之外：两种界面状态下都可见，闪退证据不依赖登录就能看到 -->
+    <div id="diag-banner" class="diag-banner hidden">
+      <pre id="diag-banner-text" class="diag-text"></pre>
+      <div class="diag-actions">
+        <button id="diag-banner-close" class="btn btn-sm">知道了</button>
+      </div>
+    </div>
+
     <!-- ============ 离线登录屏 ============ -->
     <section id="login-screen" class="screen login-screen">
       <div class="login-card">
@@ -64,7 +73,7 @@
             <span class="avatar avatar-sm" id="sidebar-avatar">?</span>
             <span class="mini-name" id="sidebar-account-name">未登录</span>
           </div>
-          <div class="version-tag" id="app-version">v0.1.2</div>
+          <div class="version-tag" id="app-version">v0.1.3</div>
         </div>
       </aside>
 
@@ -233,6 +242,7 @@
             </div>
             <div class="kv"><span class="kv-key">游戏根目录</span><code class="path-line" id="settings-game-dir">读取中…</code></div>
             <div class="kv"><span class="kv-key">存储模式</span><span id="storage-mode" class="kv-val">-</span></div>
+            <div class="kv"><span class="kv-key">可用空间</span><span id="storage-free" class="kv-val">-</span></div>
             <div class="kv"><span class="kv-key">完整文件权限</span><span id="perm-state" class="kv-val">-</span></div>
             <div class="kv"><span class="kv-key">Java 运行时</span><span id="settings-runtime" class="kv-val">-</span></div>
             <div class="kv"><span class="kv-key">标准布局</span><span id="layout-status" class="kv-val">-</span></div>

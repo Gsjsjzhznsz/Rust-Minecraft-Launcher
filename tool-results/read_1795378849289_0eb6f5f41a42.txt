@@ -1,0 +1,1168 @@
+     1→import { invoke } from "@tauri-apps/api/core";
+     2→import { listen } from "@tauri-apps/api/event";
+     3→
+     4→/* ---------- 类型 ---------- */
+     5→type Account = { kind: string; username: string; uuid: string };
+     6→type AccountEntry = Account & { selected: boolean };
+     7→type VersionInfo = { id: string; type: string; url: string };
+     8→type DownloadProgress = {
+     9→  stage: string;
+    10→  current: number;
+    11→  total: number;
+    12→  percent: number;
+    13→  file: string;
+    14→  done: boolean;
+    15→  error?: string;
+    16→};
+    17→type EnvInfo = {
+    18→  gameDir: string;
+    19→  storageMode: string;
+    20→  layoutOk: boolean;
+    21→  layoutError: string | null;
+    22→  fullAccess: boolean;
+    23→};
+    24→type AppMeta = { name: string; version: string; os: string; arch: string };
+    25→type Preflight = {
+    26→  versionInstalled: boolean;
+    27→  versionJsonOk: boolean;
+    28→  javaMajor: number;
+    29→  accountOk: boolean;
+    30→  runtimeInstalled: boolean;
+    31→  runtimeSpecAvailable: boolean;
+    32→  runtimeVersion: string | null;
+    33→  runtimeDir: string;
+    34→};
+    35→type LaunchLog = { source: string; line: string };
+    36→type LaunchExit = { code: number; version: string };
+    37→type MigrateMsg = { percent: number; done: boolean; error: string | null };
+    38→
+    39→/* ---------- DOM 工具 ---------- */
+    40→const el = <T extends HTMLElement>(id: string): T => document.getElementById(id) as T;
+    41→const show = (id: string) => el<HTMLElement>(id).classList.remove("hidden");
+    42→const hide = (id: string) => el<HTMLElement>(id).classList.add("hidden");
+    43→const setText = (id: string, text: string) => {
+    44→  el<HTMLElement>(id).textContent = text;
+    45→};
+    46→
+    47→const KIND_LABELS: Record<string, string> = {
+    48→  release: "正式版",
+    49→  snapshot: "快照",
+    50→  old_beta: "Beta",
+    51→  old_alpha: "Alpha",
+    52→};
+    53→const STAGE_LABELS: Record<string, string> = {
+    54→  manifest: "版本清单",
+    55→  "version-json": "版本 JSON",
+    56→  client: "客户端 jar",
+    57→  libraries: "依赖库",
+    58→  "asset-index": "资源索引",
+    59→  assets: "资源文件",
+    60→  done: "完成",
+    61→  error: "出错",
+    62→};
+    63→const KIND_ORDER = ["release", "snapshot", "old_beta", "old_alpha"] as const;
+    64→const PAGE_SIZE = 50;
+    65→
+    66→function bytes(n: number): string {
+    67→  if (!n) return "0 B";
+    68→  const units = ["B", "KB", "MB", "GB"];
+    69→  let v = n;
+    70→  let i = 0;
+    71→  while (v >= 1024 && i < units.length - 1) {
+    72→    v /= 1024;
+    73→    i += 1;
+    74→  }
+    75→  return `${v.toFixed(i === 0 ? 0 : 1)} ${units[i]}`;
+    76→}
+    77→
+    78→function alertIn(id: string, cls: string, msg: string) {
+    79→  const node = el<HTMLElement>(id);
+    80→  node.className = `alert ${cls}`;
+    81→  node.textContent = msg;
+    82→}
+    83→function alertOut(id: string) {
+    84→  const node = el<HTMLElement>(id);
+    85→  node.textContent = "";
+    86→  node.classList.add("hidden");
+    87→}
+    88→
+    89→/* ---------- Toast ---------- */
+    90→function toast(msg: string, type: "ok" | "err" | "" = "") {
+    91→  const wrap = el<HTMLDivElement>("toast-wrap");
+    92→  const node = document.createElement("div");
+    93→  node.className = `toast ${type}`.trim();
+    94→  node.textContent = msg;
+    95→  wrap.appendChild(node);
+    96→  window.setTimeout(() => node.remove(), 3200);
+    97→}
+    98→
+    99→/* ---------- 全局状态 ---------- */
+   100→let versions: VersionInfo[] | null = null;
+   101→let installed = new Set<string>();
+   102→let kindFilter = "all";
+   103→let searchText = "";
+   104→let shownCount = PAGE_SIZE;
+   105→let busy = false;
+   106→let currentAccount: Account | null = null;
+   107→let fullAccess = true;
+   108→let runtimeDownloading = false;
+   109→let pendingLaunchVersion: string | null = null;
+   110→
+   111→const storage = {
+   112→  get selected(): string {
+   113→    return window.localStorage.getItem("quartz.selectedVersion") ?? "";
+   114→  },
+   115→  set selected(v: string) {
+   116→    window.localStorage.setItem("quartz.selectedVersion", v);
+   117→  },
+   118→};
+   119→
+   120→/* ---------- 头像 ---------- */
+   121→function avatarStyle(uuid: string): string {
+   122→  let h = 0;
+   123→  for (const c of uuid) h = (h * 31 + c.charCodeAt(0)) >>> 0;
+   124→  const hue = h % 360;
+   125→  return `background: linear-gradient(135deg, hsl(${hue} 70% 62%), hsl(${(hue + 50) % 360} 70% 45%))`;
+   126→}
+   127→function avatarLetter(name: string): string {
+   128→  return (name[0] ?? "?").toUpperCase();
+   129→}
+   130→
+   131→function renderAccountChips() {
+   132→  const name = currentAccount?.username ?? "未登录";
+   133→  const letter = currentAccount ? avatarLetter(currentAccount.username) : "?";
+   134→  const style = currentAccount ? avatarStyle(currentAccount.uuid) : "";
+   135→  for (const [avatarId, nameId] of [
+   136→    ["sidebar-avatar", "sidebar-account-name"],
+   137→    ["topbar-avatar", "topbar-account-name"],
+   138→  ] as const) {
+   139→    const avatar = el<HTMLSpanElement>(avatarId);
+   140→    avatar.textContent = letter;
+   141→    avatar.setAttribute("style", style);
+   142→    setText(nameId, name);
+   143→  }
+   144→}
+   145→
+   146→/* ---------- 版本清单 ---------- */
+   147→async function loadVersions(showLoading = true) {
+   148→  const note = el<HTMLDivElement>("version-list-note");
+   149→  if (showLoading) note.textContent = "版本清单加载中…";
+   150→  try {
+   151→    const list = await invoke<VersionInfo[]>("list_versions");
+   152→    if (list.length === 0) throw new Error("版本清单为空");
+   153→    versions = list;
+   154→    renderVersionList();
+   155→    fillHomeSelect();
+   156→  } catch (e) {
+   157→    versions = null;
+   158→    note.textContent = `版本清单拉取失败：${String(e)}（点击下方按钮重试）`;
+   159→    fillHomeSelect();
+   160→  }
+   161→}
+   162→
+   163→async function refreshInstalled() {
+   164→  try {
+   165→    const list = await invoke<string[]>("list_installed_versions");
+   166→    installed = new Set(list);
+   167→  } catch {
+   168→    installed = new Set();
+   169→  }
+   170→  updateInstallBadge();
+   171→  if (versions) renderVersionList();
+   172→}
+   173→
+   174→/* 主页版本下拉 */
+   175→function fillHomeSelect() {
+   176→  const sel = el<HTMLSelectElement>("version-select");
+   177→  const prev = storage.selected;
+   178→  sel.innerHTML = "";
+   179→  if (!versions || versions.length === 0) {
+   180→    const opt = document.createElement("option");
+   181→    opt.value = "";
+   182→    opt.textContent = installed.size > 0 ? "官方清单未获取，可先用已安装版本" : "版本清单未获取，请前往「下载游戏」页";
+   183→    sel.appendChild(opt);
+   184→    for (const v of installed) {
+   185→      const o = document.createElement("option");
+   186→      o.value = v;
+   187→      o.textContent = `${v}（已安装）`;
+   188→      sel.appendChild(o);
+   189→    }
+   190→    sel.disabled = false;
+   191→    updateInstallBadge();
+   192→    return;
+   193→  }
+   194→  for (const kind of KIND_ORDER) {
+   195→    const list = versions.filter((v) => v.type === kind);
+   196→    if (list.length === 0) continue;
+   197→    const group = document.createElement("optgroup");
+   198→    group.label = KIND_LABELS[kind];
+   199→    for (const v of list) {
+   200→      const opt = document.createElement("option");
+   201→      opt.value = v.id;
+   202→      opt.textContent = v.id;
+   203→      group.appendChild(opt);
+   204→    }
+   205→    sel.appendChild(group);
+   206→  }
+   207→  sel.disabled = false;
+   208→  restoreSelected(sel, prev);
+   209→  updateInstallBadge();
+   210→}
+   211→
+   212→function restoreSelected(sel: HTMLSelectElement, prev: string) {
+   213→  if (prev && versions?.some((v) => v.id === prev)) {
+   214→    sel.value = prev;
+   215→  } else if (prev && installed.has(prev)) {
+   216→    sel.value = prev;
+   217→  } else {
+   218→    sel.value = versions?.[0]?.id ?? "";
+   219→  }
+   220→  storage.selected = sel.value;
+   221→}
+   222→
+   223→function updateInstallBadge() {
+   224→  const v = el<HTMLSelectElement>("version-select").value;
+   225→  const badge = el<HTMLSpanElement>("install-badge");
+   226→  if (!v) {
+   227→    badge.className = "badge badge-dim";
+   228→    badge.textContent = "未选择版本";
+   229→    return;
+   230→  }
+   231→  if (installed.has(v)) {
+   232→    badge.className = "badge badge-ok";
+   233→    badge.textContent = "已安装";
+   234→  } else {
+   235→    badge.className = "badge badge-warn";
+   236→    badge.textContent = "未安装，可在下载页获取";
+   237→  }
+   238→}
+   239→
+   240→/* 下载页列表 */
+   241→function typeBadge(kind: string): HTMLElement {
+   242→  const b = document.createElement("span");
+   243→  const map: Record<string, string> = {
+   244→    release: "badge-ok",
+   245→    snapshot: "badge-warn",
+   246→    old_beta: "badge-purple",
+   247→    old_alpha: "badge-dim",
+   248→  };
+   249→  b.className = `badge ${map[kind] ?? "badge-dim"}`;
+   250→  b.textContent = KIND_LABELS[kind] ?? kind;
+   251→  return b;
+   252→}
+   253→
+   254→function renderVersionList() {
+   255→  const wrap = el<HTMLDivElement>("version-list");
+   256→  wrap.innerHTML = "";
+   257→  const note = document.createElement("div");
+   258→  note.className = "list-note";
+   259→  note.id = "version-list-note";
+   260→  wrap.appendChild(note);
+   261→
+   262→  if (!versions) {
+   263→    note.textContent = el<HTMLDivElement>("version-list-note").textContent || "版本清单未加载";
+   264→    return;
+   265→  }
+   266→
+   267→  const text = searchText.trim().toLowerCase();
+   268→  const filtered = versions.filter(
+   269→    (v) => (kindFilter === "all" || v.type === kindFilter) && (!text || v.id.toLowerCase().includes(text)),
+   270→  );
+   271→  if (filtered.length === 0) {
+   272→    note.textContent = "没有匹配的版本";
+   273→    hide("load-more-btn");
+   274→    return;
+   275→  }
+   276→
+   277→  shownCount = Math.min(shownCount, filtered.length);
+   278→  for (const v of filtered.slice(0, shownCount)) {
+   279→    wrap.appendChild(versionRow(v));
+   280→  }
+   281→
+   282→  const more = el<HTMLButtonElement>("load-more-btn");
+   283→  if (shownCount < filtered.length) {
+   284→    more.textContent = `加载更多（${shownCount} / ${filtered.length}）`;
+   285→    show("load-more-btn");
+   286→  } else {
+   287→    hide("load-more-btn");
+   288→  }
+   289→}
+   290→
+   291→function versionRow(v: VersionInfo): HTMLElement {
+   292→  const row = document.createElement("div");
+   293→  row.className = "v-row";
+   294→
+   295→  const name = document.createElement("span");
+   296→  name.className = "v-name";
+   297→  name.textContent = v.id;
+   298→  row.appendChild(name);
+   299→
+   300→  const badges = document.createElement("span");
+   301→  badges.className = "v-badges";
+   302→  badges.appendChild(typeBadge(v.type));
+   303→  if (installed.has(v.id)) {
+   304→    const ok = document.createElement("span");
+   305→    ok.className = "badge badge-ok";
+   306→    ok.textContent = "已安装";
+   307→    badges.appendChild(ok);
+   308→  }
+   309→  row.appendChild(badges);
+   310→
+   311→  const actions = document.createElement("span");
+   312→  actions.className = "v-actions";
+   313→  const btn = document.createElement("button");
+   314→  btn.className = "btn btn-primary btn-sm";
+   315→  btn.textContent = installed.has(v.id) ? "重新下载" : "下载";
+   316→  btn.disabled = busy;
+   317→  btn.addEventListener("click", () => startDownload(v.id));
+   318→  actions.appendChild(btn);
+   319→  row.appendChild(actions);
+   320→  return row;
+   321→}
+   322→
+   323→/* ---------- 下载 ---------- */
+   324→let listening = false;
+   325→async function ensureProgressListener() {
+   326→  if (listening) return;
+   327→  listening = true;
+   328→  await listen<DownloadProgress>("download://progress", (event) => onProgress(event.payload));
+   329→  await listen<DownloadProgress>("runtime://progress", (event) => onRuntimeProgress(event.payload));
+   330→  await listen<DownloadProgress>("renderer://progress", (event) => onRendererProgress(event.payload));
+   331→  await listen<DownloadProgress>("lwjgl://progress", (event) => onLwjglProgress(event.payload));
+   332→  await listen<LaunchLog>("launch://log", (event) => appendLog(event.payload.source, event.payload.line));
+   333→  await listen<LaunchExit>("launch://exit", (event) => {
+   334→    hide("stop-btn");
+   335→    if (event.payload.code === 0) {
+   336→      setLaunchBadge("已退出（0）", "dim");
+   337→      toast("游戏已正常退出", "ok");
+   338→    } else {
+   339→      setLaunchBadge(`已退出（${event.payload.code}）`, "err");
+   340→      toast(`游戏已退出（代码 ${event.payload.code}），详情见控制台`, "err");
+   341→    }
+   342→    appendLog("quartz", `[quartz] 进程退出，代码 ${event.payload.code}`);
+   343→  });
+   344→  await listen<MigrateMsg>("quartz://migrate", (event) => {
+   345→    const p = event.payload;
+   346→    if (p.error) {
+   347→      toast(`存储迁移失败：${p.error}`, "err");
+   348→      appendLog("quartz", `[quartz] 存储迁移失败：${p.error}`);
+   349→      return;
+   350→    }
+   351→    if (p.done) {
+   352→      toast("旧游戏数据已迁移到标准目录", "ok");
+   353→      appendLog("quartz", "[quartz] 存储迁移完成");
+   354→      refreshInstalled();
+   355→      loadEnvAndMeta();
+   356→    }
+   357→  });
+   358→}
+   359→
+   360→function progressEls(prefix: string) {
+   361→  return {
+   362→    fill: el<HTMLDivElement>(`${prefix}-progress-fill`),
+   363→    text: el<HTMLSpanElement>(`${prefix}-progress-text`),
+   364→    stage: el<HTMLSpanElement>(`${prefix}-progress-stage`),
+   365→    file: el<HTMLDivElement>(`${prefix}-progress-file`),
+   366→    status: el<HTMLDivElement>(`${prefix}-progress-status`),
+   367→  };
+   368→}
+   369→
+   370→function onProgress(p: DownloadProgress) {
+   371→  for (const prefix of ["home", "dl"]) {
+   372→    const ui = progressEls(prefix);
+   373→    if (p.stage === "error") {
+   374→      alertIn(`${prefix}-progress-status`, "alert-error", `下载失败（可重试，已下载文件会自动跳过）：${p.error ?? "未知错误"}`);
+   375→    } else if (p.stage === "done") {
+   376→      ui.fill.style.width = "100%";
+   377→      ui.text.textContent = "100%";
+   378→      ui.stage.textContent = "完成";
+   379→      ui.file.textContent = "";
+   380→      alertIn(`${prefix}-progress-status`, "alert-ok", "下载完成！游戏文件已写入标准 .minecraft 目录。");
+   381→    } else {
+   382→      alertOut(`${prefix}-progress-status`);
+   383→      const percent = Math.max(0, Math.min(100, p.percent || 0));
+   384→      ui.fill.style.width = `${percent.toFixed(1)}%`;
+   385→      ui.text.textContent = `${percent.toFixed(1)}%（${bytes(p.current)} / ${bytes(p.total)}）`;
+   386→      ui.stage.textContent = STAGE_LABELS[p.stage] ?? p.stage;
+   387→      ui.file.textContent = p.file ?? "";
+   388→    }
+   389→  }
+   390→
+   391→  if (p.stage === "done") {
+   392→    busy = false;
+   393→    refreshInstalled();
+   394→    toast("下载完成", "ok");
+   395→  } else if (p.stage === "error") {
+   396→    busy = false;
+   397→    toast("下载失败", "err");
+   398→  }
+   399→  setBusyUI(busy);
+   400→}
+   401→
+   402→function setBusyUI(state: boolean) {
+   403→  for (const btn of document.querySelectorAll<HTMLButtonElement>(".v-actions .btn")) {
+   404→    btn.disabled = state;
+   405→  }
+   406→}
+   407→
+   408→async function startDownload(versionId: string) {
+   409→  if (!versionId) {
+   410→    toast("请先选择版本", "err");
+   411→    return;
+   412→  }
+   413→  if (busy) {
+   414→    toast("已有下载任务进行中", "err");
+   415→    return;
+   416→  }
+   417→  busy = true;
+   418→  setBusyUI(true);
+   419→  storage.selected = versionId;
+   420→  el<HTMLSelectElement>("version-select").value = versionId;
+   421→  updateInstallBadge();
+   422→
+   423→  for (const prefix of ["home", "dl"]) {
+   424→    const ui = progressEls(prefix);
+   425→    alertOut(`${prefix}-progress-status`);
+   426→    ui.fill.style.width = "0%";
+   427→    ui.text.textContent = "0%";
+   428→    ui.stage.textContent = "准备中";
+   429→    ui.file.textContent = "";
+   430→  }
+   431→  show("home-progress");
+   432→  show("dl-progress");
+   433→  await ensureProgressListener();
+   434→  try {
+   435→    await invoke("download_game", { versionId });
+   436→  } catch (e) {
+   437→    busy = false;
+   438→    setBusyUI(false);
+   439→    for (const prefix of ["home", "dl"]) {
+   440→      alertIn(`${prefix}-progress-status`, "alert-error", `下载启动失败：${String(e)}`);
+   441→    }
+   442→    toast("下载启动失败", "err");
+   443→  }
+   444→}
+   445→
+   446→/* ---------- 账户 ---------- */
+   447→async function loadAccounts() {
+   448→  try {
+   449→    const entries = await invoke<AccountEntry[]>("list_accounts");
+   450→    renderAccounts(entries);
+   451→    const selected = entries.find((a) => a.selected);
+   452→    if (selected) currentAccount = selected;
+   453→    renderAccountChips();
+   454→  } catch (e) {
+   455→    toast(`账号列表加载失败：${String(e)}`, "err");
+   456→  }
+   457→}
+   458→
+   459→function renderAccounts(entries: AccountEntry[]) {
+   460→  const wrap = el<HTMLDivElement>("account-list");
+   461→  wrap.innerHTML = "";
+   462→  if (entries.length === 0) {
+   463→    const note = document.createElement("div");
+   464→    note.className = "list-note card";
+   465→    note.textContent = "还没有账号，先添加一个离线账号";
+   466→    wrap.appendChild(note);
+   467→    return;
+   468→  }
+   469→  for (const a of entries) {
+   470→    wrap.appendChild(accountCard(a));
+   471→  }
+   472→}
+   473→
+   474→function accountCard(a: AccountEntry): HTMLElement {
+   475→  const card = document.createElement("div");
+   476→  card.className = `account-card${a.selected ? " selected" : ""}`;
+   477→
+   478→  const avatar = document.createElement("span");
+   479→  avatar.className = "avatar";
+   480→  avatar.textContent = avatarLetter(a.username);
+   481→  avatar.setAttribute("style", avatarStyle(a.uuid));
+   482→  card.appendChild(avatar);
+   483→
+   484→  const info = document.createElement("div");
+   485→  info.className = "account-info";
+   486→  const nameRow = document.createElement("div");
+   487→  nameRow.className = "account-name";
+   488→  nameRow.textContent = a.username;
+   489→  if (a.selected) {
+   490→    const cur = document.createElement("span");
+   491→    cur.className = "badge badge-ok";
+   492→    cur.textContent = "当前";
+   493→    nameRow.appendChild(cur);
+   494→  }
+   495→  const uuidRow = document.createElement("div");
+   496→  uuidRow.className = "account-uuid";
+   497→  uuidRow.textContent = a.uuid;
+   498→  info.appendChild(nameRow);
+   499→  info.appendChild(uuidRow);
+   500→  card.appendChild(info);
+   501→
+   502→  const actions = document.createElement("div");
+   503→  actions.className = "account-actions";
+   504→  if (!a.selected) {
+   505→    const switchBtn = document.createElement("button");
+   506→    switchBtn.className = "btn btn-sm";
+   507→    switchBtn.textContent = "切换";
+   508→    switchBtn.addEventListener("click", async () => {
+   509→      try {
+   510→        await invoke("select_account", { uuid: a.uuid });
+   511→        currentAccount = a;
+   512→        renderAccountChips();
+   513→        await loadAccounts();
+   514→        toast(`已切换到 ${a.username}`, "ok");
+   515→      } catch (e) {
+   516→        toast(`切换失败：${String(e)}`, "err");
+   517→      }
+   518→    });
+   519→    actions.appendChild(switchBtn);
+   520→  }
+   521→  const delBtn = document.createElement("button");
+   522→  delBtn.className = "btn btn-sm btn-danger";
+   523→  delBtn.textContent = "删除";
+   524→  delBtn.addEventListener("click", async () => {
+   525→    // 两段式确认，避免误删
+   526→    if (delBtn.dataset.confirm !== "1") {
+   527→      delBtn.dataset.confirm = "1";
+   528→      delBtn.textContent = "确认删除？";
+   529→      window.setTimeout(() => {
+   530→        delBtn.dataset.confirm = "";
+   531→        delBtn.textContent = "删除";
+   532→      }, 3000);
+   533→      return;
+   534→    }
+   535→    try {
+   536→      await invoke("remove_account", { uuid: a.uuid });
+   537→      toast(`已删除 ${a.username}`, "ok");
+   538→      await loadAccounts();
+   539→    } catch (e) {
+   540→      toast(`删除失败：${String(e)}`, "err");
+   541→    }
+   542→  });
+   543→  actions.appendChild(delBtn);
+   544→  card.appendChild(actions);
+   545→  return card;
+   546→}
+   547→
+   548→async function addAccount() {
+   549→  const input = el<HTMLInputElement>("new-account-name");
+   550→  const name = input.value.trim();
+   551→  alertOut("account-error");
+   552→  if (!name) {
+   553→    alertIn("account-error", "alert-error", "请输入用户名");
+   554→    return;
+   555→  }
+   556→  const btn = el<HTMLButtonElement>("add-account-btn");
+   557→  btn.disabled = true;
+   558→  try {
+   559→    const acc = await invoke<Account>("offline_login", { name });
+   560→    input.value = "";
+   561→    toast(`已添加账号 ${acc.username}`, "ok");
+   562→    await loadAccounts();
+   563→  } catch (e) {
+   564→    alertIn("account-error", "alert-error", String(e));
+   565→  } finally {
+   566→    btn.disabled = false;
+   567→  }
+   568→}
+   569→
+   570→/* ---------- 登录屏 ---------- */
+   571→async function doLogin() {
+   572→  const name = el<HTMLInputElement>("username").value.trim();
+   573→  alertOut("login-error");
+   574→  if (!name) {
+   575→    alertIn("login-error", "alert-error", "请输入用户名");
+   576→    return;
+   577→  }
+   578→  const btn = el<HTMLButtonElement>("login-btn");
+   579→  btn.disabled = true;
+   580→  try {
+   581→    currentAccount = await invoke<Account>("offline_login", { name });
+   582→    enterApp();
+   583→  } catch (e) {
+   584→    alertIn("login-error", "alert-error", String(e));
+   585→  } finally {
+   586→    btn.disabled = false;
+   587→  }
+   588→}
+   589→
+   590→/* ---------- 存储与环境 ---------- */
+   591→async function loadEnvAndMeta() {
+   592→  try {
+   593→    const env = await invoke<EnvInfo>("get_env_info");
+   594→    setText("game-dir", env.gameDir);
+   595→    setText("settings-game-dir", env.gameDir);
+   596→    const modeText =
+   597→      env.storageMode === "public"
+   598→        ? "公共标准目录（文件管理器可见，卸载不丢）"
+   599→        : env.storageMode === "external"
+   600→          ? "外部私有目录（可在文件管理器查看）"
+   601→          : env.storageMode === "internal"
+   602→            ? "内部私有目录（应用专属）"
+   603→            : "桌面环境";
+   604→    setText("storage-mode", modeText);
+   605→    fullAccess = env.fullAccess;
+   606→    togglePermUI(env.fullAccess);
+   607→    for (const badgeId of ["storage-badge", "settings-storage-badge"]) {
+   608→      const badge = el<HTMLSpanElement>(badgeId);
+   609→      if (env.layoutOk) {
+   610→        badge.className = "badge badge-ok";
+   611→        badge.textContent = "可写";
+   612→      } else {
+   613→        badge.className = "badge badge-err";
+   614→        badge.textContent = "不可写";
+   615→      }
+   616→    }
+   617→    const layout = el<HTMLElement>("layout-status");
+   618→    layout.textContent = env.layoutOk ? "标准 .minecraft 目录已就绪" : `初始化失败：${env.layoutError ?? "未知"}`;
+   619→    if (!env.layoutOk) {
+   620→      show("storage-warn");
+   621→      el<HTMLElement>("storage-warn").textContent = `存储初始化失败：${env.layoutError ?? "未知错误"}。登录与下载功能可能不可用，请反馈完整报错。`;
+   622→    } else {
+   623→      hide("storage-warn");
+   624→    }
+   625→  } catch (e) {
+   626→    setText("game-dir", `获取失败：${String(e)}`);
+   627→  }
+   628→  try {
+   629→    const meta = await invoke<AppMeta>("app_meta");
+   630→    setText("about-name", meta.name);
+   631→    setText("about-version", `v${meta.version}`);
+   632→    setText("about-platform", `${meta.os} · ${meta.arch}`);
+   633→    setText("app-version", `v${meta.version}`);
+   634→  } catch {
+   635→    /* 关于信息获取失败不影响使用 */
+   636→  }
+   637→}
+   638→
+   639→/* ---------- 启动控制台 ---------- */
+   640→const CONSOLE_MAX_LINES = 400;
+   641→function consoleLineClass(source: string): string {
+   642→  if (source === "stderr") return "console-line err";
+   643→  if (source === "quartz") return "console-line sys";
+   644→  return "console-line";
+   645→}
+   646→function appendLog(source: string, line: string) {
+   647→  const box = el<HTMLDivElement>("console-box");
+   648→  // 清掉占位行
+   649→  const first = box.firstElementChild;
+   650→  if (first && first.classList.contains("dim") && box.children.length === 1) first.remove();
+   651→  const node = document.createElement("div");
+   652→  node.className = consoleLineClass(source);
+   653→  node.textContent = line;
+   654→  box.appendChild(node);
+   655→  while (box.children.length > CONSOLE_MAX_LINES) box.removeChild(box.firstElementChild!);
+   656→  box.scrollTop = box.scrollHeight;
+   657→}
+   658→function setLaunchBadge(text: string, cls: "dim" | "ok" | "warn" | "err") {
+   659→  const badge = el<HTMLSpanElement>("launch-badge");
+   660→  badge.className = `badge badge-${cls}`;
+   661→  badge.textContent = text;
+   662→}
+   663→function clearConsole() {
+   664→  const box = el<HTMLDivElement>("console-box");
+   665→  box.innerHTML = '<div class="console-line dim">[quartz] 启动日志将显示在这里</div>';
+   666→}
+   667→
+   668→/* ---------- 完整文件权限 ---------- */
+   669→function togglePermUI(granted: boolean) {
+   670→  for (const id of ["perm-banner", "login-perm", "settings-perm"]) {
+   671→    if (granted) hide(id);
+   672→    else show(id);
+   673→  }
+   674→  const state = el<HTMLSpanElement>("perm-state");
+   675→  state.textContent = granted ? "已授权（完整文件访问）" : "未授权";
+   676→  state.style.color = granted ? "var(--ok, #4ade80)" : "var(--warn, #fbbf24)";
+   677→}
+   678→async function refreshPermission() {
+   679→  let granted = true;
+   680→  try {
+   681→    granted = (await invoke<EnvInfo>("get_env_info")).fullAccess;
+   682→  } catch {
+   683→    return; // 桥接不可用时静默
+   684→  }
+   685→  const changed = granted !== fullAccess;
+   686→  fullAccess = granted;
+   687→  togglePermUI(granted);
+   688→  if (changed && granted) {
+   689→    // 授权成功：切换到公共标准目录 + 迁移旧数据
+   690→    toast("已获得完整文件权限，正在切换标准目录…", "ok");
+   691→    try {
+   692→      const diag = await invoke<EnvInfo>("reinit_storage");
+   693→      setText("game-dir", diag.gameDir);
+   694→      setText("settings-game-dir", diag.gameDir);
+   695→      appendLog("quartz", `[quartz] 存储已切换到：${diag.gameDir}`);
+   696→      await refreshInstalled();
+   697→    } catch (e) {
+   698→      toast(`存储切换失败：${String(e)}`, "err");
+   699→    }
+   700→  }
+   701→}
+   702→async function requestPermission() {
+   703→  try {
+   704→    await invoke("request_storage_permission");
+   705→    toast("Android 11+ 已打开「所有文件访问」设置页，请开启后返回应用；低版本请在弹窗中允许", "");
+   706→  } catch (e) {
+   707→    toast(`权限请求失败：${String(e)}`, "err");
+   708→  }
+   709→  // 授权后回焦时自动重检
+   710→  window.setTimeout(refreshPermission, 1200);
+   711→  window.setTimeout(refreshPermission, 3000);
+   712→}
+   713→
+   714→/* ---------- Java 运行时状态 ---------- */
+   715→async function refreshRuntimeBadge() {
+   716→  const badge = el<HTMLSpanElement>("runtime-badge");
+   717→  const settingsRuntime = el<HTMLSpanElement>("settings-runtime");
+   718→  try {
+   719→    const st = await invoke<{ installed: boolean; version: string | null; path: string; specAvailable: boolean }>("get_runtime_status", { javaMajor: 17 });
+   720→    if (st.installed) {
+   721→      badge.className = "badge badge-ok";
+   722→      badge.textContent = `Java 运行时就绪（${st.version ?? "17"}）`;
+   723→      settingsRuntime.textContent = `就绪（${st.version ?? "17"}）`;
+   724→    } else if (st.specAvailable) {
+   725→      badge.className = "badge badge-warn";
+   726→      badge.textContent = "运行时未下载（启动时自动获取）";
+   727→      settingsRuntime.textContent = "未下载（启动时自动获取）";
+   728→    } else {
+   729→      badge.className = "badge badge-dim";
+   730→      badge.textContent = "暂无下载源";
+   731→      settingsRuntime.textContent = "暂无下载源";
+   732→    }
+   733→  } catch {
+   734→    badge.className = "badge badge-dim";
+   735→    badge.textContent = "运行时检测失败";
+   736→    settingsRuntime.textContent = "检测失败";
+   737→  }
+   738→}
+   739→
+   740→function showRtProgress() {
+   741→  runtimeDownloading = true;
+   742→  show("rt-progress");
+   743→  const fill = el<HTMLDivElement>("rt-progress-fill");
+   744→  fill.style.width = "0%";
+   745→  setText("rt-progress-text", "0%");
+   746→  setText("rt-progress-stage", "准备中");
+   747→  setText("rt-progress-file", "");
+   748→}
+   749→function onRuntimeProgress(p: DownloadProgress) {
+   750→  if (!runtimeDownloading) return;
+   751→  if (p.stage === "error") {
+   752→    runtimeDownloading = false;
+   753→    hide("rt-progress");
+   754→    appendLog("quartz", `[quartz] 运行时下载失败：${p.error ?? "未知错误"}`);
+   755→    toast("运行时下载失败，可重试", "err");
+   756→    pendingLaunchVersion = null;
+   757→    return;
+   758→  }
+   759→  if (p.stage === "done") {
+   760→    runtimeDownloading = false;
+   761→    hide("rt-progress");
+   762→    appendLog("quartz", `[quartz] Java 运行时就绪：${p.file}`);
+   763→    toast("Java 运行时就绪", "ok");
+   764→    refreshRuntimeBadge();
+   765→    const v = pendingLaunchVersion;
+   766→    pendingLaunchVersion = null;
+   767→    if (v) doLaunch(v);
+   768→    return;
+   769→  }
+   770→  const fill = el<HTMLDivElement>("rt-progress-fill");
+   771→  setText("rt-progress-stage", p.stage === "runtime-download" ? "下载" : "解包");
+   772→  setText("rt-progress-file", p.file ?? "");
+   773→  if (p.total > 0) {
+   774→    fill.style.width = `${Math.min(100, p.percent).toFixed(1)}%`;
+   775→    setText("rt-progress-text", `${p.percent.toFixed(1)}%（${bytes(p.current)} / ${bytes(p.total)}）`);
+   776→  } else {
+   777→    fill.style.width = "100%";
+   778→    setText("rt-progress-text", String(p.current));
+   779→  }
+   780→}
+   781→
+   782→/* ---------- 渲染层 + LWJGL 安卓包（全部在线下载，不随 APK 内置） ---------- */
+   783→interface RendererInfo {
+   784→  id: string;
+   785→  name: string;
+   786→  note: string;
+   787→  eglLib: string;
+   788→  glLib: string;
+   789→  sizeHint: string;
+   790→  specAvailable: boolean;
+   791→  installed: boolean;
+   792→  active: boolean;
+   793→}
+   794→let rendererDownloading = false;
+   795→let lwjglDownloading = false;
+   796→
+   797→async function refreshRenderers() {
+   798→  const list = el<HTMLDivElement>("renderer-list");
+   799→  let infos: RendererInfo[] = [];
+   800→  try {
+   801→    infos = await invoke<RendererInfo[]>("list_renderers");
+   802→  } catch {
+   803→    return;
+   804→  }
+   805→  const active = infos.find((r) => r.active);
+   806→  const badge = el<HTMLSpanElement>("renderer-badge");
+   807→  badge.textContent = active ? active.name : "-";
+   808→  badge.className = active?.installed ? "badge badge-ok" : "badge badge-warn";
+   809→  list.innerHTML = "";
+   810→  for (const r of infos) {
+   811→    const row = document.createElement("div");
+   812→    row.className = "kv";
+   813→    const name = document.createElement("span");
+   814→    name.className = "kv-key";
+   815→    name.textContent = r.name;
+   816→    const val = document.createElement("span");
+   817→    val.className = "kv-val";
+   818→    val.textContent = `${r.note} · ${r.sizeHint}`;
+   819→    row.appendChild(name);
+   820→    row.appendChild(val);
+   821→    if (r.active) {
+   822→      const b = document.createElement("span");
+   823→      b.className = "badge badge-ok";
+   824→      b.textContent = "使用中";
+   825→      row.appendChild(b);
+   826→    } else if (r.installed) {
+   827→      const b = document.createElement("span");
+   828→      b.className = "badge badge-dim";
+   829→      b.textContent = "已安装";
+   830→      row.appendChild(b);
+   831→    } else if (!r.specAvailable) {
+   832→      const b = document.createElement("span");
+   833→      b.className = "badge badge-dim";
+   834→      b.textContent = "暂无源";
+   835→      row.appendChild(b);
+   836→    }
+   837→    if (r.specAvailable && !r.installed) {
+   838→      const btn = document.createElement("button");
+   839→      btn.className = "btn btn-sm btn-primary";
+   840→      btn.textContent = "下载";
+   841→      btn.addEventListener("click", async () => {
+   842→        if (rendererDownloading) {
+   843→          toast("已有渲染层下载任务", "");
+   844→          return;
+   845→        }
+   846→        rendererDownloading = true;
+   847→        show("renderer-progress");
+   848→        setText("renderer-progress-stage", "下载");
+   849→        setText("renderer-progress-text", "0%");
+   850→        try {
+   851→          await invoke("download_renderer", { id: r.id });
+   852→        } catch (e) {
+   853→          rendererDownloading = false;
+   854→          hide("renderer-progress");
+   855→          toast(String(e), "err");
+   856→        }
+   857→      });
+   858→      row.appendChild(btn);
+   859→    }
+   860→    if (r.installed && !r.active) {
+   861→      const btn = document.createElement("button");
+   862→      btn.className = "btn btn-sm btn-ghost";
+   863→      btn.textContent = "切换";
+   864→      btn.addEventListener("click", async () => {
+   865→        try {
+   866→          await invoke("set_active_renderer", { id: r.id });
+   867→          toast(`渲染层已切换为 ${r.name}`, "ok");
+   868→          await refreshRenderers();
+   869→        } catch (e) {
+   870→          toast(String(e), "err");
+   871→        }
+   872→      });
+   873→      row.appendChild(btn);
+   874→    }
+   875→    list.appendChild(row);
+   876→  }
+   877→}
+   878→
+   879→function onRendererProgress(p: DownloadProgress) {
+   880→  if (!rendererDownloading) return;
+   881→  if (p.stage === "error") {
+   882→    rendererDownloading = false;
+   883→    hide("renderer-progress");
+   884→    appendLog("quartz", `[quartz] 渲染层下载失败：${p.error ?? "未知错误"}`);
+   885→    toast("渲染层下载失败，可重试", "err");
+   886→    return;
+   887→  }
+   888→  if (p.stage === "done") {
+   889→    rendererDownloading = false;
+   890→    hide("renderer-progress");
+   891→    appendLog("quartz", `[quartz] 渲染层就绪：${p.file}`);
+   892→    toast("渲染层就绪", "ok");
+   893→    refreshRenderers();
+   894→    return;
+   895→  }
+   896→  const fill = el<HTMLDivElement>("renderer-progress-fill");
+   897→  setText("renderer-progress-file", p.file ?? "");
+   898→  if (p.total > 0) {
+   899→    fill.style.width = `${Math.min(100, p.percent).toFixed(1)}%`;
+   900→    setText(
+   901→      "renderer-progress-text",
+   902→      `${p.percent.toFixed(1)}%（${bytes(p.current)} / ${bytes(p.total)}）`,
+   903→    );
+   904→  } else {
+   905→    fill.style.width = "100%";
+   906→    setText("renderer-progress-text", String(p.current));
+   907→  }
+   908→}
+   909→
+   910→async function refreshLwjglState() {
+   911→  const state = el<HTMLSpanElement>("lwjgl-state");
+   912→  const btn = el<HTMLButtonElement>("lwjgl-dl-btn");
+   913→  try {
+   914→    const st = await invoke<{ installed: boolean; path: string }>("get_lwjgl_status");
+   915→    if (st.installed) {
+   916→      state.textContent = "已就绪";
+   917→      state.style.color = "var(--ok, #4ade80)";
+   918→      btn.classList.add("hidden");
+   919→    } else {
+   920→      state.textContent = "未下载（启动时自动获取）";
+   921→      state.style.color = "var(--warn, #fbbf24)";
+   922→      btn.classList.remove("hidden");
+   923→    }
+   924→  } catch {
+   925→    state.textContent = "检测失败";
+   926→  }
+   927→}
+   928→
+   929→function onLwjglProgress(p: DownloadProgress) {
+   930→  if (p.stage === "error") {
+   931→    lwjglDownloading = false;
+   932→    hide("renderer-progress");
+   933→    toast(`LWJGL 下载失败：${p.error ?? ""}`, "err");
+   934→    return;
+   935→  }
+   936→  if (p.stage === "done") {
+   937→    lwjglDownloading = false;
+   938→    hide("renderer-progress");
+   939→    appendLog("quartz", `[quartz] LWJGL 安卓包就绪：${p.file}`);
+   940→    toast("LWJGL 安卓包就绪", "ok");
+   941→    refreshLwjglState();
+   942→    return;
+   943→  }
+   944→  if (!lwjglDownloading) return;
+   945→  show("renderer-progress");
+   946→  setText("renderer-progress-stage", "LWJGL");
+   947→  const fill = el<HTMLDivElement>("renderer-progress-fill");
+   948→  setText("renderer-progress-file", p.file ?? "");
+   949→  if (p.total > 0) {
+   950→    fill.style.width = `${Math.min(100, p.percent).toFixed(1)}%`;
+   951→    setText("renderer-progress-text", `${p.percent.toFixed(1)}%`);
+   952→  }
+   953→}
+   954→
+   955→/* ---------- 启动游戏（M0 真实启动链路） ---------- */
+   956→async function doLaunch(versionId: string) {
+   957→  try {
+   958→    setLaunchBadge("启动中…", "warn");
+   959→    appendLog("quartz", `[quartz] 启动 Minecraft ${versionId}…`);
+   960→    await invoke("launch_game", { versionId });
+   961→    setLaunchBadge("运行中", "ok");
+   962→    show("stop-btn");
+   963→  } catch (e) {
+   964→    const msg = String(e);
+   965→    if (msg.startsWith("RUNTIME_MISSING:")) {
+   966→      const major = Number(msg.split(":")[1] || 17);
+   967→      appendLog("quartz", `[quartz] 需要 Java ${major} 运行时，开始自动下载…`);
+   968→      showRtProgress();
+   969→      try {
+   970→        await invoke("download_runtime", { javaMajor: major });
+   971→      } catch (e2) {
+   972→        runtimeDownloading = false;
+   973→        hide("rt-progress");
+   974→        toast(String(e2), "err");
+   975→        setLaunchBadge("启动失败", "err");
+   976→      }
+   977→      return;
+   978→    }
+   979→    setLaunchBadge("启动失败", "err");
+   980→    hide("stop-btn");
+   981→    appendLog("quartz", `[quartz] 启动失败：${msg}`);
+   982→    toast(msg, "err");
+   983→  }
+   984→}
+   985→
+   986→async function launch() {
+   987→  const versionId = el<HTMLSelectElement>("version-select").value;
+   988→  if (!versionId) {
+   989→    toast("请先选择版本", "err");
+   990→    return;
+   991→  }
+   992→  if (!installed.has(versionId)) {
+   993→    toast("该版本尚未下载，请先在「下载游戏」页获取", "err");
+   994→    return;
+   995→  }
+   996→  try {
+   997→    const pf = await invoke<Preflight>("launch_preflight", { versionId });
+   998→    if (!pf.accountOk) {
+   999→      toast("请先在「账户」页登录", "err");
+  1000→      return;
+  1001→    }
+  1002→    if (!pf.versionInstalled) {
+  1003→      toast("版本文件缺失，请重新下载", "err");
+  1004→      return;
+  1005→    }
+  1006→    if (!pf.runtimeInstalled) {
+  1007→      if (!pf.runtimeSpecAvailable) {
+  1008→        toast(`该版本需要 Java ${pf.javaMajor}，运行时下载源暂未收录`, "err");
+  1009→        return;
+  1010→      }
+  1011→      appendLog("quartz", `[quartz] 需要 Java ${pf.javaMajor} 运行时，开始自动下载…`);
+  1012→      pendingLaunchVersion = versionId;
+  1013→      showRtProgress();
+  1014→      await invoke("download_runtime", { javaMajor: pf.javaMajor });
+  1015→      return; // 完成事件回调里继续 doLaunch
+  1016→    }
+  1017→    await doLaunch(versionId);
+  1018→  } catch (e) {
+  1019→    toast(String(e), "err");
+  1020→  }
+  1021→}
+  1022→
+  1023→/* ---------- 页面切换 ---------- */
+  1024→let activePage = "home";
+  1025→function showPage(page: string) {
+  1026→  activePage = page;
+  1027→  for (const p of ["home", "download", "account", "settings"]) {
+  1028→    const sec = el<HTMLElement>(`page-${p}`);
+  1029→    sec.classList.toggle("hidden", p !== page);
+  1030→  }
+  1031→  for (const nav of [el<HTMLElement>("nav"), el<HTMLElement>("bottom-nav")]) {
+  1032→    for (const item of nav.querySelectorAll<HTMLButtonElement>(".nav-item")) {
+  1033→      item.classList.toggle("active", item.dataset.page === page);
+  1034→    }
+  1035→  }
+  1036→}
+  1037→
+  1038→/* ---------- 进入主界面 ---------- */
+  1039→function enterApp() {
+  1040→  hide("login-screen");
+  1041→  show("main-screen");
+  1042→  renderAccountChips();
+  1043→  loadEnvAndMeta();
+  1044→  loadAccounts();
+  1045→  loadVersions();
+  1046→  refreshInstalled();
+  1047→  refreshRuntimeBadge();
+  1048→  refreshPermission();
+  1049→  refreshRenderers();
+  1050→  refreshLwjglState();
+  1051→}
+  1052→
+  1053→/* ---------- 事件绑定 ---------- */
+  1054→function bindEvents() {
+  1055→  // 导航（侧栏 + 底栏共用 data-page）
+  1056→  for (const nav of ["nav", "bottom-nav"]) {
+  1057→    el<HTMLElement>(nav).addEventListener("click", (e) => {
+  1058→      const target = (e.target as HTMLElement).closest<HTMLButtonElement>(".nav-item");
+  1059→      if (target?.dataset.page) showPage(target.dataset.page);
+  1060→    });
+  1061→  }
+  1062→  el<HTMLElement>("topbar-account").addEventListener("click", () => showPage("account"));
+  1063→
+  1064→  // 登录
+  1065→  el<HTMLButtonElement>("login-btn").addEventListener("click", doLogin);
+  1066→  el<HTMLInputElement>("username").addEventListener("keydown", (e) => {
+  1067→    if ((e as KeyboardEvent).key === "Enter") doLogin();
+  1068→  });
+  1069→
+  1070→  // 主页
+  1071→  el<HTMLSelectElement>("version-select").addEventListener("change", (e) => {
+  1072→    storage.selected = (e.target as HTMLSelectElement).value;
+  1073→    updateInstallBadge();
+  1074→  });
+  1075→  el<HTMLButtonElement>("launch-btn").addEventListener("click", launch);
+  1076→
+  1077→  // 下载页
+  1078→  el<HTMLInputElement>("version-search").addEventListener("input", (e) => {
+  1079→    searchText = (e.target as HTMLInputElement).value;
+  1080→    shownCount = PAGE_SIZE;
+  1081→    renderVersionList();
+  1082→  });
+  1083→  el<HTMLElement>("kind-chips").addEventListener("click", (e) => {
+  1084→    const chip = (e.target as HTMLElement).closest<HTMLButtonElement>(".chip");
+  1085→    if (!chip?.dataset.kind) return;
+  1086→    kindFilter = chip.dataset.kind;
+  1087→    shownCount = PAGE_SIZE;
+  1088→    for (const c of el<HTMLElement>("kind-chips").querySelectorAll<HTMLButtonElement>(".chip")) {
+  1089→      c.classList.toggle("active", c === chip);
+  1090→    }
+  1091→    renderVersionList();
+  1092→  });
+  1093→  el<HTMLButtonElement>("load-more-btn").addEventListener("click", () => {
+  1094→    shownCount += PAGE_SIZE;
+  1095→    renderVersionList();
+  1096→  });
+  1097→
+  1098→  // 账户页
+  1099→  el<HTMLButtonElement>("add-account-btn").addEventListener("click", addAccount);
+  1100→  el<HTMLInputElement>("new-account-name").addEventListener("keydown", (e) => {
+  1101→    if ((e as KeyboardEvent).key === "Enter") addAccount();
+  1102→  });
+  1103→
+  1104→  // 完整文件权限（登录屏 / 主界面横幅 / 设置页三处入口）
+  1105→  for (const id of ["login-perm-btn", "perm-banner-btn", "settings-perm-btn"]) {
+  1106→    el<HTMLButtonElement>(id).addEventListener("click", requestPermission);
+  1107→  }
+  1108→
+  1109→  // 启动控制台
+  1110→  el<HTMLButtonElement>("console-clear-btn").addEventListener("click", clearConsole);
+  1111→  el<HTMLButtonElement>("lwjgl-dl-btn").addEventListener("click", async () => {
+  1112→    if (lwjglDownloading) {
+  1113→      toast("已有 LWJGL 下载任务", "");
+  1114→      return;
+  1115→    }
+  1116→    lwjglDownloading = true;
+  1117→    show("renderer-progress");
+  1118→    setText("renderer-progress-stage", "LWJGL");
+  1119→    setText("renderer-progress-text", "0%");
+  1120→    try {
+  1121→      await invoke("download_lwjgl");
+  1122→    } catch (e) {
+  1123→      lwjglDownloading = false;
+  1124→      hide("renderer-progress");
+  1125→      toast(String(e), "err");
+  1126→    }
+  1127→  });
+  1128→  el<HTMLButtonElement>("stop-btn").addEventListener("click", async () => {
+  1129→    try {
+  1130→      const stopped = await invoke<boolean>("stop_game");
+  1131→      if (stopped) {
+  1132→        toast("已发送终止信号", "ok");
+  1133→        appendLog("quartz", "[quartz] 已发送终止信号 (SIGKILL)");
+  1134→      } else {
+  1135→        toast("当前没有运行中的游戏", "");
+  1136→      }
+  1137→    } catch (e) {
+  1138→      toast(String(e), "err");
+  1139→    }
+  1140→  });
+  1141→
+  1142→  // 授权后回到应用时自动重检权限（覆盖从系统设置返回的场景）
+  1143→  document.addEventListener("visibilitychange", () => {
+  1144→    if (document.visibilityState === "visible") refreshPermission();
+  1145→  });
+  1146→  window.addEventListener("focus", refreshPermission);
+  1147→}
+  1148→
+  1149→/* ---------- 启动 ---------- */
+  1150→async function boot() {
+  1151→  bindEvents();
+  1152→  await ensureProgressListener();
+  1153→  await refreshPermission();
+  1154→  try {
+  1155→    const acc = await invoke<Account | null>("get_account");
+  1156→    if (acc && acc.username) {
+  1157→      currentAccount = acc;
+  1158→      enterApp();
+  1159→      return;
+  1160→    }
+  1161→  } catch {
+  1162→    /* 未登录 */
+  1163→  }
+  1164→  el<HTMLInputElement>("username").focus();
+  1165→}
+  1166→
+  1167→boot();
+  1168→

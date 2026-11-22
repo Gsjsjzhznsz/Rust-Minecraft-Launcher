@@ -20,6 +20,7 @@ type EnvInfo = {
   layoutOk: boolean;
   layoutError: string | null;
   fullAccess: boolean;
+  freeBytes?: number | null;
 };
 type AppMeta = { name: string; version: string; os: string; arch: string };
 type Preflight = {
@@ -588,6 +589,42 @@ async function doLogin() {
 }
 
 /* ---------- 存储与环境 ---------- */
+function fmtBytes(n: number): string {
+  const mb = Math.floor(n / (1024 * 1024));
+  if (mb >= 1024) return (mb / 1024).toFixed(1) + "GB";
+  return mb + "MB";
+}
+
+/* ---------- 启动诊断（上次崩溃 / 存储不足 / 最近启动日志尾部） ---------- */
+async function showDiagnostics() {
+  try {
+    const d = await invoke<{
+      lastCrash: string | null;
+      lastLaunchTail: string | null;
+      freeBytes: number | null;
+    }>("get_diagnostics");
+    const parts: string[] = [];
+    if (d.lastCrash) parts.push("检测到上次异常退出（闪退证据已落盘）：\n" + d.lastCrash);
+    if (typeof d.freeBytes === "number" && d.freeBytes < 500 * 1024 * 1024) {
+      parts.push(
+        "⚠ 设备存储空间不足（剩余 " +
+          fmtBytes(d.freeBytes) +
+          "）：下载会失败，应用也可能闪退，建议清理空间后重试"
+      );
+    }
+    if (d.lastLaunchTail) parts.push("最近一次游戏启动日志尾部：\n" + d.lastLaunchTail);
+    if (parts.length) {
+      el<HTMLElement>("diag-banner-text").textContent = parts.join("\n\n————\n\n");
+      show("diag-banner");
+    }
+    if (typeof d.freeBytes === "number") {
+      setText("storage-free", fmtBytes(d.freeBytes) + " 可用");
+    }
+  } catch {
+    /* 诊断失败不影响启动 */
+  }
+}
+
 async function loadEnvAndMeta() {
   try {
     const env = await invoke<EnvInfo>("get_env_info");
@@ -602,6 +639,9 @@ async function loadEnvAndMeta() {
             ? "内部私有目录（应用专属）"
             : "桌面环境";
     setText("storage-mode", modeText);
+    if (typeof env.freeBytes === "number") {
+      setText("storage-free", fmtBytes(env.freeBytes) + " 可用");
+    }
     fullAccess = env.fullAccess;
     togglePermUI(env.fullAccess);
     for (const badgeId of ["storage-badge", "settings-storage-badge"]) {
@@ -1052,6 +1092,9 @@ function enterApp() {
 
 /* ---------- 事件绑定 ---------- */
 function bindEvents() {
+  // 启动诊断横幅关闭
+  el<HTMLElement>("diag-banner-close").addEventListener("click", () => hide("diag-banner"));
+
   // 导航（侧栏 + 底栏共用 data-page）
   for (const nav of ["nav", "bottom-nav"]) {
     el<HTMLElement>(nav).addEventListener("click", (e) => {
@@ -1150,6 +1193,7 @@ function bindEvents() {
 async function boot() {
   bindEvents();
   await ensureProgressListener();
+  showDiagnostics(); // 异步：诊断失败不阻塞启动
   await refreshPermission();
   try {
     const acc = await invoke<Account | null>("get_account");

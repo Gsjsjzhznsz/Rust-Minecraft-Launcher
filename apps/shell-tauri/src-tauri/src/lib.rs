@@ -377,6 +377,228 @@ fn storage_json(diag: &StorageDiag) -> serde_json::Value {
         "layoutOk": diag.layout_ok,
         "layoutError": diag.layout_error,
         "fullAccess": storage_permission_granted(),
+        "freeBytes": quartz_core::space::free_space(&diag.root),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// 崩溃证据落盘 + 启动自愈（v8「一打开就闪退」加固）
+// ---------------------------------------------------------------------------
+//
+// 「闪退」的三类根因都在这里落证据 / 自愈：
+// 1. Rust panic（任意线程）：panic hook 追加标记到唯一崩溃日志，下次启动 UI 横幅
+//    直接展示原因 —— 不再是黑盒闪退；
+// 2. Java/Kotlin 未捕获异常：QuartzApp（gen/android）同一文件追加 JAVA 标记；
+// 3. WebView 状态损坏导致的打开即崩：QuartzApp 检测 2 分钟内 ≥2 次崩溃，
+//    在 WebView 创建前清理 app_webview（Chromium profile）自愈。
+//
+// 另：失败下载每次重试都留下大文件（.qz-part/.part/.staging，PoJav APK 154MB /
+// JRE pack 38MB），反复失败会把 userdata 分区塞满 —— FUSE 与应用私有目录同分区，
+// 塞满后 WebView 无法初始化即「打开就闪退」。启动时自动清理残留 + 下载前空间
+// 门槛（space 模块）从根上折断这个循环。
+
+/// 崩溃日志唯一权威路径（run() 最早阶段解析；panic hook 与 get_diagnostics 共用）。
+/// Android 用内部私有目录（必定可写，无需任何权限）。
+static CRASH_LOG: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+fn crash_log_path() -> PathBuf {
+    #[cfg(target_os = "android")]
+    {
+        if let Some(p) = resolve_android_internal() {
+            return p.join("crash").join("quartz-crash.log");
+        }
+        // JNI 不可用时的壳层回退（应用私有目录固定路径）
+        PathBuf::from("/data/data/com.quartz.launcher/files/crash/quartz-crash.log")
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        paths::game_root().join("logs").join("quartz-crash.log")
+    }
+}
+
+/// 追加一条崩溃标记。格式（Rust/Java 两端约定，QuartzApp.kt 同款解析）：
+/// `==== CRASH @<epoch秒> <KIND> ====` 换行正文。失败静默（panic hook 内不能报错）。
+fn append_crash_marker(kind: &str, body: &str) {
+    let Some(path) = CRASH_LOG.get() else { return };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    use std::io::Write as _;
+    let text = format!("==== CRASH @{epoch} {kind} ====\n{body}\n");
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(f, "{text}");
+        let _ = f.flush();
+    }
+    // 授权时同步一份到公共目录：用户可用文件管理器直接取出日志（不依赖 UI）
+    #[cfg(target_os = "android")]
+    {
+        if storage_permission_granted() {
+            let public = paths::game_root().join("logs").join("quartz-crash.log");
+            if let Some(parent) = public.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(public) {
+                let _ = writeln!(f, "{text}");
+            }
+        }
+    }
+}
+
+/// 安装 panic hook：Rust panic（任意线程）先落盘再交回默认打印（logcat 保留）。
+/// 必须在 tauri::Builder 构建前调用 —— setup 钩子/主线程 panic 由此才有证据。
+fn install_panic_hook() {
+    let _ = CRASH_LOG.set(crash_log_path());
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "未知位置".into());
+        let msg = info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "非字符串 panic 载荷".into());
+        let thread = std::thread::current()
+            .name()
+            .unwrap_or("<unnamed>")
+            .to_string();
+        let bt = std::backtrace::Backtrace::force_capture().to_string();
+        let bt_tail = bt
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .take(40)
+            .collect::<Vec<_>>()
+            .join("\n");
+        append_crash_marker(
+            "RUST-PANIC",
+            &format!(
+                "thread: {thread}\nlocation: {location}\nmessage: {msg}\nbacktrace(40):\n{bt_tail}"
+            ),
+        );
+        eprintln!("[quartz-panic] {msg} @ {location}");
+        default_hook(info);
+    }));
+}
+
+/// 清理失败下载残留的临时文件（*.qz-part / *.part / *.tmp 与 .*.staging 目录）。
+/// 只动顶层明确的临时名，绝不碰正常数据。返回回收字节数（eprintln 汇报）。
+fn cleanup_stale_partials() {
+    let roots = [paths::runtime_dir(), paths::game_root()];
+    let mut reclaimed: u64 = 0;
+    for root in roots {
+        for entry in std::fs::read_dir(&root).into_iter().flatten().flatten() {
+            let p = entry.path();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let is_dir = p.is_dir();
+            let stale_part = !is_dir
+                && (name.ends_with(".qz-part")
+                    || name.ends_with(".part")
+                    || name.ends_with(".tmp"));
+            let stale_staging = is_dir && name.starts_with('.') && name.ends_with(".staging");
+            if stale_part || stale_staging {
+                let size = entry
+                    .metadata()
+                    .map(|m| if m.is_dir() { 0 } else { m.len() })
+                    .unwrap_or(0);
+                let ok = if is_dir {
+                    std::fs::remove_dir_all(&p).is_ok()
+                } else {
+                    std::fs::remove_file(&p).is_ok()
+                };
+                if ok {
+                    reclaimed += size;
+                    eprintln!("[quartz] 已清理残留下载缓存：{}（{} 字节）", p.display(), size);
+                }
+            }
+        }
+    }
+    if reclaimed > 0 {
+        eprintln!("[quartz] 共回收残留下载缓存 {} 字节", reclaimed);
+    }
+}
+
+/// 下载类命令的可用空间下限（精确需求在 core 各下载函数内按实际字节数校验）。
+const DOWNLOAD_FLOOR: u64 = 200 * 1024 * 1024;
+
+/// 下载前底线检查：可用空间 < 200MB 直接拦（ENOSPC 在 WebView/系统层面后果严重）。
+fn check_download_floor(target: &Path) -> Result<(), String> {
+    match quartz_core::space::free_space(target) {
+        Some(free) if free < DOWNLOAD_FLOOR => Err(quartz_core::space::insufficient(
+            DOWNLOAD_FLOOR,
+            free,
+            "执行下载",
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// 字符安全截断（按 char 而非字节，避免切断 UTF-8）。
+fn clamp_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    s.chars().take(max).collect()
+}
+
+/// 从崩溃日志提取最后一个标记块（含标记行，最多 60 行）。
+fn last_crash_summary() -> Option<String> {
+    let path = CRASH_LOG.get()?;
+    let text = std::fs::read_to_string(path).ok()?;
+    let mut blocks: Vec<Vec<&str>> = Vec::new();
+    for line in text.lines() {
+        if line.starts_with("==== CRASH @") {
+            blocks.push(vec![line]);
+        } else if let Some(last) = blocks.last_mut() {
+            last.push(line);
+        }
+    }
+    let last = blocks.last()?;
+    let body = last
+        .iter()
+        .take(60)
+        .copied()
+        .collect::<Vec<&str>>()
+        .join("\n");
+    Some(clamp_chars(&body, 3000))
+}
+
+/// 最近一次游戏启动日志尾部（SIGABRT/退出码诊断在 UI 上直达，无需文件管理器）。
+fn last_launch_tail() -> Option<String> {
+    let dir = paths::game_root().join("logs");
+    let mut best: Option<(PathBuf, std::time::SystemTime)> = None;
+    for e in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if name.starts_with("launch-") && name.ends_with(".log") {
+            let t = e
+                .metadata()
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            if best.as_ref().map(|(_, bt)| t > *bt).unwrap_or(true) {
+                best = Some((e.path(), t));
+            }
+        }
+    }
+    let (p, _) = best?;
+    let text = std::fs::read_to_string(&p).ok()?;
+    let lines: Vec<&str> = text.lines().collect();
+    let tail = lines.len().saturating_sub(60);
+    Some(clamp_chars(&lines[tail..].join("\n"), 3000))
+}
+
+/// 启动诊断：上次崩溃原因 + 存储剩余 + 最近启动日志尾部（UI 开屏横幅展示）。
+#[tauri::command]
+fn get_diagnostics() -> serde_json::Value {
+    json!({
+        "lastCrash": last_crash_summary(),
+        "lastLaunchTail": last_launch_tail(),
+        "freeBytes": quartz_core::space::free_space(&paths::game_root()),
+        "crashLogPath": CRASH_LOG.get().map(|p| p.display().to_string()),
     })
 }
 
@@ -722,6 +944,8 @@ async fn download_game(
         }
         *busy = true;
     }
+    // 空间底线检查（精确需求在 instance::install_standard 内按缺失任务字节数校验）
+    check_download_floor(&paths::game_root())?;
     let busy = state.downloading.clone();
     let app = app.clone();
 
@@ -792,6 +1016,7 @@ async fn download_runtime(java_major: u32, app: AppHandle, state: State<'_, AppS
     {
         return Err("已有运行时下载任务正在进行".to_string());
     }
+    check_download_floor(&paths::runtime_dir())?;
     let busy = state.runtime_busy.clone();
     let app = app.clone();
 
@@ -867,6 +1092,7 @@ async fn download_renderer(
     {
         return Err("已有渲染层下载任务正在进行".to_string());
     }
+    check_download_floor(&paths::runtime_dir())?;
     let busy = state.renderer_busy.clone();
     let app = app.clone();
 
@@ -927,6 +1153,7 @@ async fn download_lwjgl(app: AppHandle, state: State<'_, AppState>) -> Result<()
     {
         return Err("已有 LWJGL 下载任务正在进行".to_string());
     }
+    check_download_floor(&paths::runtime_dir())?;
     let busy = state.lwjgl_busy.clone();
     let app = app.clone();
 
@@ -1747,10 +1974,14 @@ fn stop_game(state: State<'_, AppState>) -> Result<bool, String> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // 崩溃证据落盘必须先于一切：setup/主线程 panic 与后续任何线程 panic 都有据可查
+    install_panic_hook();
     tauri::Builder::default()
         .manage(AppState::default())
         .setup(|_app| {
-            // 启动即解析真实可写存储并创建标准目录布局（诊断信息供 UI 展示）。
+            // 启动即清理失败下载的残留缓存（回收空间，断「塞满分区 → 闪退」循环），
+            // 再解析真实可写存储并创建标准目录布局（诊断信息供 UI 展示）。
+            cleanup_stale_partials();
             let diag = init_storage();
             *STORAGE_DIAG.lock().expect("锁中毒") = Some(diag);
             Ok(())
@@ -1769,6 +2000,7 @@ pub fn run() {
             download_game,
             get_game_dir,
             get_env_info,
+            get_diagnostics,
             get_permission_state,
             request_storage_permission,
             reinit_storage,

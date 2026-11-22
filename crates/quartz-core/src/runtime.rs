@@ -131,16 +131,27 @@ pub async fn download_and_install(
     let jres = paths::runtime_dir();
     std::fs::create_dir_all(&jres)?;
 
+    // 存储空间前置检查：pack 下载 + 解包副本（xz 展开约 2 倍 + 余量）。
+    // 空间不足当场报可行动错误，避免下到一半 ENOSPC（v8 加固）。
+    crate::space::ensure_free(
+        &jres,
+        spec.size * 2 + 100 * 1024 * 1024,
+        "下载 Java 运行时",
+    )
+    .map_err(crate::error::Error::Other)?;
+
     // ---- ① 下载（.qz-part 临时名，完成后改名；镜像回退见 mirror 模块） ----
     let part = jres.join(format!("{}.qz-part", spec.file));
     let resp = crate::mirror::get_stream(client, &spec.url()).await?;
     let total = resp.content_length().unwrap_or(spec.size);
     let mut downloaded: u64 = 0;
-    let mut file = std::fs::File::create(&part)?;
+    let mut file = std::fs::File::create(&part)
+        .map_err(|e| Error::Other(crate::error::io_context(&e, &part)))?;
     let mut last = tokio::time::Instant::now() - tokio::time::Duration::from_secs(1);
     let mut stream = resp;
     while let Some(chunk) = crate::mirror::next_chunk(&mut stream).await? {
-        std::io::Write::write_all(&mut file, &chunk)?;
+        std::io::Write::write_all(&mut file, &chunk)
+            .map_err(|e| Error::Other(crate::error::io_context(&e, &part)))?;
         downloaded += chunk.len() as u64;
         let now = tokio::time::Instant::now();
         if now.duration_since(last) >= tokio::time::Duration::from_millis(120) {

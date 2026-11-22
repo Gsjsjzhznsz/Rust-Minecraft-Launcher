@@ -466,3 +466,35 @@ select { appearance: none; background-image: linear-gradient(45deg, transparent 
 
 /* 控制台内嵌运行时下载进度 */
 .console-card .progress-card { margin-top: 12px; }
+
+/* ============ 启动诊断横幅（上次崩溃 / 存储不足 / 启动日志尾部） ============ */
+.diag-banner {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 999;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 48vh;
+  padding: 10px 14px;
+  background: #2a1414;
+  color: #ffd9d9;
+  border-bottom: 1px solid #b04a4a;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.45);
+}
+.diag-banner.hidden { display: none; }
+.diag-banner .diag-text {
+  margin: 0;
+  font-family: "JetBrains Mono", ui-monospace, Menlo, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+  user-select: text;
+  -webkit-user-select: text;
+}
+.diag-banner .diag-actions { display: flex; justify-content: flex-end; }
+.diag-banner .btn { border-color: #b04a4a; }

@@ -371,6 +371,28 @@ pub async fn install_standard(
     }
 
     let total: u64 = tasks.iter().filter_map(|t| t.size).sum();
+
+    // 存储空间前置检查：只统计真正缺失的任务（重试时已存在文件不计入需求），
+    // 外加 64MB 对齐/临时副本余量。空间不足在此给出可行动报错，
+    // 而不是下到一半 ENOSPC（os error 28）。
+    let pending: u64 = tasks
+        .iter()
+        .filter(|t| !t.dest.exists())
+        .filter_map(|t| t.size)
+        .sum();
+    if pending > 0 {
+        let need = pending + 64 * 1024 * 1024;
+        crate::space::ensure_free(
+            &crate::paths::minecraft_dir(),
+            need,
+            &format!(
+                "下载 {version_id}（约 {}）",
+                crate::space::human_bytes(pending)
+            ),
+        )
+        .map_err(crate::error::Error::Other)?;
+    }
+
     // 任务元数据：label -> (stage, size, dest)（供进度换算与跳过补算）
     let mut meta_by_label = std::collections::BTreeMap::new();
     for t in &tasks {

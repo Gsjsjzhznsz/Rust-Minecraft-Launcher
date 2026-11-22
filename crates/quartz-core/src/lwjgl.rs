@@ -82,6 +82,10 @@ pub async fn download_and_install(
     let _ = std::fs::remove_dir_all(&staging);
     std::fs::create_dir_all(staging.join("natives"))?;
 
+    // 存储空间前置检查：154MB APK 下载 + 提取副本（v8 加固）。
+    crate::space::ensure_free(&dir, 400 * 1024 * 1024, "下载 LWJGL 安卓包")
+        .map_err(crate::error::Error::Other)?;
+
     // ---- ① 下载官方 APK（一次 154MB，换取 jar 与 natives 版本严格配套；镜像回退） ----
     let part = paths::runtime_dir().join(".pojav.apk.part");
     let resp = crate::mirror::get_stream(client, POJAV_APK).await?;
@@ -90,10 +94,16 @@ pub async fn download_and_install(
     let mut stream = resp;
     {
         use tokio::io::AsyncWriteExt;
-        let mut out = tokio::io::BufWriter::new(tokio::fs::File::create(&part).await?);
+        let mut out = tokio::io::BufWriter::new(
+            tokio::fs::File::create(&part)
+                .await
+                .map_err(|e| Error::Other(crate::error::io_context(&e, &part)))?,
+        );
         let mut last = tokio::time::Instant::now() - tokio::time::Duration::from_secs(1);
         while let Some(chunk) = crate::mirror::next_chunk(&mut stream).await? {
-            out.write_all(&chunk).await?;
+            out.write_all(&chunk)
+                .await
+                .map_err(|e| Error::Other(crate::error::io_context(&e, &part)))?;
             cur += chunk.len() as u64;
             let now = tokio::time::Instant::now();
             if now.duration_since(last) >= tokio::time::Duration::from_millis(120) {

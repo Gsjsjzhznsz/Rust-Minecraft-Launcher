@@ -33,3 +33,16 @@ pub enum Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// io 错误 → 人类可读消息：os 28 = ENOSPC（存储满）、os 13 = EACCES（权限不足），
+/// 其余原样携带路径上下文 —— 下载管线写盘失败时给用户可行动提示而非裸 os error。
+pub fn io_context(e: &std::io::Error, path: &std::path::Path) -> String {
+    match e.raw_os_error() {
+        Some(28) => format!(
+            "写入失败（设备存储空间不足）：{}，请清理存储后重试",
+            path.display()
+        ),
+        Some(13) => format!("写入失败（权限不足）：{}", path.display()),
+        _ => format!("文件操作失败（{e}）：{}", path.display()),
+    }
+}

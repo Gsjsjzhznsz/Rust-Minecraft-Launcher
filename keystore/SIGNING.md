@@ -109,6 +109,40 @@
   glfwCreateWindow 仍需应用侧窗口桥（见 v6 节「已知边界」）——若下一轮
   日志显示 GLFW/窗口错误，属已记录的 M2 里程碑，不再是 SIGABRT。
 
+## v8 修复：闪退自愈 + 下载空间防线（2026-11-23）
+
+用户报告「一打开就闪退」（此前「又下载失败」）。Rust 启动路径全面审查未发现主线程
+panic 点（setup 钩子 / 首轮 invoke 命令均不 panic），判定最可能根因：
+① 失败下载残留（.qz-part/.part/.staging，Pojav APK 154MB / JRE pack 38MB）反复重试
+   塞满 userdata 分区（FUSE 与应用私有目录同分区）→ WebView 无法初始化，「一打开
+   就闪退」；② WebView 数据损坏（进程被杀时写坏 IndexedDB/缓存）导致崩溃循环。
+
+- 崩溃证据链（闪退不再黑盒）：
+  - Rust：`install_panic_hook()`（run() 最早调用）→ 任意线程 panic 追加到
+    `<files>/crash/quartz-crash.log`，含线程/位置/消息/backtrace 40 行；
+  - Java：新增 `QuartzApp`（Application 子类，Manifest android:name 注册）未捕获
+    异常处理器 → 同一文件同一标记格式 `==== CRASH @<epoch秒> KIND ====`；
+  - Android 原生 abort（bionic）不可捕获，但 logcat 摘录体系（v6/v7）继续覆盖游戏进程。
+- WebView 崩溃循环自愈：QuartzApp 检测 2 分钟内 ≥2 次崩溃 → 在 Activity/WebView
+  创建前删除 `app_webview`（Chromium profile）。只清 WebView 数据，不碰
+  app_data（Tauri 数据）与任何游戏文件。
+- 存储防线（断「下载失败 → 塞满 → 闪退」循环）：
+  - quartz-core 新增 `space` 模块（statvfs f_bavail×f_frsize）；
+  - 启动时 `cleanup_stale_partials()` 清理 `*.qz-part`/`*.part`/`*.tmp` 与
+    `.*.staging`（只动顶层明确临时名）；
+  - 下载前置空间检查：游戏=缺失任务字节+64MB（instance）、runtime=size×2+100MB、
+    LWJGL 400MB、渲染层 200MB、壳层四命令统一 200MB 底线（不可探测则放行）；
+  - os error 28/13 → 中文可行动文案（`error::io_context`），写盘点全部接入；
+  - `meta::expand_asset_index` 短哈希切片 panic 加固（损坏索引报错而非 abort）。
+- 诊断上屏：新增 `get_diagnostics` 命令（lastCrash / lastLaunchTail / freeBytes /
+  crashLogPath）→ 前端开屏横幅（登录屏也可见，可关闭）；设置页新增「可用空间」行；
+  `storage_json` 带 freeBytes。游戏 SIGABRT 的证据（launch-*.log 尾部 60 行）
+  经同一横幅直达 UI。
+- 版本：Cargo/tauri.conf 0.1.3，versionCode 1003。
+- 交付：Quartz.apk 27,804,767 字节；签名 SHA-256 63860a42…783 不变（可覆盖安装）；
+  930 条目、so STORED、5 个 META-INF/services 保留、QuartzApp 编入 classes6.dex、
+  targetSdk 28 不变。
+
 ## v6 修复：下载管线镜像回退（2026-11-23）
 
 用户反馈「下载失败」：v5 全部下载源为 GitHub 直连（JRE pack、154MB Pojav APK、

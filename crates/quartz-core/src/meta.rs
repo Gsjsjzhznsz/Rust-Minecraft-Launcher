@@ -220,14 +220,18 @@ pub fn expand_asset_index(
     let mut tasks = Vec::new();
     for obj in index.objects.values() {
         let hash = obj.hash.to_ascii_lowercase();
-        let url = format!(
-            "https://resources.download.minecraft.net/{}/{}",
-            &hash[..2],
-            hash
-        );
+        // 防御：短哈希会让 &hash[..2] 切片直接 panic（整进程 abort）——
+        // 损坏/半截资产索引必须报错而不是崩溃（v8 闪退加固）。
+        let Some(prefix) = hash.get(..2) else {
+            return Err(crate::error::Error::Other(format!(
+                "资产索引含非法哈希「{}」（长度不足 2），索引文件损坏，请重新下载该版本",
+                obj.hash
+            )));
+        };
+        let url = format!("https://resources.download.minecraft.net/{prefix}/{hash}");
         tasks.push(crate::download::DownloadTask {
             source: crate::download::Source::Url(url),
-            dest: assets_root.join("objects").join(&hash[..2]).join(&hash),
+            dest: assets_root.join("objects").join(prefix).join(&hash),
             hash: Some(HashSpec::sha1(hash.clone())),
             size: Some(obj.size),
             label: format!("asset:{hash}"),

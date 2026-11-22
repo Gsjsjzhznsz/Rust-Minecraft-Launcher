@@ -18,3 +18,7 @@ hex.workspace = true
 zip.workspace = true
 tar.workspace = true
 xz2.workspace = true
+
+# unix（含 Android）：space::free_space 经 statvfs 探测分区可用空间
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

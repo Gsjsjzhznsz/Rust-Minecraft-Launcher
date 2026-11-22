@@ -188,11 +188,17 @@ async fn run_task(task: DownloadTask, client: reqwest::Client) -> Result<(u64, b
                         continue;
                     }
                     if let Some(parent) = task.dest.parent() {
-                        tokio::fs::create_dir_all(parent).await?;
+                        tokio::fs::create_dir_all(parent)
+                            .await
+                            .map_err(|e| Error::Other(crate::error::io_context(&e, &parent)))?;
                     }
                     let tmp = task.dest.with_extension("qz-part");
-                    tokio::fs::write(&tmp, &data).await?;
-                    tokio::fs::rename(&tmp, &task.dest).await?;
+                    tokio::fs::write(&tmp, &data)
+                        .await
+                        .map_err(|e| Error::Other(crate::error::io_context(&e, &tmp)))?;
+                    tokio::fs::rename(&tmp, &task.dest)
+                        .await
+                        .map_err(|e| Error::Other(crate::error::io_context(&e, &task.dest)))?;
                     return Ok((data.len() as u64, false));
                 }
                 Err(e) => last_err = Some(e),

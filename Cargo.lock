@@ -788,6 +788,7 @@ name = "quartz-core"
 version = "0.1.0"
 dependencies = [
  "hex",
+ "libc",
  "md-5",
  "reqwest",
  "serde",
