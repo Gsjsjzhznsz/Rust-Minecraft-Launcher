@@ -11,6 +11,11 @@
 //!    「JRE17 for Android」（OpenJDK GPL-2 with Classpath Exception），
 //!    tarball 顶层无包装目录（`./bin/java` ...），bin/java 为 Android 原生 ELF
 //!    （interpreter /system/bin/linker64，API 21+，NDK r21 构建）。
+//! 4. 该 2021 构建在 Android 12+（API 31+）上必须配合壳层的 tagged-pointer
+//!    兼容层（LD_PRELOAD shim：进程早期 mallopt(M_BIONIC_SET_HEAP_TAGGING_LEVEL,
+//!    NONE)，源码 scripts/tagfix/quartz_tagfix.c，编入 apps/shell-tauri
+//!    include_bytes）：否则 GC 线程 scudo CHECK -> SIGABRT（退出码 134）。
+//!    壳层在 spawn java 时注入，pack 内容无需改动。
 //!
 //! Java 版本覆盖：JRE17 覆盖 Minecraft 1.13–1.20.4；1.20.5+ 需要 Java 21、
 //! 1.12- 需要 Java 8 —— 下载源待 M1 接入（见 [`spec_for`] 与 ROADMAP）。
@@ -126,19 +131,15 @@ pub async fn download_and_install(
     let jres = paths::runtime_dir();
     std::fs::create_dir_all(&jres)?;
 
-    // ---- ① 下载（.qz-part 临时名，完成后改名） ----
+    // ---- ① 下载（.qz-part 临时名，完成后改名；镜像回退见 mirror 模块） ----
     let part = jres.join(format!("{}.qz-part", spec.file));
-    let resp = client.get(spec.url()).send().await?.error_for_status()?;
+    let resp = crate::mirror::get_stream(client, &spec.url()).await?;
     let total = resp.content_length().unwrap_or(spec.size);
     let mut downloaded: u64 = 0;
     let mut file = std::fs::File::create(&part)?;
     let mut last = tokio::time::Instant::now() - tokio::time::Duration::from_secs(1);
     let mut stream = resp;
-    while let Some(chunk) = stream
-        .chunk()
-        .await
-        .map_err(|e| Error::Other(format!("运行时下载失败：{e}")))?
-    {
+    while let Some(chunk) = crate::mirror::next_chunk(&mut stream).await? {
         std::io::Write::write_all(&mut file, &chunk)?;
         downloaded += chunk.len() as u64;
         let now = tokio::time::Instant::now();
@@ -262,8 +263,12 @@ fn ensure_exec_dir(dir: &Path) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// 跨模块测试共享的全局路径状态锁（paths/lwjgl/renderers 同用）。
+    pub(crate) static TEST_STATE_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn spec_coverage_and_urls() {
@@ -286,6 +291,7 @@ mod tests {
 
     #[test]
     fn install_dir_follows_runtime_override() {
+        let _guard = TEST_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let root = std::env::temp_dir().join(format!("qz-rt-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();

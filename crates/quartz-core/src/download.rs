@@ -129,14 +129,15 @@ fn spec_matches(hash: &Option<HashSpec>, data: &[u8]) -> bool {
     }
 }
 
+/// 从单个 URL 拉全量字节（流式读 + 停滞超时；镜像选择交由 [`crate::mirror`]）。
+async fn fetch_url_bytes(client: &reqwest::Client, url: &str) -> Result<Vec<u8>> {
+    crate::mirror::get_bytes(client, url).await
+}
+
 async fn fetch_bytes(source: &Source, client: &reqwest::Client) -> Result<Vec<u8>> {
     match source {
         Source::Local(p) => tokio::fs::read(p).await.map_err(Into::into),
-        Source::Url(url) => {
-            let resp = client.get(url).send().await?;
-            let resp = resp.error_for_status()?;
-            Ok(resp.bytes().await?.to_vec())
-        }
+        Source::Url(url) => fetch_url_bytes(client, url).await,
     }
 }
 
@@ -150,38 +151,52 @@ async fn run_task(task: DownloadTask, client: reqwest::Client) -> Result<(u64, b
         }
     }
 
+    // 镜像回退重试策略：候选源（镜像优先 + 直连兑底）逐个尝试为第一轮，
+    // 全部失败后整体重试一轮（应对瞬时网络抖动）。任一候选成功即返回。
+    let urls = match &task.source {
+        Source::Local(_) => Vec::new(),
+        Source::Url(u) => crate::mirror::candidates(u),
+    };
+
     let mut last_err: Option<Error> = None;
-    for attempt in 0..3u8 {
-        if attempt > 0 {
-            tokio::time::sleep(std::time::Duration::from_millis(500 * attempt as u64)).await;
+    for round in 0..2u8 {
+        if round > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(800)).await;
         }
-        match fetch_bytes(&task.source, &client).await {
-            Ok(data) => {
-                if let Some(size) = task.size {
-                    if data.len() as u64 != size {
-                        let e = Error::SizeMismatch(task.label.clone(), size, data.len() as u64);
+        let sources: Vec<Source> = match &task.source {
+            Source::Local(_) => vec![task.source.clone()],
+            Source::Url(_) => urls.iter().map(|u| Source::Url(u.clone())).collect(),
+        };
+        for src in sources {
+            match fetch_bytes(&src, &client).await {
+                Ok(data) => {
+                    if let Some(size) = task.size {
+                        if data.len() as u64 != size {
+                            let e =
+                                Error::SizeMismatch(task.label.clone(), size, data.len() as u64);
+                            last_err = Some(e);
+                            continue;
+                        }
+                    }
+                    if !spec_matches(&task.hash, &data) {
+                        let (expected, got) = match &task.hash {
+                            Some(h) => (h.value.clone(), hash_hex(h.algo, &data)),
+                            None => (String::new(), String::new()),
+                        };
+                        let e = Error::ShaMismatch(task.label.clone(), expected, got);
                         last_err = Some(e);
                         continue;
                     }
+                    if let Some(parent) = task.dest.parent() {
+                        tokio::fs::create_dir_all(parent).await?;
+                    }
+                    let tmp = task.dest.with_extension("qz-part");
+                    tokio::fs::write(&tmp, &data).await?;
+                    tokio::fs::rename(&tmp, &task.dest).await?;
+                    return Ok((data.len() as u64, false));
                 }
-                if !spec_matches(&task.hash, &data) {
-                    let (expected, got) = match &task.hash {
-                        Some(h) => (h.value.clone(), hash_hex(h.algo, &data)),
-                        None => (String::new(), String::new()),
-                    };
-                    let e = Error::ShaMismatch(task.label.clone(), expected, got);
-                    last_err = Some(e);
-                    continue;
-                }
-                if let Some(parent) = task.dest.parent() {
-                    tokio::fs::create_dir_all(parent).await?;
-                }
-                let tmp = task.dest.with_extension("qz-part");
-                tokio::fs::write(&tmp, &data).await?;
-                tokio::fs::rename(&tmp, &task.dest).await?;
-                return Ok((data.len() as u64, false));
+                Err(e) => last_err = Some(e),
             }
-            Err(e) => last_err = Some(e),
         }
     }
     Err(last_err.unwrap_or_else(|| Error::Other(format!("task failed: {}", task.label))))
@@ -197,7 +212,8 @@ pub async fn execute(
     use tokio::task::JoinSet;
 
     let concurrency = concurrency.max(1);
-    let mut set: JoinSet<Result<(String, u64, bool)>> = JoinSet::new();
+    let mut set: JoinSet<std::result::Result<(String, u64, bool), (String, Error)>> =
+        JoinSet::new();
     let mut inflight = 0usize;
     let mut iter = plan.tasks.iter().cloned();
     let mut summary = ExecSummary::default();
@@ -214,8 +230,10 @@ pub async fn execute(
                 .await;
             let client = client.clone();
             set.spawn(async move {
-                let (bytes, skipped) = run_task(task, client).await?;
-                Ok((label, bytes, skipped))
+                match run_task(task, client).await {
+                    Ok((bytes, skipped)) => Ok((label, bytes, skipped)),
+                    Err(e) => Err((label, e)),
+                }
             });
             inflight += 1;
         }
@@ -234,11 +252,12 @@ pub async fn execute(
                     let _ = events.send(ProgressEvent::TaskDone { label, bytes }).await;
                 }
             }
-            Ok(Err(e)) => {
+            // 失败必须携带真实任务标签（v5 前丢标签导致 UI 只能显示 "task"）。
+            Ok(Err((label, e))) => {
                 summary.failed += 1;
                 let _ = events
                     .send(ProgressEvent::TaskFailed {
-                        label: "task".to_string(),
+                        label,
                         error: e.to_string(),
                     })
                     .await;
@@ -247,7 +266,7 @@ pub async fn execute(
                 summary.failed += 1;
                 let _ = events
                     .send(ProgressEvent::TaskFailed {
-                        label: "task".to_string(),
+                        label: "task(panic)".to_string(),
                         error: join_err.to_string(),
                     })
                     .await;

@@ -99,6 +99,9 @@ pub struct PlanInputs<'a> {
     pub java_major: u32,
     pub java_path: Option<PathBuf>,
     pub window: Option<(u32, u32)>,
+    /// Android 专用：移植版 LWJGL 合并类 jar（提供时整体替换 org.lwjgl:* 类路径，
+    /// 因 Mojang natives-linux 为 glibc 构建、bionic 无法加载；见 [`crate::lwjgl`]）。
+    pub lwjgl_classes_jar: Option<PathBuf>,
 }
 
 pub fn build_launch_plan(input: &PlanInputs) -> Result<LaunchPlan> {
@@ -106,7 +109,16 @@ pub fn build_launch_plan(input: &PlanInputs) -> Result<LaunchPlan> {
 
     // ---- classpath：过滤后的库 jar + 客户端 jar（顺序重要） ----
     let mut classpath: Vec<PathBuf> = Vec::new();
+    // Android：移植版 LWJGL 合并 jar 置于最前，并剔除 Mojang 的 org.lwjgl:*
+    //（其 natives-linux so 为 glibc 构建，bionic 加载必败；类路径里的 java 类
+    //  也被 lwjgl-glfw-classes.jar 全量替代，避免双实现冲突）。
+    if input.lwjgl_classes_jar.is_some() {
+        classpath.push(input.lwjgl_classes_jar.clone().unwrap());
+    }
     for lib in input.allowed_libs {
+        if input.lwjgl_classes_jar.is_some() && lib.name.starts_with("org.lwjgl") {
+            continue;
+        }
         if let Some(rel) = meta::library_jar_path(lib) {
             classpath.push(input.libraries_root.join(rel));
         }
@@ -340,6 +352,7 @@ mod tests {
             java_major: 17,
             java_path: None,
             window: None,
+            lwjgl_classes_jar: None,
         })
         .unwrap();
 
@@ -396,6 +409,46 @@ mod tests {
         {
             assert!(art.path.contains("natives-windows"));
         }
+    }
+
+    #[test]
+    fn android_lwjgl_classpath_swap() {
+        let root = std::env::temp_dir().join("qz-jvmops-swap");
+        let v = version();
+        let libs = allowed_libs(&v, &ctx());
+        let account = offline_account("Steve");
+        let inst = root.join("instances/dev");
+        let fake_jar = root.join("lwjgl3/lwjgl-glfw-classes.jar");
+
+        let plan = build_launch_plan(&PlanInputs {
+            ctx: &ctx(),
+            version: &v,
+            allowed_libs: &libs,
+            libraries_root: &root.join("libraries"),
+            natives_root: &root.join("natives"),
+            assets_root: &root.join("assets"),
+            versions_root: &root.join("versions"),
+            instance_dir: &inst,
+            account: &account,
+            memory_mb: 2048,
+            java_major: 17,
+            java_path: None,
+            window: None,
+            lwjgl_classes_jar: Some(fake_jar.clone()),
+        })
+        .unwrap();
+
+        // 移植版 jar 位于最前；org.lwjgl:* 全部被剔除
+        assert_eq!(plan.classpath.first().unwrap(), &fake_jar);
+        assert!(plan
+            .classpath
+            .iter()
+            .all(|p| !p.to_string_lossy().contains("org/lwjgl")));
+        // 其余库仍在（brigadier 由 fixture 提供）
+        assert!(plan
+            .classpath
+            .iter()
+            .any(|p| p.to_string_lossy().contains("brigadier")));
     }
 
     #[test]

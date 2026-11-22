@@ -16,23 +16,19 @@ pub const VERSION_MANIFEST_URL: &str =
     "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json";
 pub const LIBRARIES_BASE: &str = "https://libraries.minecraft.net/";
 
-/// 统一 HTTP 客户端（rustls TLS，15s 连接超时；供清单/版本 JSON 下载使用）。
+/// 统一 HTTP 客户端（rustls TLS；10s 连接超时；供全部在线下载使用，
+/// 流停滞检测由 mirror::next_chunk 负责，不设整体超时以免大文件被拦腰报错）。
 pub fn http_client() -> reqwest::Client {
     reqwest::Client::builder()
         .user_agent("Quartz/0.1.0 (Rust Minecraft Launcher; offline)")
-        .connect_timeout(std::time::Duration::from_secs(15))
+        .connect_timeout(std::time::Duration::from_secs(10))
         .build()
         .expect("failed to build http client")
 }
 
 pub async fn fetch_version_manifest(client: &reqwest::Client) -> Result<VersionManifest> {
-    let text = client
-        .get(VERSION_MANIFEST_URL)
-        .send()
-        .await?
-        .error_for_status()?
-        .text()
-        .await?;
+    // 镜像回退：BMCLAPI 优先，官方直连兑底（见 mirror 模块）。
+    let text = crate::mirror::get_text(client, VERSION_MANIFEST_URL).await?;
     parse_version_manifest(&text)
 }
 
@@ -41,13 +37,7 @@ pub fn parse_version_manifest(text: &str) -> Result<VersionManifest> {
 }
 
 pub async fn fetch_version_json(client: &reqwest::Client, url: &str) -> Result<VersionJson> {
-    let text = client
-        .get(url)
-        .send()
-        .await?
-        .error_for_status()?
-        .text()
-        .await?;
+    let text = crate::mirror::get_text(client, url).await?;
     parse_version_json(&text)
 }
 

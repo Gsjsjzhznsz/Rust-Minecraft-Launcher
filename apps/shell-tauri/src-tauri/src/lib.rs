@@ -28,7 +28,7 @@
 
 use quartz_core::instance::DownloadProgress;
 use quartz_core::renderbus::{self, DeviceCaps};
-use quartz_core::{auth, host_arch, instance, jvmops, meta, model, paths, platform, rules, runtime, RuntimeCtx};
+use quartz_core::{auth, host_arch, instance, jvmops, lwjgl, meta, model, paths, platform, renderers, rules, runtime, RuntimeCtx};
 use serde::Serialize;
 use serde_json::json;
 use std::path::{Path, PathBuf};
@@ -41,6 +41,10 @@ pub struct AppState {
     downloading: Arc<std::sync::Mutex<bool>>,
     /// 运行时 pack 下载互斥。
     runtime_busy: Arc<std::sync::atomic::AtomicBool>,
+    /// 渲染层 pack 下载互斥。
+    renderer_busy: Arc<std::sync::atomic::AtomicBool>,
+    /// LWJGL pack 下载互斥。
+    lwjgl_busy: Arc<std::sync::atomic::AtomicBool>,
     /// 运行中的游戏进程 pid（None = 空闲）。
     game_pid: Arc<Mutex<Option<u32>>>,
 }
@@ -58,7 +62,19 @@ fn with_jni<T>(
         let vm = unsafe { jni::JavaVM::from_raw(ctx.vm().cast()) }.ok()?;
         let mut env = vm.attach_current_thread().ok()?;
         let context = unsafe { jni::objects::JObject::from_raw(ctx.context().cast()) };
-        f(&mut env, &context)
+        // 防御：清掉上游遗留的挂起异常。JNIEnv 按线程复用，任何未清理的异常都会让
+        // 本闭包内的下一个 JNI 调用（甚至 Tauri 内部调用）在 CheckJNI 下直接 abort。
+        if env.exception_check().unwrap_or(false) {
+            let _ = env.exception_clear();
+        }
+        let result = f(&mut env, &context);
+        // 关键：闭包内任何 JNI Err（如 NoSuchMethodError）都会把异常留在挂起态，
+        // 若不清掉，下一次 NewStringUTF 等调用即触发
+        // "JNI NewStringUTF called with pending exception" abort 闪退。
+        if env.exception_check().unwrap_or(false) {
+            let _ = env.exception_clear();
+        }
+        result
     }))
     .ok()
     .flatten()
@@ -127,40 +143,53 @@ fn jni_internal_files_dir(env: &mut jni::JNIEnv, context: &jni::objects::JObject
 //   （旧存储模型，授权即时生效不杀进程）。
 // 游戏文件即可放在文件管理器可见的标准目录 /storage/emulated/0/Quartz/files。
 
-/// Android 端存储权限是否已授权。
-/// 优先走壳层 Kotlin 判定（Android 11+ = isExternalStorageManager，
-/// 10- = WRITE_EXTERNAL_STORAGE 已 GRANTED）；JNI 不可用时回退纯 checkSelfPermission。
+/// Android 端存储权限是否已授权（纯系统 API，不依赖 Activity 实例）。
+///
+/// 注意：ndk-context 给到的 context 是 **Application** 对象（不是 MainActivity），
+/// 其上不存在任何自定义方法 —— 在它上面 GetMethodID("isStorageAccessGranted")
+/// 必抛 NoSuchMethodError。故全部改用静态方法 / Context 自有方法：
+/// - Android 11+（API 30+）：静态 Environment.isExternalStorageManager()
+///   （MANAGE_EXTERNAL_STORAGE「所有文件访问」）
+/// - Android 10 及以下：Context.checkSelfPermission(WRITE_EXTERNAL_STORAGE)
+///   （targetSdk 28 旧存储模型，Application 即 Context，可直接调）
 #[cfg(target_os = "android")]
 fn android_storage_permission_granted() -> bool {
-    // 1) MainActivity.isStorageAccessGranted()（覆盖 MANAGE_EXTERNAL_STORAGE）
-    if let Some(granted) = with_jni(|env, ctx| {
-        Some(
-            env.call_method(ctx, "isStorageAccessGranted", "()Z", &[])
-                .ok()?
-                .z()
-                .ok()?,
-        )
-    }) {
-        return granted;
-    }
-    // 2) 回退：WRITE checkSelfPermission（仅覆盖旧模型，JNI 异常时尽力而为）
     use jni::objects::JValue;
     with_jni(|env, ctx| {
-        let perm = env
-            .new_string("android.permission.WRITE_EXTERNAL_STORAGE")
-            .ok()?;
-        let granted = env
-            .call_method(
-                ctx,
-                "checkSelfPermission",
-                "(Ljava/lang/String;)I",
-                &[JValue::Object(&perm.into())],
-            )
+        let sdk = env
+            .get_static_field("android/os/Build$VERSION", "SDK_INT", "I")
             .ok()?
             .i()
             .ok()?;
-        // PackageManager.PERMISSION_GRANTED == 0
-        Some(granted == 0)
+        if sdk >= 30 {
+            let granted = env
+                .call_static_method(
+                    "android/os/Environment",
+                    "isExternalStorageManager",
+                    "()Z",
+                    &[],
+                )
+                .ok()?
+                .z()
+                .ok()?;
+            Some(granted)
+        } else {
+            let perm = env
+                .new_string("android.permission.WRITE_EXTERNAL_STORAGE")
+                .ok()?;
+            let granted = env
+                .call_method(
+                    ctx,
+                    "checkSelfPermission",
+                    "(Ljava/lang/String;)I",
+                    &[JValue::Object(&perm.into())],
+                )
+                .ok()?
+                .i()
+                .ok()?;
+            // PackageManager.PERMISSION_GRANTED == 0
+            Some(granted == 0)
+        }
     })
     .unwrap_or(false)
 }
@@ -190,35 +219,44 @@ fn get_permission_state() -> serde_json::Value {
 fn request_storage_permission() -> Result<bool, String> {
     #[cfg(target_os = "android")]
     {
-        // 1) MainActivity.requestStorageAccess()：按系统版本分流（11+ 设置页 / 10- 弹窗）
+        // MainActivity 伴生对象静态方法（GetStaticMethodID，不依赖接收对象类型）：
+        // 内部持有当前 Activity 实例，按系统版本分流（11+「所有文件访问」设置页 /
+        // 10- 运行时弹窗）。此前直接在 ndk-context 的 Application 对象上调实例方法
+        // requestStorageAccess —— 其上查无此方法，NoSuchMethodError 未清理即 abort。
         let via_kotlin = with_jni(|env, ctx| {
-            env.call_method(ctx, "requestStorageAccess", "()V", &[]).ok()?;
+            use jni::objects::JClass;
+            use jni::objects::JValue;
+            // 注意：FindClass 在 AttachCurrentThread 的原生线程上走系统类加载器，
+            // 解析不到 APK 内的应用类；必须经 context.getClassLoader().loadClass()
+            // 显式解析壳层 MainActivity（Application 即 Context，链路稳定）。
+            let loader = env
+                .call_method(ctx, "getClassLoader", "()Ljava/lang/ClassLoader;", &[])
+                .ok()?
+                .l()
+                .ok()?;
+            let name = env
+                .new_string("com.quartz.launcher.MainActivity")
+                .ok()?;
+            let cls_obj = env
+                .call_method(
+                    &loader,
+                    "loadClass",
+                    "(Ljava/lang/String;)Ljava/lang/Class;",
+                    &[JValue::Object(&name.into())],
+                )
+                .ok()?
+                .l()
+                .ok()?;
+            let cls = JClass::from(cls_obj);
+            env.call_static_method(&cls, "requestStorageAccessStatic", "()V", &[])
+                .ok()?;
             Some(())
         });
         if via_kotlin.is_some() {
             return Ok(true);
         }
-        // 2) 回退：直接 requestPermissions 弹窗（旧路径，仅 WRITE/READ）
-        use jni::objects::JValue;
-        with_jni(|env, ctx| {
-            let write = env.new_string("android.permission.WRITE_EXTERNAL_STORAGE").ok()?;
-            let read = env.new_string("android.permission.READ_EXTERNAL_STORAGE").ok()?;
-            let write_obj: jni::objects::JObject = write.into();
-            let arr = env
-                .new_object_array(2, "java/lang/String", write_obj)
-                .ok()?;
-            let read_obj: jni::objects::JObject = read.into();
-            env.set_object_array_element(&arr, 1, read_obj).ok()?;
-            env.call_method(
-                ctx,
-                "requestPermissions",
-                "([Ljava/lang/String;I)V",
-                &[JValue::Object(&arr), JValue::Int(42)],
-            )
-            .ok()?;
-            Some(())
-        });
-        Ok(true)
+        // 到这里说明 JNI 链路本身异常（with_jni 已清异常）；给用户明确的手动指引。
+        Err("无法唤起系统权限界面。请手动授予：系统设置 → 应用 → Quartz → 权限 → 所有文件访问权限".to_string())
     }
     #[cfg(not(target_os = "android"))]
     {
@@ -503,7 +541,6 @@ fn plan_offline(player: String, memory_mb: u32) -> Result<serde_json::Value, Str
     let version: model::VersionJson =
         serde_json::from_str(quartz_core::fixtures::VERSION_1_20_4)
             .map_err(|e| e.to_string())?;
-    let hal = platform::default_hal();
     let ctx = RuntimeCtx::new("linux", host_arch());
     let allowed: Vec<&model::Library> = version
         .libraries
@@ -527,6 +564,7 @@ fn plan_offline(player: String, memory_mb: u32) -> Result<serde_json::Value, Str
         java_major: version.java_version.as_ref().map(|j| j.major_version).unwrap_or(17),
         java_path: None,
         window: None,
+        lwjgl_classes_jar: None,
     })
     .map_err(|e| e.to_string())?;
 
@@ -791,6 +829,141 @@ async fn download_runtime(java_major: u32, app: AppHandle, state: State<'_, AppS
 }
 
 // ---------------------------------------------------------------------------
+// 渲染层 pack + LWJGL 安卓 pack（全部在线下载，APK 不内置）
+// ---------------------------------------------------------------------------
+
+/// 渲染器目录 + 安装状态 + 当前选中。
+#[tauri::command]
+fn list_renderers() -> serde_json::Value {
+    let active = renderers::active();
+    json!(renderers::catalog()
+        .iter()
+        .map(|s| {
+            json!({
+                "id": s.id,
+                "name": s.name,
+                "note": s.note,
+                "eglLib": s.egl_lib,
+                "glLib": s.gl_lib,
+                "sizeHint": s.size_hint,
+                "specAvailable": s.source.is_some(),
+                "installed": renderers::is_installed(s.id),
+                "active": s.id == active,
+            })
+        })
+        .collect::<Vec<_>>())
+}
+
+/// 后台下载渲染层 pack，进度经 `renderer://progress` 上报。
+#[tauri::command]
+async fn download_renderer(
+    id: String,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    if state
+        .renderer_busy
+        .swap(true, std::sync::atomic::Ordering::SeqCst)
+    {
+        return Err("已有渲染层下载任务正在进行".to_string());
+    }
+    let busy = state.renderer_busy.clone();
+    let app = app.clone();
+
+    tauri::async_runtime::spawn(async move {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<DownloadProgress>(64);
+        let forwarder_app = app.clone();
+        let forwarder = tokio::spawn(async move {
+            while let Some(ev) = rx.recv().await {
+                let _ = forwarder_app.emit("renderer://progress", &ev);
+            }
+        });
+
+        let client = meta::http_client();
+        let result = renderers::download_and_install(&client, &id, tx).await;
+        if let Err(e) = &result {
+            let _ = app.emit(
+                "renderer://progress",
+                &DownloadProgress {
+                    stage: "error".to_string(),
+                    current: 0,
+                    total: 0,
+                    percent: 0.0,
+                    file: String::new(),
+                    done: false,
+                    error: Some(e.to_string()),
+                },
+            );
+        }
+        drop(result);
+        busy.store(false, std::sync::atomic::Ordering::SeqCst);
+        let _ = forwarder.await;
+    });
+
+    Ok(())
+}
+
+/// 选择当前渲染器（落盘 renderer.json）。
+#[tauri::command]
+fn set_active_renderer(id: String) -> Result<(), String> {
+    renderers::set_active(&id).map_err(|e| e.to_string())
+}
+
+/// LWJGL 安卓 pack 状态。
+#[tauri::command]
+fn get_lwjgl_status() -> serde_json::Value {
+    json!({
+        "installed": lwjgl::is_installed(),
+        "path": lwjgl::install_dir().to_string_lossy(),
+    })
+}
+
+/// 后台下载 LWJGL 安卓 pack，进度经 `lwjgl://progress` 上报。
+#[tauri::command]
+async fn download_lwjgl(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    if state
+        .lwjgl_busy
+        .swap(true, std::sync::atomic::Ordering::SeqCst)
+    {
+        return Err("已有 LWJGL 下载任务正在进行".to_string());
+    }
+    let busy = state.lwjgl_busy.clone();
+    let app = app.clone();
+
+    tauri::async_runtime::spawn(async move {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<DownloadProgress>(64);
+        let forwarder_app = app.clone();
+        let forwarder = tokio::spawn(async move {
+            while let Some(ev) = rx.recv().await {
+                let _ = forwarder_app.emit("lwjgl://progress", &ev);
+            }
+        });
+
+        let client = meta::http_client();
+        let result = lwjgl::download_and_install(&client, tx).await;
+        if let Err(e) = &result {
+            let _ = app.emit(
+                "lwjgl://progress",
+                &DownloadProgress {
+                    stage: "error".to_string(),
+                    current: 0,
+                    total: 0,
+                    percent: 0.0,
+                    file: String::new(),
+                    done: false,
+                    error: Some(e.to_string()),
+                },
+            );
+        }
+        drop(result);
+        busy.store(false, std::sync::atomic::Ordering::SeqCst);
+        let _ = forwarder.await;
+    });
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // 游戏启动（M0 已接入）
 // ---------------------------------------------------------------------------
 
@@ -808,6 +981,8 @@ pub struct LaunchLog {
 pub struct LaunchExit {
     pub code: i32,
     pub version: String,
+    /// 本次启动的完整日志文件路径（UI 可直接展示/复制）。
+    pub log_file: Option<String>,
 }
 
 /// 启动前自检：版本文件 / Java 主版本 / 账号 / 运行时状态。
@@ -858,6 +1033,12 @@ fn build_plan_for(version_id: &str) -> Result<(model::VersionJson, jvmops::Launc
 
     let game_dir = paths::minecraft_dir();
     let natives_root = game_dir.join("natives");
+    // Android：移植版 LWJGL 合并 jar 替换 Mojang org.lwjgl:*（glibc natives 不可用）
+    let lwjgl_jar = if cfg!(target_os = "android") && lwjgl::is_installed() {
+        Some(lwjgl::classes_jar())
+    } else {
+        None
+    };
     let plan = jvmops::build_launch_plan(&jvmops::PlanInputs {
         ctx: &ctx,
         version: &version,
@@ -874,9 +1055,34 @@ fn build_plan_for(version_id: &str) -> Result<(model::VersionJson, jvmops::Launc
         java_major: major,
         java_path: None,
         window: None,
+        lwjgl_classes_jar: lwjgl_jar,
     })
     .map_err(|e| format!("启动计划装配失败：{e}"))?;
     Ok((version, plan, major))
+}
+
+/// Android 12+ tagged-pointer 兼容层 shim 落盘（源码：scripts/tagfix/quartz_tagfix.c）。
+///
+/// Android 12（API 31）起 AArch64 堆指针最高字节被系统保留，OpenJDK top-byte
+/// 用途与之冲突 -> scudo CHECK 失败 abort（SIGABRT，退出码 134，典型崩在 GC
+/// 工作线程）。修复 = java 进程早期 mallopt(M_BIONIC_SET_HEAP_TAGGING_LEVEL,
+/// NONE)（Termux openjdk-17 PR#10347 同款方案）；shim 以 include_bytes 编入
+/// 壳层，启动前写到 JVM pack 私有目录，经 LD_PRELOAD 注入 java 进程。
+#[cfg(target_os = "android")]
+fn ensure_tagfix_lib() -> Option<PathBuf> {
+    const SHIM: &[u8] = include_bytes!("../tagfix/libqztagfix.so");
+    let dst = paths::runtime_dir().join("libqztagfix.so");
+    if let Ok(meta) = std::fs::metadata(&dst) {
+        if meta.len() == SHIM.len() as u64 {
+            return Some(dst);
+        }
+    }
+    if std::fs::write(&dst, SHIM).is_ok() {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o644));
+        return Some(dst);
+    }
+    None
 }
 
 /// 拉起 JVM 子进程并托管日志/退出（`launch://log` / `launch://exit` 事件）。
@@ -891,51 +1097,214 @@ fn spawn_game(
     app: AppHandle,
 ) -> Result<(), String> {
     use std::io::BufRead;
+    use std::io::Write;
     use std::process::{Command, Stdio};
 
     let java = runtime::java_bin(major);
     let jre_home = runtime::install_dir(major);
     let game_dir = paths::minecraft_dir();
 
+    // ---- 持久化启动日志（完整证据链）----
+    // stdout/stderr/quartz 行 + 完整命令行/环境 全部落盘 <game_root>/logs/launch-*.log。
+    // 原生崩溃（SIGABRT 等）的 JVM 报告只写 hs_err 文件 / logcat，不会进 stderr ——
+    // 因此异常退出时自动摘录 hs_err 到本日志，下次运行即可拿到全部诊断信息。
+    let logs_dir = paths::game_root().join("logs");
+    let _ = std::fs::create_dir_all(&logs_dir);
+    let log_path = logs_dir.join(format!(
+        "launch-{}.log",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    ));
+    let log_file: Arc<Mutex<Option<std::fs::File>>> =
+        Arc::new(Mutex::new(std::fs::File::create(&log_path).ok()));
+
+    // 控制台 + 文件双写。
+    let qlog = {
+        let app = app.clone();
+        let log_file = log_file.clone();
+        move |source: &str, line: &str| {
+            let _ = app.emit(
+                "launch://log",
+                &LaunchLog { source: source.into(), line: line.into() },
+            );
+            if let Ok(mut guard) = log_file.lock() {
+                if let Some(f) = guard.as_mut() {
+                    let _ = writeln!(f, "[{source}] {line}");
+                    let _ = f.flush();
+                }
+            }
+        }
+    };
+
     // ---- JVM 动态库搜索路径（必须先于 smoke test 计算，两处共用） ----
     // bionic linker 不认 RUNPATH，bin/java 找 libjli.so 完全依赖 LD_LIBRARY_PATH。
-    // 覆盖包内全部可能落点：lib（libjli.so 实测在此）、lib/jli、lib/server、
-    // lib/client（arm32 client VM）、natives 目录（游戏 so）。
-    let ld_library_path = format!(
-        "{}:{}:{}:{}:{}",
-        jre_home.join("lib").display(),
-        jre_home.join("lib/jli").display(),
-        jre_home.join("lib/server").display(),
-        jre_home.join("lib/client").display(),
-        plan.natives_dir.display()
-    );
+    // 顺序（先者优先）：渲染层目录 -> LWJGL 安卓 natives -> 游戏 natives ->
+    // JRE lib / lib/jli / lib/server / lib/client。
+    let mut ld_parts: Vec<String> = Vec::new();
+    #[cfg(target_os = "android")]
+    let active_renderer = {
+        let id = renderers::active();
+        let spec = renderers::spec_for(&id);
+        if renderers::is_installed(&id) {
+            ld_parts.push(
+                renderers::install_dir(&id)
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        }
+        if lwjgl::is_installed() {
+            ld_parts.push(lwjgl::natives_dir().to_string_lossy().into_owned());
+        }
+        qlog(
+            "quartz",
+            &format!(
+                "[quartz] 渲染层：{}（{}）｜ LWJGL 安卓包：{}",
+                spec.map(|s| s.name).unwrap_or("未知"),
+                id,
+                if lwjgl::is_installed() { "已就绪" } else { "未安装" },
+            ),
+        );
+        id
+    };
+    #[cfg(not(target_os = "android"))]
+    let active_renderer = String::new();
+    ld_parts.push(jre_home.join("lib").display().to_string());
+    ld_parts.push(jre_home.join("lib/jli").display().to_string());
+    ld_parts.push(jre_home.join("lib/server").display().to_string());
+    ld_parts.push(jre_home.join("lib/client").display().to_string());
+    ld_parts.push(plan.natives_dir.display().to_string());
+    let ld_library_path = ld_parts.join(":");
 
-    // ---- smoke test：JRE 可执行性（与真实启动完全同环境）----
-    // 必须带 LD_LIBRARY_PATH/JAVA_HOME：Pojav android-openjdk 的 bin/java 无 RUNPATH，
-    // 裸跑必报 CANNOT LINK。自检失败直接终止启动并回显全部输出（可诊断，不静默）。
-    let _ = app.emit(
-        "launch://log",
-        &LaunchLog {
-            source: "quartz".into(),
-            line: format!("[quartz] JRE {major}：{}", jre_home.display()),
-        },
+    // Android 无 /tmp：JVM 的 hsperfdata / 临时文件目录必须显式指向内部可写目录
+    //（tmpdir 初始化失败是 Pojav 系 JRE 早期 abort 的常见诱因）。
+    #[cfg(target_os = "android")]
+    let tmp_dir = {
+        let d = paths::runtime_dir().join("tmp");
+        let _ = std::fs::create_dir_all(&d);
+        d
+    };
+    #[cfg(not(target_os = "android"))]
+    let tmp_dir = std::env::temp_dir();
+
+    // ---- Android JVM 参数包：java.library.path 私有目录优先 + 渲染层接线 ----
+    // FUSE（/storage/emulated/0）挂载为 noexec，System.loadLibrary/dlopen 无法从
+    // 公共目录装载 native：顺序必须是 LWJGL natives（含 pojavexec/jnidispatch）->
+    // 渲染层 -> 游戏 natives（FUSE，仅兜底）。附加在 plan 参数之后（同名 -D 后者生效）。
+    #[cfg(target_os = "android")]
+    let (jlp, android_jvm_extra) = {
+        let jlp = format!(
+            "{}:{}:{}",
+            lwjgl::natives_dir().display(),
+            renderers::install_dir(&active_renderer).display(),
+            plan.natives_dir.display(),
+        );
+        let gl_lib = renderers::spec_for(&active_renderer)
+            .map(|s| s.gl_lib)
+            .unwrap_or("libgl4es_114.so");
+        let extra = vec![
+            format!("-Djava.library.path={jlp}"),
+            // liblwjgl_opengl 按该属性 dlopen 渲染器 GL 库；PojavRendererInit 也据它识别渲染层
+            format!("-Dorg.lwjgl.opengl.libname={gl_lib}"),
+            // tmpdir 显式内部化 + 关闭 hsperfdata（部分安卓构建在 /tmp 缺失时初始化 abort）
+            format!("-Djava.io.tmpdir={}", tmp_dir.display()),
+            "-XX:-UsePerfData".to_string(),
+            // JVM 崩溃报告定向到日志目录（默认写 CWD，FUSE 上难定位）
+            format!("-XX:ErrorFile={}", logs_dir.join("hs_err_%p.log").display()),
+            // 早期初始化诊断：abort 若发生在 JVM 初始化阶段，stderr 会留下最后一步
+            "-Xlog:init=info:stderr".to_string(),
+        ];
+        (jlp, extra)
+    };
+    #[cfg_attr(not(target_os = "android"), allow(unused_variables))]
+    #[cfg(not(target_os = "android"))]
+    let (jlp, android_jvm_extra): (String, Vec<String>) = (String::new(), Vec::new());
+
+    // ---- Android 12+ tagged-pointer 兼容层（JRE GC 线程 SIGABRT 修复）----
+    // 落盘 shim 并以 LD_PRELOAD 注入（smoke test / 二分自检 / 真实启动共用）。
+    #[cfg(target_os = "android")]
+    let tagfix_lib = ensure_tagfix_lib();
+    #[cfg(target_os = "android")]
+    {
+        match tagfix_lib.as_ref() {
+            Some(p) => qlog(
+                "quartz",
+                &format!(
+                    "[quartz] tagged-pointer 兼容层：{}（LD_PRELOAD 注入）",
+                    p.display()
+                ),
+            ),
+            None => qlog("quartz", "[quartz] tagged-pointer 兼容层落盘失败（跳过注入）"),
+        }
+    }
+
+    // ---- 头部：完整命令行 + 环境（诊断核心：一眼看出坏参数/坏路径） ----
+    if let Ok(mut guard) = log_file.lock() {
+        if let Some(f) = guard.as_mut() {
+            let _ = writeln!(f, "==== Quartz launch {version_id} (java {major}) ====");
+            let _ = writeln!(f, "java: {}", java.display());
+            let _ = writeln!(f, "cwd: {}", plan.working_dir.display());
+            let _ = writeln!(f, "JAVA_HOME: {}", jre_home.display());
+            let _ = writeln!(f, "LD_LIBRARY_PATH: {ld_library_path}");
+            let _ = writeln!(f, "TMPDIR: {}", tmp_dir.display());
+            #[cfg(target_os = "android")]
+            {
+                let _ = writeln!(f, "java.library.path: {jlp}");
+                let gl_lib = renderers::spec_for(&active_renderer)
+                    .map(|s| s.gl_lib)
+                    .unwrap_or("libgl4es_114.so");
+                let _ = writeln!(f, "org.lwjgl.opengl.libname: {gl_lib}");
+                let _ = writeln!(
+                    f,
+                    "LD_PRELOAD: {}",
+                    tagfix_lib
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "未启用".to_string())
+                );
+            }
+            let _ = writeln!(f, "---- jvm args ({} 个) ----", plan.jvm_args.len());
+            for a in &plan.jvm_args {
+                let _ = writeln!(f, "  {a}");
+            }
+            let _ = writeln!(f, "---- classpath ({} jars) ----", plan.classpath.len());
+            for c in &plan.classpath {
+                let _ = writeln!(f, "  {}", c.display());
+            }
+            let _ = writeln!(f, "main_class: {}", plan.main_class);
+            let _ = writeln!(f, "---- game args ({} 个) ----", plan.game_args.len());
+            for a in &plan.game_args {
+                let _ = writeln!(f, "  {a}");
+            }
+            let _ = writeln!(f, "========================================");
+            let _ = f.flush();
+        }
+    }
+
+    // ---- smoke test：JRE 可执行性（与真实启动同 LD_LIBRARY_PATH/JAVA_HOME）----
+    // Pojav android-openjdk 的 bin/java 无 RUNPATH，裸跑必报 CANNOT LINK。
+    // 自检失败直接终止启动并回显全部输出（可诊断，不静默）。
+    qlog(
+        "quartz",
+        &format!("[quartz] JRE {major}：{}", jre_home.display()),
     );
-    match Command::new(&java)
+    let mut smoke = Command::new(&java);
+    smoke
         .arg("-version")
         .env("JAVA_HOME", &jre_home)
-        .env("LD_LIBRARY_PATH", &ld_library_path)
-        .output()
+        .env("LD_LIBRARY_PATH", &ld_library_path);
+    #[cfg(target_os = "android")]
     {
+        if let Some(p) = &tagfix_lib {
+            smoke.env("LD_PRELOAD", p);
+        }
+    }
+    match smoke.output() {
         Ok(out) if out.status.success() => {
             let text = String::from_utf8_lossy(&out.stderr);
             for line in text.lines().filter(|l| !l.trim().is_empty()).take(2) {
-                let _ = app.emit(
-                    "launch://log",
-                    &LaunchLog {
-                        source: "quartz".into(),
-                        line: format!("[quartz] {line}"),
-                    },
-                );
+                qlog("quartz", &format!("[quartz] {line}"));
             }
         }
         Ok(out) => {
@@ -947,6 +1316,7 @@ fn spawn_game(
                 .filter(|l| !l.trim().is_empty())
                 .collect::<Vec<_>>()
                 .join(" | ");
+            qlog("quartz", &format!("[quartz] JVM 自检失败：{tail}"));
             return Err(format!(
                 "JVM 自检失败（退出码 {}，LD_LIBRARY_PATH={}）：{}",
                 out.status.code().unwrap_or(-1),
@@ -962,10 +1332,72 @@ fn spawn_game(
         }
     }
 
+    // ---- 二分自检：完整 JVM 参数 + 相同环境/cwd，仅无 classpath 与主类 ----
+    // 通过 => 崩溃（若有）必然在游戏类加载或原生库装载层，stderr 会留下痕迹；
+    // 失败 => JVM 参数/环境层问题，当场带回证据报错，避免游戏进程静默 134 退出。
+    #[cfg(target_os = "android")]
+    {
+        let mut probe = Command::new(&java);
+        probe
+            .args(&android_jvm_extra)
+            .arg("-version")
+            .env("JAVA_HOME", &jre_home)
+            .env("LD_LIBRARY_PATH", &ld_library_path)
+            .env("TMPDIR", &tmp_dir)
+            .env("HOME", &game_dir)
+            .current_dir(&plan.working_dir);
+        for (k, v) in renderers::launch_env(&active_renderer) {
+            probe.env(k, v);
+        }
+        if let Some(p) = &tagfix_lib {
+            probe.env("LD_PRELOAD", p);
+        }
+        match probe.output() {
+            Ok(out) if out.status.success() => {
+                qlog("quartz", "[quartz] JVM 二分自检（完整参数）：通过");
+            }
+            Ok(out) => {
+                let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+                text.push_str(&String::from_utf8_lossy(&out.stderr));
+                let tail: String = text
+                    .lines()
+                    .filter(|l| !l.trim().is_empty())
+                    .take(12)
+                    .collect::<Vec<_>>()
+                    .join(" | ");
+                let code = out.status.code().unwrap_or(-1);
+                qlog(
+                    "quartz",
+                    &format!("[quartz] JVM 二分自检失败（退出码 {code}）：{tail}"),
+                );
+                if tail.is_empty() {
+                    dump_crash_evidence(None, &qlog, &log_file);
+                }
+                return Err(format!(
+                    "JVM 二分自检失败（退出码 {code}）：完整 JVM 参数即触发崩溃，详情见启动日志"
+                ));
+            }
+            Err(e) => {
+                return Err(format!("JVM 二分自检无法执行：{e}"));
+            }
+        }
+    }
+
     // ---- 组装命令：jvm_args + main_class + game_args ----
     let mut cmd = Command::new(&java);
-    cmd.args(&plan.jvm_args)
-        .arg(&plan.main_class)
+    cmd.args(&plan.jvm_args);
+    #[cfg(target_os = "android")]
+    {
+        // 安卓 JVM 参数包在上方计算（二分自检与真实启动共用），此处直接复用。
+        for a in &android_jvm_extra {
+            cmd.arg(a);
+        }
+        for (k, v) in renderers::launch_env(&active_renderer) {
+            cmd.env(k, v);
+        }
+        cmd.env("TMPDIR", &tmp_dir);
+    }
+    cmd.arg(&plan.main_class)
         .args(&plan.game_args)
         .current_dir(&plan.working_dir)
         .env("HOME", &game_dir)
@@ -975,6 +1407,13 @@ fn spawn_game(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
+    #[cfg(target_os = "android")]
+    {
+        if let Some(p) = &tagfix_lib {
+            cmd.env("LD_PRELOAD", p);
+        }
+    }
+
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("游戏进程启动失败：{e}"))?;
@@ -982,38 +1421,34 @@ fn spawn_game(
     if let Ok(mut slot) = game_pid.lock() {
         *slot = Some(pid);
     }
-    {
-        let app2 = app.clone();
-        let _ = app2.emit(
-            "launch://log",
-            &LaunchLog {
-                source: "quartz".into(),
-                line: format!("[quartz] 游戏进程已启动 (pid {pid})，工作目录：{}", plan.working_dir.display()),
-            },
-        );
-    }
+    qlog(
+        "quartz",
+        &format!(
+            "[quartz] 游戏进程已启动 (pid {pid})，工作目录：{}",
+            plan.working_dir.display()
+        ),
+    );
 
-    // ---- 日志泵：stdout / stderr -> launch://log ----
+    // ---- 日志泵：stdout / stderr -> launch://log + 启动日志文件 ----
     if let Some(stdout) = child.stdout.take() {
-        let app2 = app.clone();
+        let qlog2 = qlog.clone();
         std::thread::spawn(move || {
             for line in std::io::BufReader::new(stdout).lines().map_while(Result::ok) {
-                let _ = app2.emit("launch://log", &LaunchLog { source: "stdout".into(), line });
+                qlog2("stdout", &line);
             }
         });
     }
     if let Some(stderr) = child.stderr.take() {
-        let app2 = app.clone();
+        let qlog2 = qlog.clone();
         std::thread::spawn(move || {
             for line in std::io::BufReader::new(stderr).lines().map_while(Result::ok) {
-                let _ = app2.emit("launch://log", &LaunchLog { source: "stderr".into(), line });
+                qlog2("stderr", &line);
             }
         });
     }
 
-    // ---- 退出看护：wait -> launch://exit -> 清理 pid 槽位 ----
-    // 退出码语义：正常退出 = code；信号死亡 = 128+信号号（137=SIGKILL，134=SIGABRT，
-    // 之前恒报 -1 无法区分 linker abort / SIGSEGV / 被系统杀死）。
+    // ---- 退出看护：wait -> launch://exit -> hs_err 摘录 -> 清理 pid 槽位 ----
+    // 退出码语义：正常退出 = code；信号死亡 = 128+信号号（137=SIGKILL，134=SIGABRT）。
     let game_pid_exit = game_pid;
     std::thread::spawn(move || {
         let code = child.wait().map(|st| exit_status_code(&st)).unwrap_or(-1);
@@ -1023,27 +1458,66 @@ fn spawn_game(
                 *slot = None;
             }
         }
-        // 常见信号死亡的提示行（帮助用户/开发者定位）
+        qlog("quartz", &format!("[quartz] 游戏进程退出，代码 {code}"));
         if code == 137 {
-            let _ = app.emit(
-                "launch://log",
-                &LaunchLog {
-                    source: "quartz".into(),
-                    line: "[quartz] 退出码 137 = SIGKILL：常见于系统低内存回收（尝试调小内存）或 Android 12+ 幽灵进程限制".into(),
-                },
-            );
+            qlog("quartz", "[quartz] 退出码 137 = SIGKILL：常见于系统低内存回收（尝试调小内存）或 Android 12+ 幽灵进程限制");
         } else if code == 134 {
-            let _ = app.emit(
-                "launch://log",
-                &LaunchLog {
-                    source: "quartz".into(),
-                    line: "[quartz] 退出码 134 = SIGABRT：常见于动态链接失败或 JVM fatal error，见上方 stderr 输出".into(),
-                },
+            qlog("quartz", "[quartz] 退出码 134 = SIGABRT：原生层崩溃，详细信息在 JVM 崩溃报告（hs_err）与 logcat，不进 stderr");
+        }
+        // 异常退出：先摘 logcat 崩溃证据（SIGABRT 不进 stderr/hs_err），再摘 hs_err。
+        if code != 0 {
+            #[cfg(target_os = "android")]
+            dump_crash_evidence(Some(pid), &qlog, &log_file);
+            let mut hs_errs: Vec<(PathBuf, std::time::SystemTime)> = Vec::new();
+            for dir in [&logs_dir, &plan.working_dir, &game_dir, &jre_home] {
+                if let Ok(rd) = std::fs::read_dir(dir) {
+                    for e in rd.flatten() {
+                        let name = e.file_name().to_string_lossy().into_owned();
+                        if name.starts_with("hs_err_pid") && name.ends_with(".log") {
+                            let mtime = e
+                                .metadata()
+                                .and_then(|m| m.modified())
+                                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                            hs_errs.push((e.path(), mtime));
+                        }
+                    }
+                }
+            }
+            if let Some((hp, _)) =
+                hs_errs.into_iter().max_by_key(|(_, t)| *t)
+            {
+                qlog(
+                    "quartz",
+                    &format!("[quartz] 发现 JVM 崩溃报告：{}", hp.display()),
+                );
+                if let Ok(text) = std::fs::read_to_string(&hp) {
+                    let excerpt: Vec<&str> = text.lines().take(60).collect();
+                    if let Some(first) = excerpt.first() {
+                        qlog("stderr", &format!("hs_err: {first}"));
+                    }
+                    if let Ok(mut guard) = log_file.lock() {
+                        if let Some(f) = guard.as_mut() {
+                            let _ = writeln!(f, "==== hs_err 摘录（前 60 行）====");
+                            for l in &excerpt {
+                                let _ = writeln!(f, "{l}");
+                            }
+                            let _ = f.flush();
+                        }
+                    }
+                }
+            }
+            qlog(
+                "quartz",
+                &format!("[quartz] 完整启动日志：{}", log_path.display()),
             );
         }
         let _ = app.emit(
             "launch://exit",
-            &LaunchExit { code, version: version_id },
+            &LaunchExit {
+                code,
+                version: version_id,
+                log_file: Some(log_path.to_string_lossy().into_owned()),
+            },
         );
     });
     Ok(())
@@ -1064,6 +1538,171 @@ fn exit_status_code(st: &std::process::ExitStatus) -> i32 {
     }
 }
 
+/// 原生层崩溃（SIGABRT 等）的证据摘录。
+///
+/// bionic 的 abort 不写 stderr、JVM 不写 hs_err，唯一记录在 logd：
+/// crash 缓冲（Fatal signal / Abort message）与 main 缓冲（同 uid 可读）。
+/// 另附运行时组件清单，验证 pack 落位与 so 齐全。
+#[cfg(target_os = "android")]
+fn dump_crash_evidence(
+    pid: Option<u32>,
+    qlog: &impl Fn(&str, &str),
+    log_file: &Arc<Mutex<Option<std::fs::File>>>,
+) {
+    use std::io::Write;
+    let write_log = |text: &str| {
+        if let Ok(mut guard) = log_file.lock() {
+            if let Some(f) = guard.as_mut() {
+                let _ = writeln!(f, "{text}");
+                let _ = f.flush();
+            }
+        }
+    };
+    // ---- logcat：crash 缓冲优先，main 缓冲兜底（各限 30 行防刷屏） ----
+    for buf in ["crash", "main"] {
+        let out = std::process::Command::new("logcat")
+            .args(["-d", "-b", buf, "-t", "300"])
+            .output();
+        match out {
+            Ok(out) => {
+                let text = String::from_utf8_lossy(&out.stdout);
+                let mut kept = 0usize;
+                for line in text.lines().rev() {
+                    if kept >= 30 {
+                        break;
+                    }
+                    let hit = match pid {
+                        // threadtime 格式：date time PID TID level tag: msg
+                        Some(p) => line
+                            .split_whitespace()
+                            .nth(2)
+                            .is_some_and(|f| f == p.to_string()),
+                        None => {
+                            line.contains("Fatal signal")
+                                || line.contains("Abort message")
+                                || line.contains("SIGABRT")
+                                || line.contains("SIGSEGV")
+                                || line.contains("SIGBUS")
+                                || line.contains("CheckJNI")
+                        }
+                    };
+                    if hit {
+                        qlog("logcat", line);
+                        write_log(&format!("[logcat-{buf}] {line}"));
+                        kept += 1;
+                    }
+                }
+                if kept == 0 {
+                    qlog(
+                        "quartz",
+                        &format!("[quartz] logcat {buf} 缓冲无匹配记录（可能已被滚动或无权限）"),
+                    );
+                }
+            }
+            Err(e) => {
+                qlog("quartz", &format!("[quartz] logcat 不可用（{e}）"));
+            }
+        }
+    }
+    // ---- 组件清单：确认运行时 pack 实际落位 ----
+    let dirs: [(&str, PathBuf); 4] = [
+        ("lwjgl3/natives", lwjgl::natives_dir()),
+        (
+            "renderers/active",
+            renderers::install_dir(&renderers::active()),
+        ),
+        ("jre lib/server", runtime::install_dir(17).join("lib/server")),
+        ("game natives", paths::minecraft_dir().join("natives")),
+    ];
+    for (label, dir) in dirs {
+        let mut names: Vec<String> = Vec::new();
+        if let Ok(rd) = std::fs::read_dir(&dir) {
+            for e in rd.flatten().take(40) {
+                let size = e.metadata().map(|m| m.len()).unwrap_or(0);
+                names.push(format!("{}({})", e.file_name().to_string_lossy(), size));
+            }
+        }
+        let line = if names.is_empty() {
+            format!("[quartz] 组件清单 {label}：空或不可读（{}）", dir.display())
+        } else {
+            format!("[quartz] 组件清单 {label}：{}", names.join(", "))
+        };
+        qlog("quartz", &line);
+        write_log(&line);
+    }
+}
+
+/// Android 启动前置：LWJGL 安卓 pack 缺失时阻塞在线下载（进度写启动控制台）。
+#[cfg(target_os = "android")]
+fn ensure_lwjgl_pack(app: &AppHandle) -> Result<(), String> {
+    if lwjgl::is_installed() {
+        return Ok(());
+    }
+    let _ = app.emit(
+        "launch://log",
+        &LaunchLog {
+            source: "quartz".into(),
+            line: "[quartz] 首次启动：在线获取 LWJGL 安卓包…".into(),
+        },
+    );
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<DownloadProgress>(64);
+    let app2 = app.clone();
+    tauri::async_runtime::spawn(async move {
+        while let Some(ev) = rx.recv().await {
+            let line = if ev.stage == "error" {
+                format!("[quartz] LWJGL 下载错误：{}", ev.error.unwrap_or_default())
+            } else {
+                format!("[quartz] LWJGL 下载 {}%", ev.percent as u32)
+            };
+            let _ = app2.emit("launch://log", &LaunchLog { source: "quartz".into(), line });
+        }
+    });
+    let client = meta::http_client();
+    tauri::async_runtime::block_on(async move { lwjgl::download_and_install(&client, tx).await })
+        .map_err(|e| format!("LWJGL 安卓包下载失败：{e}"))?;
+    Ok(())
+}
+
+/// Android 启动前置：当前渲染层缺失时阻塞在线下载。
+#[cfg(target_os = "android")]
+fn ensure_renderer(app: &AppHandle) -> Result<(), String> {
+    let active = renderers::active();
+    if renderers::is_installed(&active) {
+        return Ok(());
+    }
+    let has_source = renderers::spec_for(&active)
+        .map(|s| s.source.is_some())
+        .unwrap_or(false);
+    if !has_source {
+        return Err(format!("所选渲染层 {active} 暂无下载源，请在设置页更换"));
+    }
+    let _ = app.emit(
+        "launch://log",
+        &LaunchLog {
+            source: "quartz".into(),
+            line: format!("[quartz] 首次使用渲染层 {active}：在线获取…"),
+        },
+    );
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<DownloadProgress>(64);
+    let app2 = app.clone();
+    tauri::async_runtime::spawn(async move {
+        while let Some(ev) = rx.recv().await {
+            let line = if ev.stage == "error" {
+                format!("[quartz] 渲染层下载错误：{}", ev.error.unwrap_or_default())
+            } else {
+                format!("[quartz] 渲染层下载 {}%", ev.percent as u32)
+            };
+            let _ = app2.emit("launch://log", &LaunchLog { source: "quartz".into(), line });
+        }
+    });
+    let client = meta::http_client();
+    tauri::async_runtime::block_on(async move {
+        renderers::download_and_install(&client, &renderers::active(), tx).await
+    })
+    .map_err(|e| format!("渲染层下载失败：{e}"))?;
+    Ok(())
+}
+
 /// 真实启动：版本 JSON -> LaunchPlan -> JVM 子进程（M0 已接入）。
 /// JVM pack 缺失时返回 `RUNTIME_MISSING:<major>`，UI 自动触发运行时下载。
 #[tauri::command]
@@ -1074,6 +1713,11 @@ fn launch_game(version_id: String, app: AppHandle, state: State<'_, AppState>) -
     let (_version, plan, major) = build_plan_for(&version_id)?;
     if !runtime::is_installed(major) {
         return Err(format!("RUNTIME_MISSING:{major}"));
+    }
+    #[cfg(target_os = "android")]
+    {
+        ensure_lwjgl_pack(&app)?;
+        ensure_renderer(&app)?;
     }
     std::fs::create_dir_all(&plan.working_dir).ok();
     std::fs::create_dir_all(&plan.natives_dir).ok();
@@ -1133,6 +1777,11 @@ pub fn run() {
             launch_preflight,
             launch_game,
             stop_game,
+            list_renderers,
+            download_renderer,
+            set_active_renderer,
+            get_lwjgl_status,
+            download_lwjgl,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

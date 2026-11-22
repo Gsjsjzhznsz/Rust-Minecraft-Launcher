@@ -327,6 +327,8 @@ async function ensureProgressListener() {
   listening = true;
   await listen<DownloadProgress>("download://progress", (event) => onProgress(event.payload));
   await listen<DownloadProgress>("runtime://progress", (event) => onRuntimeProgress(event.payload));
+  await listen<DownloadProgress>("renderer://progress", (event) => onRendererProgress(event.payload));
+  await listen<DownloadProgress>("lwjgl://progress", (event) => onLwjglProgress(event.payload));
   await listen<LaunchLog>("launch://log", (event) => appendLog(event.payload.source, event.payload.line));
   await listen<LaunchExit>("launch://exit", (event) => {
     hide("stop-btn");
@@ -777,6 +779,179 @@ function onRuntimeProgress(p: DownloadProgress) {
   }
 }
 
+/* ---------- 渲染层 + LWJGL 安卓包（全部在线下载，不随 APK 内置） ---------- */
+interface RendererInfo {
+  id: string;
+  name: string;
+  note: string;
+  eglLib: string;
+  glLib: string;
+  sizeHint: string;
+  specAvailable: boolean;
+  installed: boolean;
+  active: boolean;
+}
+let rendererDownloading = false;
+let lwjglDownloading = false;
+
+async function refreshRenderers() {
+  const list = el<HTMLDivElement>("renderer-list");
+  let infos: RendererInfo[] = [];
+  try {
+    infos = await invoke<RendererInfo[]>("list_renderers");
+  } catch {
+    return;
+  }
+  const active = infos.find((r) => r.active);
+  const badge = el<HTMLSpanElement>("renderer-badge");
+  badge.textContent = active ? active.name : "-";
+  badge.className = active?.installed ? "badge badge-ok" : "badge badge-warn";
+  list.innerHTML = "";
+  for (const r of infos) {
+    const row = document.createElement("div");
+    row.className = "kv";
+    const name = document.createElement("span");
+    name.className = "kv-key";
+    name.textContent = r.name;
+    const val = document.createElement("span");
+    val.className = "kv-val";
+    val.textContent = `${r.note} · ${r.sizeHint}`;
+    row.appendChild(name);
+    row.appendChild(val);
+    if (r.active) {
+      const b = document.createElement("span");
+      b.className = "badge badge-ok";
+      b.textContent = "使用中";
+      row.appendChild(b);
+    } else if (r.installed) {
+      const b = document.createElement("span");
+      b.className = "badge badge-dim";
+      b.textContent = "已安装";
+      row.appendChild(b);
+    } else if (!r.specAvailable) {
+      const b = document.createElement("span");
+      b.className = "badge badge-dim";
+      b.textContent = "暂无源";
+      row.appendChild(b);
+    }
+    if (r.specAvailable && !r.installed) {
+      const btn = document.createElement("button");
+      btn.className = "btn btn-sm btn-primary";
+      btn.textContent = "下载";
+      btn.addEventListener("click", async () => {
+        if (rendererDownloading) {
+          toast("已有渲染层下载任务", "");
+          return;
+        }
+        rendererDownloading = true;
+        show("renderer-progress");
+        setText("renderer-progress-stage", "下载");
+        setText("renderer-progress-text", "0%");
+        try {
+          await invoke("download_renderer", { id: r.id });
+        } catch (e) {
+          rendererDownloading = false;
+          hide("renderer-progress");
+          toast(String(e), "err");
+        }
+      });
+      row.appendChild(btn);
+    }
+    if (r.installed && !r.active) {
+      const btn = document.createElement("button");
+      btn.className = "btn btn-sm btn-ghost";
+      btn.textContent = "切换";
+      btn.addEventListener("click", async () => {
+        try {
+          await invoke("set_active_renderer", { id: r.id });
+          toast(`渲染层已切换为 ${r.name}`, "ok");
+          await refreshRenderers();
+        } catch (e) {
+          toast(String(e), "err");
+        }
+      });
+      row.appendChild(btn);
+    }
+    list.appendChild(row);
+  }
+}
+
+function onRendererProgress(p: DownloadProgress) {
+  if (!rendererDownloading) return;
+  if (p.stage === "error") {
+    rendererDownloading = false;
+    hide("renderer-progress");
+    appendLog("quartz", `[quartz] 渲染层下载失败：${p.error ?? "未知错误"}`);
+    toast("渲染层下载失败，可重试", "err");
+    return;
+  }
+  if (p.stage === "done") {
+    rendererDownloading = false;
+    hide("renderer-progress");
+    appendLog("quartz", `[quartz] 渲染层就绪：${p.file}`);
+    toast("渲染层就绪", "ok");
+    refreshRenderers();
+    return;
+  }
+  const fill = el<HTMLDivElement>("renderer-progress-fill");
+  setText("renderer-progress-file", p.file ?? "");
+  if (p.total > 0) {
+    fill.style.width = `${Math.min(100, p.percent).toFixed(1)}%`;
+    setText(
+      "renderer-progress-text",
+      `${p.percent.toFixed(1)}%（${bytes(p.current)} / ${bytes(p.total)}）`,
+    );
+  } else {
+    fill.style.width = "100%";
+    setText("renderer-progress-text", String(p.current));
+  }
+}
+
+async function refreshLwjglState() {
+  const state = el<HTMLSpanElement>("lwjgl-state");
+  const btn = el<HTMLButtonElement>("lwjgl-dl-btn");
+  try {
+    const st = await invoke<{ installed: boolean; path: string }>("get_lwjgl_status");
+    if (st.installed) {
+      state.textContent = "已就绪";
+      state.style.color = "var(--ok, #4ade80)";
+      btn.classList.add("hidden");
+    } else {
+      state.textContent = "未下载（启动时自动获取）";
+      state.style.color = "var(--warn, #fbbf24)";
+      btn.classList.remove("hidden");
+    }
+  } catch {
+    state.textContent = "检测失败";
+  }
+}
+
+function onLwjglProgress(p: DownloadProgress) {
+  if (p.stage === "error") {
+    lwjglDownloading = false;
+    hide("renderer-progress");
+    toast(`LWJGL 下载失败：${p.error ?? ""}`, "err");
+    return;
+  }
+  if (p.stage === "done") {
+    lwjglDownloading = false;
+    hide("renderer-progress");
+    appendLog("quartz", `[quartz] LWJGL 安卓包就绪：${p.file}`);
+    toast("LWJGL 安卓包就绪", "ok");
+    refreshLwjglState();
+    return;
+  }
+  if (!lwjglDownloading) return;
+  show("renderer-progress");
+  setText("renderer-progress-stage", "LWJGL");
+  const fill = el<HTMLDivElement>("renderer-progress-fill");
+  setText("renderer-progress-file", p.file ?? "");
+  if (p.total > 0) {
+    fill.style.width = `${Math.min(100, p.percent).toFixed(1)}%`;
+    setText("renderer-progress-text", `${p.percent.toFixed(1)}%`);
+  }
+}
+
 /* ---------- 启动游戏（M0 真实启动链路） ---------- */
 async function doLaunch(versionId: string) {
   try {
@@ -871,6 +1046,8 @@ function enterApp() {
   refreshInstalled();
   refreshRuntimeBadge();
   refreshPermission();
+  refreshRenderers();
+  refreshLwjglState();
 }
 
 /* ---------- 事件绑定 ---------- */
@@ -931,6 +1108,23 @@ function bindEvents() {
 
   // 启动控制台
   el<HTMLButtonElement>("console-clear-btn").addEventListener("click", clearConsole);
+  el<HTMLButtonElement>("lwjgl-dl-btn").addEventListener("click", async () => {
+    if (lwjglDownloading) {
+      toast("已有 LWJGL 下载任务", "");
+      return;
+    }
+    lwjglDownloading = true;
+    show("renderer-progress");
+    setText("renderer-progress-stage", "LWJGL");
+    setText("renderer-progress-text", "0%");
+    try {
+      await invoke("download_lwjgl");
+    } catch (e) {
+      lwjglDownloading = false;
+      hide("renderer-progress");
+      toast(String(e), "err");
+    }
+  });
   el<HTMLButtonElement>("stop-btn").addEventListener("click", async () => {
     try {
       const stopped = await invoke<boolean>("stop_game");

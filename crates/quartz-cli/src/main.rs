@@ -193,6 +193,7 @@ fn run(cmd: Cmd) -> quartz_core::Result<()> {
                 java_major: 17,
                 java_path: None,
                 window: None,
+                lwjgl_classes_jar: None,
             })?;
 
             println!("{}", serde_json::to_string_pretty(&plan)?);

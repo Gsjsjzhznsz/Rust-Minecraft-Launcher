@@ -13,16 +13,46 @@ import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 
 class MainActivity : TauriActivity() {
+  companion object {
+    /** 当前前台 MainActivity（Rust 侧 JNI 经静态方法转发到实例）。 */
+    @JvmStatic
+    var instance: MainActivity? = null
+      private set
+
+    /**
+     * Rust 侧经 JNI GetStaticMethodID 调用的唯一入口。
+     * ndk-context 提供给 Rust 的是 Application 对象，其上不存在自定义实例方法，
+     * 直接调用必抛 NoSuchMethodError —— 因此必须走类静态方法转发到当前 Activity。
+     */
+    @JvmStatic
+    fun requestStorageAccessStatic() {
+      instance?.requestStorageAccess()
+    }
+  }
+
   override fun onCreate(savedInstanceState: Bundle?) {
     enableEdgeToEdge()
     super.onCreate(savedInstanceState)
+  }
+
+  override fun onResume() {
+    super.onResume()
+    instance = this
+  }
+
+  override fun onDestroy() {
+    super.onDestroy()
+    if (instance === this) {
+      instance = null
+    }
   }
 
   /**
    * 存储权限（完整文件权限）是否已授权：
    * - Android 11+（API 30+）：「所有文件访问」MANAGE_EXTERNAL_STORAGE
    * - Android 10 及以下：WRITE_EXTERNAL_STORAGE 运行时授权（targetSdk 28 旧模型）
-   * 由 Rust 侧经 JNI 调用（get_permission_state / reinit_storage 链路）。
+   * 注：Rust 侧权限判定已改为直接调静态 Environment.isExternalStorageManager() /
+   * Context.checkSelfPermission（不依赖 Activity 实例）；本方法保留作壳层内部判定。
    */
   fun isStorageAccessGranted(): Boolean {
     return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {

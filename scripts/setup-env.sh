@@ -1,7 +1,12 @@
 #!/bin/sh
 # Quartz 构建环境变量（source 本文件后再执行 cargo/gradle 命令）
 # 工具链由 scripts/bootstrap.sh 安装（rustup ~/.cargo + npm tauri-cli + .toolchain/android-sdk）
-export JAVA_HOME=/home/z/my-project/.toolchain/jdk-21.0.13.1+2
+# JDK 优先用 .toolchain 内的发行版；缺失时回退系统 OpenJDK 21（Debian 自带）
+if [ -d /home/z/my-project/.toolchain/jdk-21.0.13.1+2 ]; then
+  export JAVA_HOME=/home/z/my-project/.toolchain/jdk-21.0.13.1+2
+else
+  export JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64
+fi
 export ANDROID_HOME=/home/z/my-project/.toolchain/android-sdk
 export NDK_HOME=$ANDROID_HOME/ndk/27.0.12077973
 export ANDROID_NDK_ROOT=$NDK_HOME

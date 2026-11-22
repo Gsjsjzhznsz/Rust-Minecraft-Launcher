@@ -276,14 +276,13 @@ async fn send_progress(tx: &tokio::sync::mpsc::Sender<DownloadProgress>, ev: Dow
     let _ = tx.send(ev).await;
 }
 
-/// 拉取文本并做可选 SHA-1 校验。
+/// 拉取文本并做可选 SHA-1 校验（镜像回退由 mirror 模块负责）。
 async fn fetch_text_verified(
     client: &reqwest::Client,
     url: &str,
     sha1: Option<&str>,
 ) -> Result<String> {
-    let resp = client.get(url).send().await?.error_for_status()?;
-    let bytes = resp.bytes().await?;
+    let bytes = crate::mirror::get_bytes(client, url).await?;
     if let Some(expect) = sha1 {
         let spec = crate::download::HashSpec::sha1(expect);
         if !spec.matches(&bytes) {

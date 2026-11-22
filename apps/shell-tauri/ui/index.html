@@ -245,6 +245,27 @@
 
           <div class="card">
             <div class="card-title-row">
+              <svg class="icon" viewBox="0 0 24 24"><path d="M12 2l9 5v10l-9 5-9-5V7z"/><path d="M12 12l9-5M12 12v10M12 12L3 7"/></svg>
+              <h3>渲染层</h3>
+              <span id="renderer-badge" class="badge badge-dim">-</span>
+            </div>
+            <p class="page-sub">GL 转译层与 JRE、LWJGL 一样全部在线下载，不随 APK 内置</p>
+            <div id="renderer-list"></div>
+            <div class="kv"><span class="kv-key">LWJGL 安卓包</span><span id="lwjgl-state" class="kv-val">-</span>
+              <button id="lwjgl-dl-btn" class="btn btn-sm btn-primary hidden">下载</button></div>
+            <div id="renderer-progress" class="progress-card hidden">
+              <div class="progress-head">
+                <span class="progress-title">渲染层</span>
+                <span id="renderer-progress-stage" class="progress-stage"></span>
+                <span id="renderer-progress-text" class="progress-text">0%</span>
+              </div>
+              <div class="progress-bar"><div id="renderer-progress-fill" class="progress-fill"></div></div>
+              <div id="renderer-progress-file" class="progress-file"></div>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-title-row">
               <svg class="icon" viewBox="0 0 24 24"><path d="M6 3h9l5 5v13a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1z"/><path d="M9 12h7M9 16h7M9 8h2"/></svg>
               <h3>标准 .minecraft 目录结构</h3>
             </div>

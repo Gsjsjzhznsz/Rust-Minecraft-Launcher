@@ -1,0 +1,710 @@
+     1→package com.mio.plugin
+     2→
+     3→import android.content.Context
+     4→import android.os.Bundle
+     5→import com.mio.data.Renderer
+     6→import com.mio.datastore.appSettingsDataStore
+     7→import com.mio.manager.RendererManager
+     8→import com.tungsten.fcl.FCLApp
+     9→import com.tungsten.fcl.R
+    10→import com.tungsten.fclcore.mod.LocalModFile
+    11→import com.tungsten.fclcore.util.Logging
+    12→import kotlinx.coroutines.CoroutineScope
+    13→import kotlinx.coroutines.Dispatchers
+    14→import kotlinx.coroutines.SupervisorJob
+    15→import kotlinx.coroutines.flow.first
+    16→import kotlinx.coroutines.launch
+    17→import kotlinx.coroutines.runBlocking
+    18→import java.util.logging.Level
+    19→
+    20→object RendererPlugin : AbstractPlugin<Renderer>() {
+    21→
+    22→    /** 插件渲染器列表（懒初始化，内置渲染器见 RendererManager） */
+    23→    @JvmStatic
+    24→    val rendererList: List<Renderer>
+    25→        get() = items
+    26→
+    27→    /** v2 路径前缀，启动器替换为插件 nativeLibraryDir */
+    28→    private const val NATIVE_PREFIX = "**|"
+    29→
+    30→    /** v1 启动链路约定：eglName/glName 以 / 开头时运行时拼接插件 nativeLibraryDir */
+    31→    private const val V1_DIR_PREFIX = "/"
+    32→
+    33→    /** 可配置环境变量在配置表中的启用状态键后缀（selectable 专用） */
+    34→    private const val ENABLED_SUFFIX = "@enabled"
+    35→
+    36→    /** 可配置环境变量类型（供配置对话框区分控件） */
+    37→    enum class EnvType { SELECTABLE, CUSTOMIZABLE, TOGGLEABLE, ORDERED }
+    38→
+    39→    /** 单个可配置环境变量在对话框中展示/编辑所需的完整信息 */
+    40→    data class EnvSpec(
+    41→        val key: String,
+    42→        val type: EnvType,
+    43→        /** 标题（一般为变量名） */
+    44→        val title: String,
+    45→        /** selectable 候选值（含默认值），其他类型为空 */
+    46→        val options: List<String> = emptyList(),
+    47→        /** customizable 提示用默认值 */
+    48→        val defaultValue: String? = null,
+    49→        /** selectable 是否带启用开关（check 非 null 时） */
+    50→        val checkable: Boolean = false,
+    51→        /** 当前开关状态（selectable / toggleable） */
+    52→        val enabled: Boolean,
+    53→        /** 当前值（selectable 选中值 / customizable 输入文本） */
+    54→        val value: String,
+    55→        /** 标题下的功能说明（可空；内置渲染器有，v2 插件暂无） */
+    56→        val description: String? = null,
+    57→        /** ordered（方案偏好序）配置的完整定义，其他类型为空 */
+    58→        val ordered: OrderedSpec? = null,
+    59→    )
+    60→
+    61→    /** ordered 条目的单个候选项 */
+    62→    data class OrderedOption(
+    63→        val value: String,
+    64→        /** 展示名（内置渲染器构建时已本地化） */
+    65→        val label: String,
+    66→        val description: String? = null,
+    67→    )
+    68→
+    69→    /**
+    70→     * ordered（方案偏好序）配置定义：值为逗号分隔的后端序列，序列即偏好序，
+    71→     * 候选集合与默认序必须同源覆盖（对齐 ZL2 #2165 OrderedChoiceEntry 语义）
+    72→     */
+    73→    data class OrderedSpec(
+    74→        /** 全部候选后端 */
+    75→        val options: List<OrderedOption>,
+    76→        /** 默认偏好序（恰好覆盖全部候选；剔除未知项的补尾、继承展开都以此序兜底） */
+    77→        val defaultOrder: List<String>,
+    78→        /** 从哪个前置条目继承（全局序），空为无继承的全局条目 */
+    79→        val inheritFrom: String? = null,
+    80→        /** 继承展开时父序伪项 native 在本条目对应的真实后端 */
+    81→        val nativeValue: String? = null,
+    82→    ) {
+    83→        init {
+    84→            require(options.isNotEmpty() && options.map { it.value }.toSet().size == options.size) {
+    85→                "OrderedSpec options must be non-empty and unique"
+    86→            }
+    87→            require(defaultOrder.size == options.size && options.map { it.value }.toSet() == defaultOrder.toSet()) {
+    88→                "OrderedSpec defaultOrder must cover every option exactly once"
+    89→            }
+    90→            require(inheritFrom == null || nativeValue != null) {
+    91→                "OrderedSpec inheriting from a parent must provide nativeValue"
+    92→            }
+    93→        }
+    94→    }
+    95→
+    96→    /** 对话框确认后单项的回传值；enabled/value 为 null 表示该项无此状态 */
+    97→    data class EnvValue(val enabled: Boolean? = null, val value: String? = null)
+    98→
+    99→    /** 已解析的 v2 插件配置（包名 → 条目），init/refresh 时重建 */
+   100→    private class V2Entry(
+   101→        val config: RendererConfigV2,
+   102→        val nativeLibraryDir: String,
+   103→        /** envKey → 插件内本地化标题 */
+   104→        val titles: Map<String, String>,
+   105→        /** 插件应用名（渲染器来源显示） */
+   106→        val label: String,
+   107→    )
+   108→
+   109→    private val v2Entries = mutableMapOf<String, V2Entry>()
+   110→
+   111→    /** 用户环境变量配置（包名 → 扁平键值），init 时从 DataStore 读入，UI 修改后同步更新 */
+   112→    private var envPrefs: Map<String, Map<String, String>> = emptyMap()
+   113→
+   114→    private val saveScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+   115→
+   116→    override fun onInit(context: Context) {
+   117→        v2Entries.clear()
+   118→        envPrefs = runCatching {
+   119→            runBlocking { context.appSettingsDataStore.data.first().plugin.rendererEnvPrefs }
+   120→        }.getOrDefault(emptyMap())
+   121→    }
+   122→
+   123→    override fun parse(app: PluginManager.PluginApp) {
+   124→        val metaData = app.appInfo.metaData ?: return
+   125→        // v2 优先：同时声明新旧架构的插件只加载 v2 配置
+   126→        if (metaData.containsKey(PluginManager.META_PLUGIN_V2)) {
+   127→            parseV2(app, metaData)
+   128→            return
+   129→        }
+   130→        if (metaData.getBoolean(PluginManager.META_PLUGIN, false)) {
+   131→            parseV1(app, metaData)
+   132→        }
+   133→    }
+   134→
+   135→    private fun parseV1(app: PluginManager.PluginApp, metaData: Bundle) {
+   136→        val rendererString = metaData.getString("renderer") ?: return
+   137→        val des = metaData.getString("des") ?: return
+   138→        val boatEnvString = metaData.getString("boatEnv") ?: return
+   139→        val pojavEnvString = metaData.getString("pojavEnv") ?: return
+   140→        val nativeLibraryDir = app.appInfo.nativeLibraryDir
+   141→        val renderer = rendererString.split(":")
+   142→        val boatEnv = boatEnvString.split(":")
+   143→        val pojavEnv = pojavEnvString.split(":")
+   144→        val minMCVer = metaData.safeGetString("minMCVer") ?: ""
+   145→        val maxMCVer = metaData.safeGetString("maxMCVer") ?: ""
+   146→        addRenderer(
+   147→            Renderer(
+   148→                renderer[0],
+   149→                des,
+   150→                renderer[1],
+   151→                renderer[2],
+   152→                nativeLibraryDir,
+   153→                boatEnv,
+   154→                pojavEnv,
+   155→                app.packageName,
+   156→                minMCVer,
+   157→                maxMCVer,
+   158→                source = app.label
+   159→            )
+   160→        )
+   161→    }
+   162→
+   163→    private fun parseV2(app: PluginManager.PluginApp, metaData: Bundle) {
+   164→        val configResId = metaData.getInt(PluginManager.META_PLUGIN_V2)
+   165→        if (configResId == 0) return
+   166→        val entry = runCatching {
+   167→            val pm = FCLApp.getAppContext().packageManager
+   168→            val resources = pm.getResourcesForApplication(app.appInfo)
+   169→            val config = rendererV2Json.decodeFromString<RendererConfigV2>(resources.getString(configResId))
+   170→            val titles = mutableMapOf<String, String>()
+   171→            config.env.forEach { env ->
+   172→                val titleKey = when (env) {
+   173→                    is SelectableEnvV2 -> env.title?.key
+   174→                    is CustomizableEnvV2 -> env.title?.key
+   175→                    is ToggleableEnvV2 -> env.title?.key
+   176→                    else -> null
+   177→                } ?: return@forEach
+   178→                runCatching {
+   179→                    val id = metaData.getInt(titleKey)
+   180→                    if (id != 0) titles[titleKey] = resources.getString(id)
+   181→                }
+   182→            }
+   183→            V2Entry(config, app.appInfo.nativeLibraryDir, titles, app.label)
+   184→        }.getOrNull() ?: return
+   185→        v2Entries[app.packageName] = entry
+   186→        addRenderer(buildV2Renderer(app.packageName, entry))
+   187→    }
+   188→
+   189→    /** 按当前用户配置把 v2 配置转成 v1 语义的 Renderer（path 非空分支） */
+   190→    private fun buildV2Renderer(packageName: String, entry: V2Entry): Renderer {
+   191→        val config = entry.config
+   192→        return Renderer(
+   193→            config.displayName,
+   194→            config.displayName,
+   195→            toV1LibPath(config.rendererGLPath),
+   196→            toV1LibPath(config.rendererEGLPath),
+   197→            entry.nativeLibraryDir,
+   198→            null,
+   199→            buildPojavEnv(entry, envPrefs[packageName].orEmpty()),
+   200→            packageName,
+   201→            config.minMCVer ?: "",
+   202→            config.maxMCVer ?: "",
+   203→            config.rendererId,
+   204→            entry.label
+   205→        )
+   206→    }
+   207→
+   208→    /** 是否存在可配置环境变量（决定插件管理页条目是否显示设置按钮） */
+   209→    fun hasConfigurableEnvs(packageName: String): Boolean {
+   210→        ensureInit()
+   211→        val entry = v2Entries[packageName] ?: return false
+   212→        return entry.config.env.any { it !is NormalEnvV2 }
+   213→    }
+   214→
+   215→    /** 可配置环境变量列表（供配置对话框展示；无 v2 配置的插件返回空） */
+   216→    fun getConfigurableEnvs(packageName: String): List<EnvSpec> {
+   217→        ensureInit()
+   218→        val entry = v2Entries[packageName] ?: return emptyList()
+   219→        val prefs = envPrefs[packageName].orEmpty()
+   220→        return entry.config.env.mapNotNull { env ->
+   221→            when (env) {
+   222→                is SelectableEnvV2 -> EnvSpec(
+   223→                    env.key,
+   224→                    EnvType.SELECTABLE,
+   225→                    env.title?.let { entry.titles[it.key] } ?: env.key,
+   226→                    buildList {
+   227→                        add(env.items.defaultValue)
+   228→                        addAll(env.items.values)
+   229→                    }.distinct(),
+   230→                    env.items.defaultValue,
+   231→                    env.check != null,
+   232→                    if (env.check == null) true
+   233→                    else prefs[env.key + ENABLED_SUFFIX]?.toBooleanStrictOrNull() ?: env.check,
+   234→                    prefs[env.key] ?: env.items.defaultValue
+   235→                )
+   236→
+   237→                is CustomizableEnvV2 -> EnvSpec(
+   238→                    env.key,
+   239→                    EnvType.CUSTOMIZABLE,
+   240→                    env.title?.let { entry.titles[it.key] } ?: env.key,
+   241→                    emptyList(),
+   242→                    env.defaultValue,
+   243→                    false,
+   244→                    true,
+   245→                    prefs[env.key] ?: env.defaultValue.orEmpty()
+   246→                )
+   247→
+   248→                is ToggleableEnvV2 -> EnvSpec(
+   249→                    env.key,
+   250→                    EnvType.TOGGLEABLE,
+   251→                    env.title?.let { entry.titles[it.key] } ?: env.key,
+   252→                    emptyList(),
+   253→                    null,
+   254→                    false,
+   255→                    prefs[env.key + ENABLED_SUFFIX]?.toBooleanStrictOrNull() ?: env.toggle,
+   256→                    env.value
+   257→                )
+   258→
+   259→                is NormalEnvV2 -> null
+   260→            }
+   261→        }
+   262→    }
+   263→
+   264→    /** 全量保存某插件的环境变量配置：更新内存缓存、异步落盘并重建该插件渲染器 */
+   265→    fun updateEnvConfigs(context: Context, packageName: String, values: Map<String, EnvValue>) {
+   266→        ensureInit()
+   267→        val flat = mutableMapOf<String, String>()
+   268→        values.forEach { (key, v) ->
+   269→            v.value?.let { flat[key] = it }
+   270→            v.enabled?.let { flat[key + ENABLED_SUFFIX] = it.toString() }
+   271→        }
+   272→        storeEnvPrefs(context, packageName, flat)
+   273→        val entry = v2Entries[packageName] ?: return
+   274→        val renderer = buildV2Renderer(packageName, entry)
+   275→        addRenderer(renderer)
+   276→        RendererManager.replaceRenderer(renderer)
+   277→    }
+   278→
+   279→    /** 更新内存缓存并异步落盘某键的扁平环境变量配置（插件与内置渲染器共用） */
+   280→    private fun storeEnvPrefs(context: Context, key: String, flat: Map<String, String>) {
+   281→        envPrefs = envPrefs.toMutableMap().apply { put(key, flat) }
+   282→        saveScope.launch {
+   283→            runCatching {
+   284→                context.appSettingsDataStore.updateData { pref ->
+   285→                    pref.copy(plugin = pref.plugin.copy(
+   286→                        rendererEnvPrefs = pref.plugin.rendererEnvPrefs.toMutableMap()
+   287→                            .apply { put(key, flat) }
+   288→                    ))
+   289→                }
+   290→            }.onFailure { e ->
+   291→                Logging.LOG.log(Level.SEVERE, "保存插件环境变量配置失败", e)
+   292→            }
+   293→        }
+   294→    }
+   295→
+   296→    // ---------- 内置渲染器配置（MobileGlues）与 SFPEW 兼容层配置 ----------
+   297→    // 内置渲染器没有插件包名，复用 envPrefs 存储并以 "builtin:" 前缀伪键区分；
+   298→    // 配置入口为渲染器选择列表的齿轮图标，编辑用与插件页相同的 RendererEnvDialog。
+   299→    // SFPEW 兼容层对内置渲染器按 AAMC 同款硬编码规则：默认启用，仅对自带 FPE/完整 GL 的内置渲染器关闭；
+   300→    // 外部插件渲染器行为未知，由渲染器选择对话框"高级设置"里的全局开关控制（默认关闭，用户显式开启）
+   301→
+   302→    @JvmField
+   303→    val BUILTIN_MOBILEGLUES_KEY = "builtin:mobileglues"
+   304→
+   305→    /** SFPEW 兼容层配置伪键：插件层开关与层全局项（SFPEW_RELAXED_CONTEXT） */
+   306→    private const val SFPEW_LAYER_KEY = "layer:sfpew"
+   307→
+   308→    /** SFPEW 兼容层配置键名（高级设置读写） */
+   309→    const val SFPEW_LAYER_PLUGINS = "SFPEW_LAYER_PLUGINS"
+   310→    const val SFPEW_LAYER_RELAXED_CONTEXT = "SFPEW_RELAXED_CONTEXT"
+   311→
+   312→    /** 自带 FPE/完整 GL 的内置渲染器：叠加层对其硬编码关闭（上游 AAMC 同款规则） */
+   313→    private val FPE_CAPABLE_BUILTIN_IDS = setOf(
+   314→        Renderer.ID_NGGL4ES, Renderer.ID_GL4ES, Renderer.ID_VGPU, Renderer.ID_ZINK
+   315→    )
+   316→
+   317→    /** 自实现 FPE 模拟的模组 id（上游 AAMC 同款检测）：这类模组接管旧版渲染链，层只剩透传开销 */
+   318→    private val FPE_EMULATOR_MOD_IDS = setOf("angelica", "actinium")
+   319→
+   320→    /** 本次启动是否装了自实现 FPE 的模组（LauncherHelper mods 扫描后写入，仅进程内有效） */
+   321→    @Volatile
+   322→    private var fpeEmulatorModPresent = false
+   323→
+   324→    /**
+   325→     * 启动链 mods 扫描后调用：检测是否装了自实现 FPE 模拟的模组（Angelica/Actinium 等）。
+   326→     * 检测到即整层跳过（含内置渲染器），仅对活跃模组生效。
+   327→     */
+   328→    @JvmStatic
+   329→    fun setFpeEmulatorModsPresent(mods: List<LocalModFile>?) {
+   330→        val present = mods != null && mods.any { it.isActive && it.id in FPE_EMULATOR_MOD_IDS }
+   331→        fpeEmulatorModPresent = present
+   332→        if (present) {
+   333→            val ids = mods!!.filter { it.isActive && it.id in FPE_EMULATOR_MOD_IDS }
+   334→                .joinToString(", ") { it.id }
+   335→            Logging.LOG.info("FPE emulator mod detected ($ids), SFPEW compatibility layer disabled")
+   336→        }
+   337→    }
+   338→
+   339→    private fun builtinKey(rendererId: String): String? = when (rendererId) {
+   340→        Renderer.ID_MOBILEGLUES -> BUILTIN_MOBILEGLUES_KEY
+   341→        else -> null
+   342→    }
+   343→
+   344→    /** 兼容层伪键下的扁平配置读取（未初始化时懒初始化插件扫描） */
+   345→    private fun sfpewLayerPrefs(): Map<String, String> {
+   346→        ensureInit()
+   347→        return envPrefs[SFPEW_LAYER_KEY].orEmpty()
+   348→    }
+   349→
+   350→    /**
+   351→     * 该渲染器启动时是否叠加 SFPEW 兼容层（启动链路注入 env 的依据）。
+   352→     * 装有自实现 FPE 的模组时整层跳过；
+   353→     * 内置渲染器行为已知：默认启用，仅自带 FPE 的内置渲染器硬编码关闭；
+   354→     * 外部插件渲染器行为未知：由高级设置里的全局开关控制，默认关闭（用户显式开启）。
+   355→     */
+   356→    @JvmStatic
+   357→    fun isSfpewLayerEnabled(renderer: Renderer): Boolean {
+   358→        if (fpeEmulatorModPresent) return false
+   359→        if (renderer.path.isEmpty()) {
+   360→            return renderer.id !in FPE_CAPABLE_BUILTIN_IDS
+   361→        }
+   362→        return toggleEnabled(sfpewLayerPrefs(), SFPEW_LAYER_PLUGINS, false)
+   363→    }
+   364→
+   365→    /** 插件渲染器兼容层全局开关（高级设置读写；默认关闭） */
+   366→    fun isSfpewPluginLayerEnabled(): Boolean =
+   367→        toggleEnabled(sfpewLayerPrefs(), SFPEW_LAYER_PLUGINS, false)
+   368→
+   369→    fun setSfpewPluginLayerEnabled(context: Context, enabled: Boolean) {
+   370→        val flat = sfpewLayerPrefs().toMutableMap()
+   371→        flat[SFPEW_LAYER_PLUGINS + ENABLED_SUFFIX] = enabled.toString()
+   372→        storeEnvPrefs(context, SFPEW_LAYER_KEY, flat)
+   373→    }
+   374→
+   375→    /** 兼容层 relaxed context 全局开关（高级设置读写；strict 为默认，仅启动链路注入 env 用） */
+   376→    @JvmStatic
+   377→    fun isSfpewRelaxedContextEnabled(): Boolean =
+   378→        toggleEnabled(sfpewLayerPrefs(), SFPEW_LAYER_RELAXED_CONTEXT, false)
+   379→
+   380→    fun setSfpewRelaxedContextEnabled(context: Context, enabled: Boolean) {
+   381→        val flat = sfpewLayerPrefs().toMutableMap()
+   382→        flat[SFPEW_LAYER_RELAXED_CONTEXT + ENABLED_SUFFIX] = enabled.toString()
+   383→        storeEnvPrefs(context, SFPEW_LAYER_KEY, flat)
+   384→    }
+   385→
+   386→    /** 内置渲染器是否提供可配置环境变量（渲染器列表齿轮图标的显隐依据） */
+   387→    fun hasBuiltinEnvConfig(rendererId: String): Boolean = builtinKey(rendererId) != null
+   388→
+   389→    /** 内置渲染器的可配置环境变量列表（已应用用户配置的当前值） */
+   390→    fun builtinEnvSpecs(context: Context, rendererId: String): List<EnvSpec> {
+   391→        val key = builtinKey(rendererId) ?: return emptyList()
+   392→        ensureInit()
+   393→        val prefs = envPrefs[key].orEmpty()
+   394→        return when (rendererId) {
+   395→            Renderer.ID_MOBILEGLUES -> listOf(
+   396→                EnvSpec(
+   397→                    key = "MG_COUNT_LAUNCH",
+   398→                    type = EnvType.TOGGLEABLE,
+   399→                    title = "MG_COUNT_LAUNCH",
+   400→                    description = context.getString(R.string.renderer_config_mg_count_launch_desc),
+   401→                    enabled = prefs["MG_COUNT_LAUNCH$ENABLED_SUFFIX"]?.toBooleanStrictOrNull() ?: true,
+   402→                    value = "1"
+   403→                ),
+   404→                EnvSpec(
+   405→                    key = "enableANGLE",
+   406→                    type = EnvType.SELECTABLE,
+   407→                    title = "enableANGLE",
+   408→                    description = context.getString(R.string.renderer_config_mg_angle_desc),
+   409→                    options = listOf("0", "1", "2", "3"),
+   410→                    checkable = false,
+   411→                    enabled = true,
+   412→                    // MG 2.0.1 起缺省语义为 DisableIfPossible（上游 settings.cpp 缺省分支），回落值随上游对齐
+   413→                    value = prefs["enableANGLE"] ?: "0"
+   414→                ),
+   415→                EnvSpec(
+   416→                    key = "enableNoError",
+   417→                    type = EnvType.SELECTABLE,
+   418→                    title = "enableNoError",
+   419→                    description = context.getString(R.string.renderer_config_mg_noerror_desc),
+   420→                    options = listOf("0", "1", "2", "3"),
+   421→                    checkable = false,
+   422→                    enabled = true,
+   423→                    value = prefs["enableNoError"] ?: "0"
+   424→                )
+   425→            ) + multidrawEnvSpecs(prefs, context) + listOf(
+   426→                EnvSpec(
+   427→                    key = "angleDepthClearFixMode",
+   428→                    type = EnvType.TOGGLEABLE,
+   429→                    title = "angleDepthClearFixMode",
+   430→                    description = context.getString(R.string.renderer_config_mg_depthfix_desc),
+   431→                    enabled = prefs["angleDepthClearFixMode$ENABLED_SUFFIX"]?.toBooleanStrictOrNull() ?: false,
+   432→                    value = "1"
+   433→                ),
+   434→                EnvSpec(
+   435→                    key = "customGLVersion",
+   436→                    type = EnvType.SELECTABLE,
+   437→                    title = "customGLVersion",
+   438→                    description = context.getString(R.string.renderer_config_mg_glversion_desc),
+   439→                    options = listOf("0", "46", "45", "44", "43", "42", "41", "40", "33", "32"),
+   440→                    checkable = false,
+   441→                    enabled = true,
+   442→                    value = prefs["customGLVersion"] ?: "0"
+   443→                ),
+   444→                EnvSpec(
+   445→                    key = "maxGlslCacheSize",
+   446→                    type = EnvType.CUSTOMIZABLE,
+   447→                    title = "maxGlslCacheSize",
+   448→                    description = context.getString(R.string.renderer_config_mg_glslcache_desc),
+   449→                    defaultValue = "32",
+   450→                    enabled = true,
+   451→                    value = prefs["maxGlslCacheSize"] ?: "32"
+   452→                ),
+   453→                EnvSpec(
+   454→                    key = "enableExtTimerQuery",
+   455→                    type = EnvType.TOGGLEABLE,
+   456→                    title = "enableExtTimerQuery",
+   457→                    description = context.getString(R.string.renderer_config_mg_ext_timer_desc),
+   458→                    enabled = prefs["enableExtTimerQuery$ENABLED_SUFFIX"]?.toBooleanStrictOrNull() ?: true,
+   459→                    value = "1"
+   460→                ),
+   461→                EnvSpec(
+   462→                    key = "enableExtComputeShader",
+   463→                    type = EnvType.TOGGLEABLE,
+   464→                    title = "enableExtComputeShader",
+   465→                    description = context.getString(R.string.renderer_config_mg_ext_compute_desc),
+   466→                    enabled = prefs["enableExtComputeShader$ENABLED_SUFFIX"]?.toBooleanStrictOrNull() ?: false,
+   467→                    value = "1"
+   468→                ),
+   469→                EnvSpec(
+   470→                    key = "enableExtDirectStateAccess",
+   471→                    type = EnvType.TOGGLEABLE,
+   472→                    title = "enableExtDirectStateAccess",
+   473→                    description = context.getString(R.string.renderer_config_mg_ext_dsa_desc),
+   474→                    enabled = prefs["enableExtDirectStateAccess$ENABLED_SUFFIX"]?.toBooleanStrictOrNull() ?: false,
+   475→                    value = "1"
+   476→                ),
+   477→                EnvSpec(
+   478→                    key = "fsr1Setting",
+   479→                    type = EnvType.SELECTABLE,
+   480→                    title = "fsr1Setting",
+   481→                    description = context.getString(R.string.renderer_config_mg_fsr1_desc),
+   482→                    options = listOf("0", "1", "2", "3", "4"),
+   483→                    checkable = false,
+   484→                    enabled = true,
+   485→                    value = prefs["fsr1Setting"] ?: "0"
+   486→                )
+   487→            )
+   488→
+   489→            else -> emptyList()
+   490→        }
+   491→    }
+   492→
+   493→    /**
+   494→     * MG 2.0.1 MultiDraw 方案排序：全局序（multidrawOrder）+ 五个函数级异常条目
+   495→     * （默认关闭 = 跟随全局序；启用时刻把当前全局序展开为快照落盘，此后不再跟随）。
+   496→     * 键名/候选集合/默认序对齐上游 settings.cpp 与 ZL2 #2165。
+   497→     */
+   498→    private fun multidrawEnvSpecs(prefs: Map<String, String>, context: Context): List<EnvSpec> {
+   499→        fun option(value: String): OrderedOption = when (value) {
+   500→            "native" -> OrderedOption(
+   501→                "native",
+   502→                context.getString(R.string.renderer_config_mg_multidraw_native),
+   503→                context.getString(R.string.renderer_config_mg_multidraw_native_desc)
+   504→            )
+   505→            "unroll" -> OrderedOption("unroll", context.getString(R.string.renderer_config_mg_multidraw_unroll))
+   506→            "compute" -> OrderedOption("compute", context.getString(R.string.renderer_config_mg_multidraw_compute))
+   507→            "multiindirect" -> OrderedOption("multiindirect", "MultiIndirect")
+   508→            "multibasevertex" -> OrderedOption("multibasevertex", "MultiBaseVertex")
+   509→            "multiarrays" -> OrderedOption("multiarrays", "MultiArrays")
+   510→            "indirect" -> OrderedOption("indirect", "Indirect")
+   511→            "basevertex" -> OrderedOption("basevertex", "BaseVertex")
+   512→            else -> OrderedOption(value, value)
+   513→        }
+   514→
+   515→        val globalOrder = MG_MULTIDRAW_ORDERS.getValue("multidrawOrder")
+   516→        val globalOrdered = OrderedSpec(options = globalOrder.map(::option), defaultOrder = globalOrder)
+   517→        val globalValue = coerceOrder(prefs["multidrawOrder"], globalOrdered)
+   518→
+   519→        val exceptions = MG_MULTIDRAW_ORDERS.filterKeys { it != "multidrawOrder" }.map { (key, order) ->
+   520→            val ordered = OrderedSpec(
+   521→                options = order.map(::option),
+   522→                defaultOrder = order,
+   523→                inheritFrom = "multidrawOrder",
+   524→                nativeValue = MG_MULTIDRAW_NATIVES.getValue(key)
+   525→            )
+   526→            val enabled = prefs[key + ENABLED_SUFFIX]?.toBooleanStrictOrNull() ?: false
+   527→            EnvSpec(
+   528→                key = key,
+   529→                type = EnvType.ORDERED,
+   530→                title = MD_MULTIDRAW_EXCEPTION_TITLES.getValue(key),
+   531→                description = context.getString(R.string.renderer_config_mg_multidraw_exception_desc),
+   532→                checkable = true,
+   533→                enabled = enabled,
+   534→                // 未启用条目的展示值为当前全局序的继承展开（即启用时刻的快照来源），已启用条目取已存快照
+   535→                value = if (enabled) coerceOrder(prefs[key], ordered) else expandOrder(globalValue, ordered),
+   536→                ordered = ordered
+   537→            )
+   538→        }
+   539→
+   540→        return listOf(
+   541→            EnvSpec(
+   542→                key = "multidrawOrder",
+   543→                type = EnvType.ORDERED,
+   544→                title = "multidrawOrder",
+   545→                description = context.getString(R.string.renderer_config_mg_multidraw_order_desc),
+   546→                enabled = true,
+   547→                value = globalValue,
+   548→                ordered = globalOrdered
+   549→            )
+   550→        ) + exceptions
+   551→    }
+   552→
+   553→    /** 启动链路读取内置渲染器的扁平配置（FCLauncher 注入 env 用） */
+   554→    @JvmStatic
+   555→    fun builtinEnvPrefs(rendererId: String): Map<String, String> {
+   556→        val key = builtinKey(rendererId) ?: return emptyMap()
+   557→        ensureInit()
+   558→        return envPrefs[key].orEmpty()
+   559→    }
+   560→
+   561→    /** 开关型配置的启用状态读取（键名后缀约定收口于此，供 Java 侧注入 env / 写 MG 配置用；未配置回落默认值） */
+   562→    @JvmStatic
+   563→    fun toggleEnabled(prefs: Map<String, String>, key: String, def: Boolean): Boolean =
+   564→        prefs[key + ENABLED_SUFFIX]?.toBooleanStrictOrNull() ?: def
+   565→
+   566→    /** 开关键是否被显式记录过（区分"从未配置"与"显式关闭"；启动链路摘除 config.json 残留键用） */
+   567→    @JvmStatic
+   568→    fun isToggleConfigured(prefs: Map<String, String>, key: String): Boolean =
+   569→        prefs.containsKey(key + ENABLED_SUFFIX)
+   570→
+   571→    /** 配置键是否被用户显式配置过（值键或开关键任一存在；未配置的键交由渲染器自管默认值） */
+   572→    @JvmStatic
+   573→    fun isConfigured(prefs: Map<String, String>, key: String): Boolean =
+   574→        prefs.containsKey(key) || prefs.containsKey(key + ENABLED_SUFFIX)
+   575→
+   576→    /** 内置渲染器配置对话框确认后保存（无 v2 渲染器重建） */
+   577→    fun updateBuiltinEnvConfigs(context: Context, rendererId: String, values: Map<String, EnvValue>) {
+   578→        val key = builtinKey(rendererId) ?: return
+   579→        ensureInit()
+   580→        val flat = mutableMapOf<String, String>()
+   581→        values.forEach { (k, v) ->
+   582→            v.value?.let { flat[k] = it }
+   583→            v.enabled?.let { flat[k + ENABLED_SUFFIX] = it.toString() }
+   584→        }
+   585→        storeEnvPrefs(context, key, flat)
+   586→    }
+   587→
+   588→    /** 触发 AbstractPlugin 的懒初始化（插件扫描 + v1/v2 解析） */
+   589→    private fun ensureInit() {
+   590→        @Suppress("UNUSED_EXPRESSION")
+   591→        items
+   592→    }
+   593→
+   594→    /** 生成最终 pojavEnv：可配置项按用户配置取值，DLOPEN 与 dlopenLibPaths 合并为一条 */
+   595→    private fun buildPojavEnv(entry: V2Entry, prefs: Map<String, String>): List<String> {
+   596→        val dir = entry.nativeLibraryDir
+   597→        val result = mutableListOf<String>()
+   598→        val dlopen = mutableListOf<String>()
+   599→        fun addDlopen(raw: String) {
+   600→            raw.split(',').map { it.trim() }.filter { it.isNotEmpty() }.forEach { dlopen.add(it) }
+   601→        }
+   602→        entry.config.env.forEach { env ->
+   603→            when (env) {
+   604→                is NormalEnvV2 -> {
+   605→                    if (env.key == "DLOPEN") addDlopen(resolveLibValue(env.key, env.value, dir))
+   606→                    else result.add("${env.key}=${resolveLibValue(env.key, env.value, dir)}")
+   607→                }
+   608→
+   609→                is SelectableEnvV2 -> {
+   610→                    val enabled = if (env.check == null) true
+   611→                    else prefs[env.key + ENABLED_SUFFIX]?.toBooleanStrictOrNull() ?: env.check
+   612→                    if (enabled) {
+   613→                        val value = prefs[env.key] ?: env.items.defaultValue
+   614→                        if (value.isNotEmpty()) result.add("${env.key}=$value")
+   615→                    }
+   616→                }
+   617→
+   618→                is CustomizableEnvV2 -> {
+   619→                    val value = prefs[env.key] ?: env.defaultValue
+   620→                    if (!value.isNullOrEmpty()) result.add("${env.key}=$value")
+   621→                }
+   622→
+   623→                is ToggleableEnvV2 -> {
+   624→                    val enabled = prefs[env.key + ENABLED_SUFFIX]?.toBooleanStrictOrNull() ?: env.toggle
+   625→                    if (enabled) result.add("${env.key}=${resolveLibValue(env.key, env.value, dir)}")
+   626→                }
+   627→            }
+   628→        }
+   629→        entry.config.dlopenLibPaths.forEach { addDlopen(resolveLibValue("DLOPEN", it, dir)) }
+   630→        if (dlopen.isNotEmpty()) result.add("DLOPEN=${dlopen.distinct().joinToString(",")}")
+   631→        return result
+   632→    }
+   633→
+   634→    /**
+   635→     * 解析环境变量值中的 `**|` 插件库路径：
+   636→     * v1 启动链路会对 LIB_MESA_NAME/MESA_LIBRARY/DLOPEN 的值自动拼接插件 nativeLibraryDir，
+   637→     * 这些 key 只保留库文件名；其余 key 直接替换为绝对路径。
+   638→     */
+   639→    private fun resolveLibValue(key: String, raw: String, nativeDir: String): String {
+   640→        val joinsDir = key == "LIB_MESA_NAME" || key == "MESA_LIBRARY" || key == "DLOPEN"
+   641→        if (raw.startsWith(NATIVE_PREFIX)) {
+   642→            val lib = raw.removePrefix(NATIVE_PREFIX)
+   643→            return if (joinsDir) lib else "$nativeDir/$lib"
+   644→        }
+   645→        if (joinsDir && raw.startsWith("/")) return raw.substringAfterLast('/')
+   646→        return raw
+   647→    }
+   648→
+   649→    /** v2 库路径转 v1 语义：`**|x` → `/x`（运行时由启动链路拼接插件 nativeLibraryDir） */
+   650→    private fun toV1LibPath(raw: String): String =
+   651→        if (raw.startsWith(NATIVE_PREFIX)) V1_DIR_PREFIX + raw.removePrefix(NATIVE_PREFIX) else raw
+   652→
+   653→    private fun addRenderer(renderer: Renderer) {
+   654→        items.removeIf { it.id == renderer.id }
+   655→        items.add(renderer)
+   656→    }
+   657→}
+   658→
+   659→/** MG 2.0.1 MultiDraw 各条目的候选集合与默认偏好序（序列即偏好序）。对齐上游
+   660→ *  MobileGlues-cpp/config/settings.cpp 的 k_md_default_global_order / k_md_entries，勿随手改动 */
+   661→val MG_MULTIDRAW_ORDERS: Map<String, List<String>> = mapOf(
+   662→    "multidrawOrder" to listOf(
+   663→        "native", "multiindirect", "multibasevertex", "multiarrays", "indirect", "basevertex", "unroll", "compute"
+   664→    ),
+   665→    "multidrawOrderArrays" to listOf("multiarrays", "multiindirect", "unroll"),
+   666→    "multidrawOrderElements" to listOf("multiarrays", "multiindirect", "multibasevertex", "indirect", "unroll"),
+   667→    "multidrawOrderElementsBaseVertex" to listOf(
+   668→        "multibasevertex", "multiindirect", "indirect", "basevertex", "unroll", "compute"
+   669→    ),
+   670→    "multidrawOrderArraysIndirect" to listOf("multiindirect", "indirect"),
+   671→    "multidrawOrderElementsIndirect" to listOf("multiindirect", "indirect"),
+   672→)
+   673→
+   674→/** 函数级异常条目中父序伪项 native 对应的真实后端（同源 settings.cpp 的 native_backend 字段） */
+   675→val MG_MULTIDRAW_NATIVES: Map<String, String> = mapOf(
+   676→    "multidrawOrderArrays" to "multiarrays",
+   677→    "multidrawOrderElements" to "multiarrays",
+   678→    "multidrawOrderElementsBaseVertex" to "multibasevertex",
+   679→    "multidrawOrderArraysIndirect" to "multiindirect",
+   680→    "multidrawOrderElementsIndirect" to "multiindirect",
+   681→)
+   682→
+   683→/** 函数级异常条目的展示标题（对齐上游入口点名） */
+   684→val MD_MULTIDRAW_EXCEPTION_TITLES: Map<String, String> = mapOf(
+   685→    "multidrawOrderArrays" to "glMultiDrawArrays",
+   686→    "multidrawOrderElements" to "glMultiDrawElements",
+   687→    "multidrawOrderElementsBaseVertex" to "glMultiDrawElementsBaseVertex",
+   688→    "multidrawOrderArraysIndirect" to "glMultiDrawArraysIndirect",
+   689→    "multidrawOrderElementsIndirect" to "glMultiDrawElementsIndirect",
+   690→)
+   691→
+   692→/** ordered 值规整：剔除未知项、去重保首见、缺失项按默认序补尾（对 config.json 手编值宽容解析） */
+   693→fun coerceOrder(raw: String?, spec: RendererPlugin.OrderedSpec): String {
+   694→    val known = spec.options.associateBy { it.value }
+   695→    val parsed = raw?.split(',')?.mapNotNull { known[it.trim()] }.orEmpty()
+   696→    val missing = spec.defaultOrder.mapNotNull { known[it] }
+   697→        .filterNot { option -> parsed.any { it.value == option.value } }
+   698→    return (parsed + missing).distinctBy { it.value }.joinToString(",") { it.value }
+   699→}
+   700→
+   701→/** ordered 继承展开：父序中伪项 native 替换为本条目真实后端后再规整（候选外的项被剔除、缺项补尾） */
+   702→fun expandOrder(parentOrder: String, spec: RendererPlugin.OrderedSpec): String =
+   703→    coerceOrder(
+   704→        parentOrder.split(',').joinToString(",") { segment ->
+   705→            val value = segment.trim()
+   706→            if (value == "native") spec.nativeValue ?: value else value
+   707→        },
+   708→        spec
+   709→    )
+   710→

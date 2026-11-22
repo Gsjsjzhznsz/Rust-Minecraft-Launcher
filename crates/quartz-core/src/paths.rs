@@ -69,6 +69,14 @@ pub fn set_runtime_jres_root(root: PathBuf) {
         .expect("RUNTIME_JRES_ROOT 锁中毒") = Some(root);
 }
 
+/// 清除 JVM pack 根目录注入（仅测试用：验证回退行为）。
+#[cfg(test)]
+pub(crate) fn clear_runtime_jres_root() {
+    *RUNTIME_JRES_ROOT
+        .lock()
+        .expect("RUNTIME_JRES_ROOT 锁中毒") = None;
+}
+
 /// JVM pack 安装根目录（exec 必须可用）：注入值优先，回退游戏根 jres/。
 pub fn runtime_dir() -> PathBuf {
     if let Some(p) = RUNTIME_JRES_ROOT
@@ -232,8 +240,12 @@ mod tests {
 
     // 单测试函数串行执行：RUNTIME_ROOT 是进程级全局状态，
     // 拆成多个并行测试会互相污染（先验证默认布局，再验证运行时覆盖）。
+    // 跨模块共享：runtime/lwjgl/renderers 的测试也触碰同一全局，须同锁。
     #[test]
     fn layout_and_runtime_override() {
+        let _guard = crate::runtime::tests::TEST_STATE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // —— 默认布局：全部派生路径相对同一根 —— //
         let root = game_root();
         assert!(root.ends_with(".minecraft") || root.join(".minecraft").is_absolute());
@@ -260,7 +272,8 @@ mod tests {
         assert!(set_runtime_root(public_root.clone()));
         assert_eq!(game_root(), public_root);
 
-        // —— JVM pack 目录：注入优先，回退游戏根 jres/ —— //
+        // —— JVM pack 目录：清除注入后回退游戏根 jres/，注入后用注入值 —— //
+        clear_runtime_jres_root();
         let jres_root = public_root.join("jres");
         assert_eq!(runtime_dir(), jres_root);
         let exec_root = std::env::temp_dir().join("quartz-test-jres");
@@ -268,5 +281,7 @@ mod tests {
         assert_eq!(runtime_dir(), exec_root);
         set_runtime_jres_root(jres_root.clone());
         assert_eq!(runtime_dir(), jres_root);
+        // 恢复中性状态，避免影响其他测试
+        set_runtime_jres_root(exec_root.clone());
     }
 }
