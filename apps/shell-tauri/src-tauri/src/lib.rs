@@ -24,6 +24,7 @@
 //! - `download_runtime(java_major)` 下载 JVM 运行时 pack（`runtime://progress` 事件）
 //! - `launch_game(version_id)`    M0 已接入：JRE pack + LaunchPlan 子进程启动，
 //!                                `launch://log` / `launch://exit` 事件实时上报
+//!                                （v0.1.8：exit 事件附日志尾部直达 UI）
 //! - `stop_game()`                终止游戏进程（SIGKILL）
 
 use quartz_core::instance::DownloadProgress;
@@ -1256,6 +1257,8 @@ pub struct LaunchExit {
     pub version: String,
     /// 本次启动的完整日志文件路径（UI 可直接展示/复制）。
     pub log_file: Option<String>,
+    /// 退出时日志尾部（游戏进程 + 启动器）：崩溃证据直达 UI，用户反馈可直接粘贴。
+    pub log_tail: Option<String>,
 }
 
 /// 启动前自检：版本文件 / Java 主版本 / 账号 / 运行时状态。
@@ -1801,6 +1804,7 @@ fn spawn_game(
                 code,
                 version: version_id,
                 log_file: Some(log_path.to_string_lossy().into_owned()),
+                log_tail: None,
             },
         );
     });

@@ -201,45 +201,68 @@ class MainActivity : TauriActivity() {
   // ------------------------------------------------------------------
 
   fun showGameSurface() {
-    val content = findViewById<ViewGroup>(android.R.id.content) ?: return
-    if (gameView != null) return
-    webViewVisibleBeforeGame = webView?.visibility == View.VISIBLE
-    webView?.visibility = View.GONE
-    window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-    val gv = GameView(this)
-    val controls = GameControls(this)
-    gameView = gv
-    gameControls = controls
-    content.addView(
-      gv,
-      FrameLayout.LayoutParams(
-        ViewGroup.LayoutParams.MATCH_PARENT,
-        ViewGroup.LayoutParams.MATCH_PARENT
+    // v0.1.8 加固：本方法在主进程 UI 线程执行 —— 任何异常未捕获 = 整个 App 死亡
+    //（用户视角的“闪退”）。游戏层 UI 创建失败必须降级为恢复 WebView + 崩溃留痕。
+    try {
+      val content = findViewById<ViewGroup>(android.R.id.content) ?: return
+      if (gameView != null) return
+      webViewVisibleBeforeGame = webView?.visibility == View.VISIBLE
+      webView?.visibility = View.GONE
+      window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+      val gv = GameView(this)
+      val controls = GameControls(this)
+      gameView = gv
+      gameControls = controls
+      content.addView(
+        gv,
+        FrameLayout.LayoutParams(
+          ViewGroup.LayoutParams.MATCH_PARENT,
+          ViewGroup.LayoutParams.MATCH_PARENT
+        )
       )
-    )
-    content.addView(
-      controls,
-      FrameLayout.LayoutParams(
-        ViewGroup.LayoutParams.MATCH_PARENT,
-        ViewGroup.LayoutParams.MATCH_PARENT
+      content.addView(
+        controls,
+        FrameLayout.LayoutParams(
+          ViewGroup.LayoutParams.MATCH_PARENT,
+          ViewGroup.LayoutParams.MATCH_PARENT
+        )
       )
-    )
+    } catch (t: Throwable) {
+      (applicationContext as? QuartzApp)?.appendMarker(
+        "UI-GAME-SURFACE",
+        "游戏层创建失败（已降级恢复 WebView，不终止进程）：${t.message}\n" +
+          t.stackTraceToString().take(2000)
+      )
+      try {
+        hideGameSurface()
+      } catch (_: Throwable) {
+      }
+    }
   }
 
   fun hideGameSurface() {
-    val content = findViewById<ViewGroup>(android.R.id.content) ?: return
-    window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-    gameControls?.let {
-      (it.parent as? ViewGroup)?.removeView(it)
-    }
-    // GameView 的 surfaceDestroyed 回调负责 releaseSurface（移除视图即触发）
-    gameView?.let {
-      (it.parent as? ViewGroup)?.removeView(it)
-    }
-    gameControls = null
-    gameView = null
-    if (webViewVisibleBeforeGame) {
-      webView?.visibility = View.VISIBLE
+    // v0.1.8 加固：同 showGameSurface —— 恢复路径的异常也绝不致死（游戏崩溃
+    // 后的 UI 恢复走这里，若抛异常用户将永远看到黑屏 Surface）。
+    try {
+      val content = findViewById<ViewGroup>(android.R.id.content) ?: return
+      window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+      gameControls?.let {
+        (it.parent as? ViewGroup)?.removeView(it)
+      }
+      // GameView 的 surfaceDestroyed 回调负责 releaseSurface（移除视图即触发）
+      gameView?.let {
+        (it.parent as? ViewGroup)?.removeView(it)
+      }
+      gameControls = null
+      gameView = null
+      if (webViewVisibleBeforeGame) {
+        webView?.visibility = View.VISIBLE
+      }
+    } catch (t: Throwable) {
+      (applicationContext as? QuartzApp)?.appendMarker(
+        "UI-GAME-SURFACE-HIDE",
+        "游戏层恢复失败：${t.message}\n" + t.stackTraceToString().take(2000)
+      )
     }
   }
 
@@ -254,26 +277,35 @@ class MainActivity : TauriActivity() {
 
   override fun dispatchKeyEvent(event: KeyEvent): Boolean {
     if (gameView != null) {
-      val glfw = GlfwKeys.toGlfwKey(event.keyCode)
-      val action = when (event.action) {
-        KeyEvent.ACTION_DOWN -> 1
-        KeyEvent.ACTION_UP -> 0
-        else -> -1
-      }
-      if (glfw != 0 && action >= 0) {
-        val mods = GlfwKeys.mods(event.metaState)
-        val repeats = if (event.action == KeyEvent.ACTION_DOWN) event.repeatCount else 0
-        if (action == 1 && repeats == 0) {
-          GameIpc.key(glfw, 0, 1, mods)
-          // 可打印字符同步发 char 事件（聊天输入）
-          if (event.isPrintingKey) {
-            val ch = event.unicodeChar
-            if (ch > 0) GameIpc.char(ch, mods)
-          }
-        } else if (action == 0) {
-          GameIpc.key(glfw, 0, 0, mods)
+      // v0.1.8 加固：键转发层异常不得杀死主进程
+      try {
+        val glfw = GlfwKeys.toGlfwKey(event.keyCode)
+        val action = when (event.action) {
+          KeyEvent.ACTION_DOWN -> 1
+          KeyEvent.ACTION_UP -> 0
+          else -> -1
         }
-        return true
+        if (glfw != 0 && action >= 0) {
+          val mods = GlfwKeys.mods(event.metaState)
+          val repeats = if (event.action == KeyEvent.ACTION_DOWN) event.repeatCount else 0
+          if (action == 1 && repeats == 0) {
+            GameIpc.key(glfw, 0, 1, mods)
+            // 可打印字符同步发 char 事件（聊天输入）
+            if (event.isPrintingKey) {
+              val ch = event.unicodeChar
+              if (ch > 0) GameIpc.char(ch, mods)
+            }
+          } else if (action == 0) {
+            GameIpc.key(glfw, 0, 0, mods)
+          }
+          return true
+        }
+      } catch (t: Throwable) {
+        (applicationContext as? QuartzApp)?.appendMarker(
+          "UI-KEY-FORWARD",
+          "按键转发失败：${t.message}"
+        )
+        return super.dispatchKeyEvent(event)
       }
     }
     return super.dispatchKeyEvent(event)

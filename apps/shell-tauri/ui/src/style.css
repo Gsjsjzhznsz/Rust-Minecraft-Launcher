@@ -506,3 +506,37 @@ select { appearance: none; background-image: linear-gradient(45deg, transparent 
 }
 .diag-banner .diag-actions { display: flex; justify-content: flex-end; }
 .diag-banner .btn { border-color: #b04a4a; }
+
+/* ---------- v0.1.8：游戏退出详情（崩溃日志尾部直达 UI） ---------- */
+.exit-detail {
+  margin: 10px 12px 4px;
+  border: 1px solid rgba(214, 69, 65, 0.45);
+  border-radius: 10px;
+  background: rgba(214, 69, 65, 0.08);
+  overflow: hidden;
+}
+.exit-detail-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  background: rgba(214, 69, 65, 0.14);
+}
+.exit-detail-title {
+  flex: 1;
+  font-size: 13px;
+  font-weight: 600;
+  color: #ff8f8b;
+}
+.exit-detail-text {
+  margin: 0;
+  padding: 10px;
+  max-height: 220px;
+  overflow: auto;
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  word-break: break-all;
+  color: #e8ebf1;
+}

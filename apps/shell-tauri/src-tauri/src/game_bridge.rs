@@ -28,7 +28,7 @@ use crate::LaunchLog;
 use tauri::Emitter;
 use jni_sys::{jboolean, jint, JNI_OK, JNI_VERSION_1_8};
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -429,13 +429,45 @@ static APP_HANDLE: OnceLock<tauri::AppHandle> = OnceLock::new();
 static STATE_VERSION: Mutex<String> = Mutex::new(String::new());
 /// 当前启动日志文件句柄（qlog_emit 写入目标）。
 static STATE_LOG_FILE: Mutex<Option<Arc<Mutex<Option<std::fs::File>>>>> = Mutex::new(None);
+/// 当前游戏进程日志路径（:game stdout/stderr 直写；退出摘要 + 看门狗判定用）。
+static STATE_GAME_LOG_PATH: Mutex<Option<PathBuf>> = Mutex::new(None);
+/// 当前启动器侧日志路径（退出摘要第二段）。
+static STATE_MAIN_LOG_PATH: Mutex<Option<PathBuf>> = Mutex::new(None);
 
 pub fn game_running() -> bool {
     GAME_RUNNING.load(Ordering::SeqCst)
 }
 
-/// 统一退出上报：隐藏游戏层 + 恢复竖屏 + emit launch://exit。幂等。
-/// 调用方：GameHost.gameExited（:game 正常结束）/ gameProcessGone（崩溃/停止）。
+/// 读日志尾部（最多 max_lines 行，单行截断 400 字符）。
+fn log_tail_text(path: Option<&Path>, max_lines: usize) -> Option<String> {
+    let path = path?;
+    let text = std::fs::read_to_string(path).ok()?;
+    let lines: Vec<String> = text
+        .lines()
+        .rev()
+        .take(max_lines)
+        .map(|l| {
+            if l.chars().count() > 400 {
+                format!("{}…", l.chars().take(400).collect::<String>())
+            } else {
+                l.to_string()
+            }
+        })
+        .collect();
+    if lines.is_empty() {
+        return None;
+    }
+    Some(
+        lines
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+}
+
+/// 统一退出上报：隐藏游戏层 + 恢复竖屏 + emit launch://exit（附日志尾部）。幂等。
+/// 调用方：GameHost.gameExited（:game 正常结束）/ gameProcessGone（崩溃/停止）/ 看门狗。
 pub fn finish_game_exit(code: i32) {
     if EXIT_EMITTED.swap(true, Ordering::SeqCst) {
         return;
@@ -445,12 +477,30 @@ pub fn finish_game_exit(code: i32) {
     hide_game_surface();
     if let Some(app) = APP_HANDLE.get() {
         let version = STATE_VERSION.lock().ok().map(|g| g.clone()).unwrap_or_default();
+        // 崩溃证据直达 UI：游戏进程日志尾部 + 启动器日志尾部（用户下次反馈可直接粘贴）。
+        let game_tail = log_tail_text(
+            STATE_GAME_LOG_PATH.lock().ok().and_then(|g| g.clone()).as_deref(),
+            40,
+        );
+        let main_tail = log_tail_text(
+            STATE_MAIN_LOG_PATH.lock().ok().and_then(|g| g.clone()).as_deref(),
+            16,
+        );
+        let mut tail = String::new();
+        match game_tail {
+            Some(t) => tail.push_str(&format!("--- 游戏进程日志尾部 ---\n{t}")),
+            None => tail.push_str("--- 游戏进程日志为空（进程未产出任何输出） ---"),
+        }
+        if let Some(t) = main_tail {
+            tail.push_str(&format!("\n\n--- 启动器日志尾部 ---\n{t}"));
+        }
         let _ = app.emit(
             "launch://exit",
             &LaunchExit {
                 code,
                 version,
                 log_file: None,
+                log_tail: if tail.is_empty() { None } else { Some(tail) },
             },
         );
     }
@@ -471,6 +521,32 @@ fn append_state_log(line: &str) {
 pub fn stop_game_process() {
     STOP_REQUESTED.store(true, Ordering::SeqCst);
     let _ = call_activity_static("stopGameServiceStatic", "()V", &[]);
+}
+
+/// 致命信号拦截（:game 进程）：SIGABRT/SIGBUS/SIGFPE/SIGILL 到达时写一行证据到
+/// 日志（fd 2 已重定向到游戏日志），随后 _exit(128+sig)。
+/// 目的：让 :game 进程以“正常退出”姿态死亡 —— 不经 debuggerd/ams_crash 通道，
+/// 部分 ROM（MIUI 等）对崩溃进程会整组杀掉应用，此拦截切断该路径；
+/// 启动器 UI 经 binder death 回调可靠恢复。
+/// 注意：故意不拦截 SIGSEGV —— HotSpot 依赖它做隐式空检查；JVM 致命错误写完
+/// hs_err 后走 abort()，仍会落入本拦截。
+extern "C" fn quartz_on_fatal_signal(sig: c_int) {
+    const MSG: &str = "==== [quartz] :game fatal signal (intercepted, clean exit) ====\n";
+    unsafe {
+        libc::write(2, MSG.as_ptr() as *const c_void, MSG.len());
+        libc::_exit(128 + sig);
+    }
+}
+
+fn install_fatal_signal_handlers() {
+    unsafe {
+        for sig in [libc::SIGABRT, libc::SIGBUS, libc::SIGFPE, libc::SIGILL] {
+            let mut act: libc::sigaction = std::mem::zeroed();
+            act.sa_sigaction = quartz_on_fatal_signal as usize;
+            act.sa_flags = libc::SA_RESTART;
+            libc::sigaction(sig, &act, ptr::null_mut());
+        }
+    }
 }
 
 /// 主进程回调：:game 进程正常结束（GameService 发 MSG_EXIT 后自杀）。
@@ -499,6 +575,26 @@ pub unsafe extern "C" fn Java_com_quartz_launcher_GameHost_gameProcessGone(
         });
     }
     finish_game_exit(if stopped { 137 } else { 134 });
+    // 崩溃证据补充采集（异步，不拖慢 UI 恢复）：v0.1.8 起致命信号已在 :game
+    // 侧拦截为干净退出（通常无 debuggerd 记录），此处兜底抓取 crash 缓冲，
+    // JVM 写 hs_err 前的 abort / 拦截器未覆盖的极端路径仍可留痕。
+    if !stopped {
+        std::thread::spawn(|| {
+            let out = std::process::Command::new("logcat")
+                .args(["-d", "-b", "crash", "-t", "120"])
+                .output();
+            if let Ok(o) = out {
+                let text = String::from_utf8_lossy(&o.stdout);
+                let recent: Vec<&str> = text.lines().rev().take(12).collect();
+                for line in recent.into_iter().rev() {
+                    if line.trim().is_empty() {
+                        continue;
+                    }
+                    append_state_log(&format!("[logcat-crash] {line}"));
+                }
+            }
+        });
+    }
 }
 
 /// 主进程回调：:game 进程上报鼠标 grab 状态（GameService 转发桥回调）。
@@ -525,6 +621,10 @@ fn qlog_emit(app: &tauri::AppHandle, log_file: &Arc<Mutex<Option<std::fs::File>>
 }
 
 /// 启动规格（主进程装配 -> spec 文件 -> :game 进程读取执行）。
+/// game_root/runtime_dir（v0.1.8）：:game 是独立进程，paths 模块的进程级注入
+/// static 在该进程不存在 —— 必须随 spec 传入并在 run_game_from_spec 顶部
+/// 重新注入，否则 tagfix/hook jar/tmp/java.library.path/渲染层全部解析到
+/// 错误回退路径（v0.1.7 游戏秒崩的根因）。
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct GameSpec {
     pub version_id: String,
@@ -537,6 +637,10 @@ pub struct GameSpec {
     /// Mojang 版本 natives 目录（含在 java.library.path 尾部）
     pub natives_dir: String,
     pub log_path: String,
+    /// 主进程解析的游戏根目录（含 .minecraft / logs / accounts.json）
+    pub game_root: String,
+    /// 主进程解析的可 exec 运行时目录（JVM pack / 渲染层 / LWJGL / 桥 / hook jar）
+    pub runtime_dir: String,
 }
 
 /// :game 独立进程启动主流程（v0.1.7 崩溃隔离重构）。
@@ -564,6 +668,26 @@ pub fn launch_via_game_process(
     }
 
     let jre_home = crate::runtime::install_dir(major);
+    // 游戏进程输出独立落盘（与启动器日志分离）：tail 只跟游戏输出，
+    // 看门狗以“游戏日志是否产出内容”判定 :game 是否真的跑起来了。
+    let game_log_path = log_path
+        .parent()
+        .map(|dir| {
+            dir.join(format!(
+                "game-{}.log",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0)
+            ))
+        })
+        .unwrap_or_else(|| log_path.to_path_buf());
+    if let Ok(mut g) = STATE_GAME_LOG_PATH.lock() {
+        *g = Some(game_log_path.clone());
+    }
+    if let Ok(mut g) = STATE_MAIN_LOG_PATH.lock() {
+        *g = Some(log_path.to_path_buf());
+    }
     let spec = GameSpec {
         version_id: version_id.clone(),
         main_class: plan.main_class.clone(),
@@ -572,7 +696,9 @@ pub fn launch_via_game_process(
         jvm_args: plan.jvm_args.clone(),
         game_args: plan.game_args.clone(),
         natives_dir: plan.natives_dir.to_string_lossy().into_owned(),
-        log_path: log_path.to_string_lossy().into_owned(),
+        log_path: game_log_path.to_string_lossy().into_owned(),
+        game_root: crate::paths::game_root().to_string_lossy().into_owned(),
+        runtime_dir: crate::paths::runtime_dir().to_string_lossy().into_owned(),
     };
 
     // spec 落盘（内部目录，:game 进程同 uid 可读）
@@ -584,7 +710,10 @@ pub fn launch_via_game_process(
         &app,
         &log_file,
         "quartz",
-        "[quartz] 启动模式：:game 独立进程 JVM + Rust 显示桥（崩溃不影响启动器 UI）",
+        &format!(
+            "[quartz] 启动模式：:game 独立进程 JVM + Rust 显示桥（崩溃不影响启动器 UI）；游戏输出：{}",
+            game_log_path.display()
+        ),
     );
 
     // 显示游戏视图（横屏 SurfaceView）+ 绑定 :game 服务
@@ -601,11 +730,11 @@ pub fn launch_via_game_process(
         return Err("绑定 :game 游戏进程服务失败".into());
     }
 
-    // tail 线程：:game 进程把 stdout/stderr 直写日志文件，主进程跟踪新行
+    // tail 线程：:game 进程把 stdout/stderr 直写游戏日志文件，主进程跟踪新行
     // -> launch://log（WebView 实时控制台）。退出回调会把 TAIL_ACTIVE 置否。
     let tail_app = app.clone();
     let tail_lf = log_file.clone();
-    let tail_path = log_path.to_path_buf();
+    let tail_path = game_log_path.clone();
     std::thread::spawn(move || {
         use std::io::{Read, Seek, SeekFrom};
         let mut pos: u64 = std::fs::metadata(&tail_path).map(|m| m.len()).unwrap_or(0);
@@ -634,6 +763,38 @@ pub fn launch_via_game_process(
             }
             std::thread::sleep(std::time::Duration::from_millis(250));
         }
+    });
+
+    // 看门狗：正常路径下 :game 进程在 MSG_INIT 后 1 秒内就会向游戏日志写入
+    // 首行输出（日志重定向先于一切）。20 秒仍空 = 服务没起来 / spec 未送达 /
+    // 进程秒死（失败于 loadLibrary 等极早期阶段，binder 死亡都来不及触发）——
+    // 强制结束并恢复启动器 UI，避免黑屏 Surface 永久悬挂。
+    std::thread::spawn(move || {
+        let game_log = game_log_path.clone();
+        let stop_app = app.clone();
+        for _ in 0..40 {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            if !TAIL_ACTIVE.load(Ordering::SeqCst) {
+                return; // 已退出（MSG_EXIT / binder death），看门狗退位
+            }
+            if std::fs::metadata(&game_log)
+                .map(|m| m.len() > 0)
+                .unwrap_or(false)
+            {
+                return; // 游戏进程已产出输出，启动正常
+            }
+        }
+        if EXIT_EMITTED.load(Ordering::SeqCst) {
+            return;
+        }
+        qlog_emit(
+            &stop_app,
+            &log_file,
+            "quartz",
+            "[quartz] 看门狗：游戏进程 20 秒无任何输出（服务未启动 / spec 未送达 / 进程秒死），强制恢复启动器",
+        );
+        let _ = call_activity_static("stopGameServiceStatic", "()V", &[]);
+        finish_game_exit(253);
     });
     Ok(())
 }
@@ -732,6 +893,14 @@ unsafe fn run_game_from_spec(
     let raw = std::fs::read_to_string(spec_path).map_err(|e| format!("spec 读取失败：{e}"))?;
     let spec: GameSpec = serde_json::from_str(&raw).map_err(|e| format!("spec 解析失败：{e}"))?;
 
+    // 0) 路径重注入（v0.1.8 根因修复，必须先于一切路径使用）：:game 是独立
+    //    进程，quartz-core 的 RUNTIME_ROOT/RUNTIME_JRES_ROOT 在本进程为空 ——
+    //    不注入则 tagfix/hook jar/tmp/java.library.path/渲染层/LWJGL 全部解析
+    //    到错误的回退路径（Android 11+ FUSE 上甚至不可写）→ JVM/游戏秒崩。
+    //    重注入后 quartz-core 全部路径/渲染层/LWJGL 函数在本进程即恢复正确。
+    crate::paths::set_runtime_root(PathBuf::from(&spec.game_root));
+    crate::paths::set_runtime_jres_root(PathBuf::from(&spec.runtime_dir));
+
     // 0) stdout/stderr 直写日志文件（先于一切：本函数所有输出都进日志）
     {
         let c = CString::new(spec.log_path.clone()).map_err(|_| "日志路径含 NUL")?;
@@ -751,6 +920,14 @@ unsafe fn run_game_from_spec(
         std::process::id()
     );
     eprintln!("[quartz] 本次游戏崩溃将只终止本进程，启动器 UI 不受影响");
+    eprintln!(
+        "[quartz] 路径重注入完成：game_root={} | runtime_dir={}",
+        spec.game_root,
+        spec.runtime_dir
+    );
+    // 致命信号拦截：先装一次（覆盖 JVM dlopen/初始化期间的 abort）——
+    // 让崩溃进程以干净退出码消失，避免部分 ROM 因 debuggerd 崩溃报告整组杀掉应用。
+    install_fatal_signal_handlers();
 
     // 1) 当前目录 + 环境变量
     let workdir = std::path::PathBuf::from(&spec.workdir);
@@ -935,6 +1112,9 @@ unsafe fn run_game_from_spec(
         return Err(format!("JNI_CreateJavaVM 失败（rc={rc}）"));
     }
     eprintln!("[quartz] :game 进程内 JVM 创建成功（OpenJDK 17，与 ART 并存）");
+    // JVM 初始化会覆盖 SIGABRT 处理器（HotSpot 崩溃报告用）：重装拦截 ——
+    // HotSpot 写完 hs_err 后调用 abort()，仍落入本拦截（干净退出，不惊动系统）。
+    install_fatal_signal_handlers();
 
     // 8) 安装退出捕获 SecurityManager（自研 hook jar）：System.exit/halt 被
     //    否决并转为 ExitSignal，崩溃码沿调用栈返回本函数而非 os::exit。

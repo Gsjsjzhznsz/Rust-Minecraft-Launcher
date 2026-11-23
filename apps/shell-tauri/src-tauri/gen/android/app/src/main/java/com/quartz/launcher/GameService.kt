@@ -108,6 +108,17 @@ class GameService : Service() {
 
     override fun onBind(intent: Intent?): IBinder = messenger.binder
 
+    override fun onCreate() {
+        super.onCreate()
+        // v0.1.8 加固：壳层库在 onCreate（主线程）抢先装载，消除与 MSG_SURFACE
+        // 处理（同样在主线程直调 QuartzBridge native）的装载竞态 —— 首条 Surface
+        // 消息到达时符号必然已注册，不再依赖 runner 线程装载完成时序。
+        try {
+            System.loadLibrary("quartz_shell_lib")
+        } catch (_: Throwable) {
+        }
+    }
+
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         // startService 保证主进程 unbind 后 :game 不被销毁（started service）
         return START_NOT_STICKY

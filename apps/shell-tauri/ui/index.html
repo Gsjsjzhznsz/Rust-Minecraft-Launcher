@@ -143,6 +143,15 @@
               <button id="console-clear-btn" class="btn btn-sm btn-ghost">清屏</button>
             </div>
             <div id="console-box" class="console-box"><div class="console-line dim">[quartz] 启动日志将显示在这里</div></div>
+            <!-- v0.1.8：退出详情（崩溃日志尾部直达 UI，反馈时可直接复制） -->
+            <div id="exit-detail" class="exit-detail hidden">
+              <div class="exit-detail-head">
+                <span class="exit-detail-title">游戏退出详情（含日志尾部）</span>
+                <button id="exit-detail-copy" class="btn btn-sm btn-ghost">复制</button>
+                <button id="exit-detail-close" class="btn btn-sm btn-ghost">关闭</button>
+              </div>
+              <pre id="exit-detail-text" class="exit-detail-text"></pre>
+            </div>
             <div id="rt-progress" class="progress-card hidden">
               <div class="progress-head">
                 <span class="progress-title">Java 运行时</span>

@@ -34,7 +34,7 @@ type Preflight = {
   runtimeDir: string;
 };
 type LaunchLog = { source: string; line: string };
-type LaunchExit = { code: number; version: string };
+type LaunchExit = { code: number; version: string; logTail?: string | null };
 type MigrateMsg = { percent: number; done: boolean; error: string | null };
 
 /* ---------- DOM 工具 ---------- */
@@ -333,14 +333,27 @@ async function ensureProgressListener() {
   await listen<LaunchLog>("launch://log", (event) => appendLog(event.payload.source, event.payload.line));
   await listen<LaunchExit>("launch://exit", (event) => {
     hide("stop-btn");
-    if (event.payload.code === 0) {
+    const code = event.payload.code;
+    if (code === 0) {
       setLaunchBadge("已退出（0）", "dim");
       toast("游戏已正常退出", "ok");
+      hide("exit-detail");
     } else {
-      setLaunchBadge(`已退出（${event.payload.code}）`, "err");
-      toast(`游戏已退出（代码 ${event.payload.code}），详情见控制台`, "err");
+      setLaunchBadge(`已退出（${code}）`, "err");
+      toast(`游戏已退出（代码 ${code}），详情见控制台`, "err");
+      // v0.1.8：崩溃证据直达 UI —— 日志尾部（游戏进程 + 启动器）展示在控制台下方
+      const detail = el<HTMLDivElement>("exit-detail");
+      el<HTMLPreElement>("exit-detail-text").textContent =
+        event.payload.logTail || "（无日志输出 —— 进程未产出任何内容）";
+      detail.classList.remove("hidden");
     }
-    appendLog("quartz", `[quartz] 进程退出，代码 ${event.payload.code}`);
+    appendLog("quartz", `[quartz] 进程退出，代码 ${code}`);
+    // 控制台也追加尾部（与详情框互为备份）
+    if (event.payload.logTail) {
+      for (const line of event.payload.logTail.split("\n").slice(-40)) {
+        appendLog("stderr", line);
+      }
+    }
   });
   await listen<MigrateMsg>("quartz://migrate", (event) => {
     const p = event.payload;
@@ -1151,6 +1164,16 @@ function bindEvents() {
 
   // 启动控制台
   el<HTMLButtonElement>("console-clear-btn").addEventListener("click", clearConsole);
+  // 退出详情（v0.1.8）：复制 / 关闭
+  el<HTMLButtonElement>("exit-detail-copy").addEventListener("click", async () => {
+    try {
+      await navigator.clipboard.writeText(el<HTMLPreElement>("exit-detail-text").textContent || "");
+      toast("已复制退出详情", "ok");
+    } catch (_) {
+      toast("复制失败，请长按选择文本", "err");
+    }
+  });
+  el<HTMLButtonElement>("exit-detail-close").addEventListener("click", () => hide("exit-detail"));
   el<HTMLButtonElement>("lwjgl-dl-btn").addEventListener("click", async () => {
     if (lwjglDownloading) {
       toast("已有 LWJGL 下载任务", "");

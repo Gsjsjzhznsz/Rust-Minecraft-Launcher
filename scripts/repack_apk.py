@@ -6,11 +6,23 @@
 - replicates each entry's original compression method (STORED entries must
   stay STORED for extractNativeLibs=false; zipalign restores offsets)
 """
+import os
 import shutil
 import sys
 import zipfile
 
-SRC = "/tmp/my-project/.qz-gradle-build/app/outputs/apk/universal/debug/app-universal-debug.apk"
+def _raw_apk() -> str:
+    if os.environ.get("QUARTZ_RAW_APK"):
+        return os.environ["QUARTZ_RAW_APK"]
+    for cand in (
+        "/home/z/my-project/apps/shell-tauri/src-tauri/gen/android/app/build/outputs/apk/universal/debug/app-universal-debug.apk",
+        "/tmp/my-project/.qz-gradle-build/app/outputs/apk/universal/debug/app-universal-debug.apk",
+    ):
+        if os.path.exists(cand):
+            return cand
+    raise SystemExit("raw APK not found (set QUARTZ_RAW_APK)")
+
+SRC = _raw_apk()
 STRIPPED_SO = "/tmp/apkwork/libquartz_shell_lib-final.so"
 DST = sys.argv[1] if len(sys.argv) > 1 else "/tmp/apkwork/quartz-repack.apk"
 
