@@ -24,3 +24,7 @@ apps/shell-tauri/src-tauri/gen/android/buildSrc/build
 tool-results/
 .qz-gradle-build/
 tool-results/
+# v0.1.9 补充：主机模拟环境的大体积下载产物与运行日志（脚本入库，产物不入库）
+/sim/
+/logs/
+/upload/

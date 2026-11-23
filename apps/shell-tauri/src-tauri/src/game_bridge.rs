@@ -433,6 +433,10 @@ static STATE_LOG_FILE: Mutex<Option<Arc<Mutex<Option<std::fs::File>>>>> = Mutex:
 static STATE_GAME_LOG_PATH: Mutex<Option<PathBuf>> = Mutex::new(None);
 /// 当前启动器侧日志路径（退出摘要第二段）。
 static STATE_MAIN_LOG_PATH: Mutex<Option<PathBuf>> = Mutex::new(None);
+/// tail 线程已读偏移（退出时同步排干剩余行，避免 250ms 轮询竞态丢掉最后的
+/// 错误详情 —— 252 盲盒的根因之一：nativeRunGame 的 eprintln 与 MSG_EXIT
+/// 几乎同时写入，tail 线程来不及读）。
+static GAME_LOG_POS: Mutex<u64> = Mutex::new(0);
 
 pub fn game_running() -> bool {
     GAME_RUNNING.load(Ordering::SeqCst)
@@ -466,12 +470,60 @@ fn log_tail_text(path: Option<&Path>, max_lines: usize) -> Option<String> {
     )
 }
 
+/// 退出前把游戏日志尚未 tail 到的行同步写进控制台流（防秒退竞态丢错误详情）。
+fn drain_game_log_to_console() {
+    let path = match STATE_GAME_LOG_PATH.lock().ok().and_then(|g| g.clone()) {
+        Some(p) => p,
+        None => return,
+    };
+    let pos = GAME_LOG_POS.lock().ok().map(|p| *p).unwrap_or(0);
+    let meta = match std::fs::metadata(&path) {
+        Ok(m) => m,
+        Err(_) => return,
+    };
+    if meta.len() <= pos {
+        return;
+    }
+    let Ok(mut f) = std::fs::File::open(&path) else {
+        return;
+    };
+    use std::io::{Read, Seek, SeekFrom};
+    if f.seek(SeekFrom::Start(pos)).is_err() {
+        return;
+    }
+    let mut buf = Vec::new();
+    if f.read_to_end(&mut buf).is_err() {
+        return;
+    }
+    if let Ok(mut p) = GAME_LOG_POS.lock() {
+        *p = pos + buf.len() as u64;
+    }
+    let text = String::from_utf8_lossy(&buf);
+    let lines: Vec<&str> = text
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .collect();
+    if let Some(app) = APP_HANDLE.get() {
+        if let Ok(g) = STATE_LOG_FILE.lock() {
+            if let Some(lf) = g.as_ref() {
+                // 最多补 100 行，且保持原顺序
+                for line in lines.iter().rev().take(100).collect::<Vec<_>>().into_iter().rev() {
+                    qlog_emit(app, lf, "stdout", line);
+                }
+            }
+        }
+    }
+}
+
 /// 统一退出上报：隐藏游戏层 + 恢复竖屏 + emit launch://exit（附日志尾部）。幂等。
 /// 调用方：GameHost.gameExited（:game 正常结束）/ gameProcessGone（崩溃/停止）/ 看门狗。
 pub fn finish_game_exit(code: i32) {
     if EXIT_EMITTED.swap(true, Ordering::SeqCst) {
         return;
     }
+    // 同步排干游戏日志剩余行：nativeRunGame 的错误详情（如 JNI_CreateJavaVM
+    // 失败原因）与 MSG_EXIT 同窗期落盘，tail 线程轮询赶不上 —— 不排干就是盲盒。
+    drain_game_log_to_console();
     GAME_RUNNING.store(false, Ordering::SeqCst);
     TAIL_ACTIVE.store(false, Ordering::SeqCst);
     hide_game_surface();
@@ -581,11 +633,13 @@ pub unsafe extern "C" fn Java_com_quartz_launcher_GameHost_gameProcessGone(
     if !stopped {
         std::thread::spawn(|| {
             let out = std::process::Command::new("logcat")
-                .args(["-d", "-b", "crash", "-t", "120"])
+                .args(["-d", "-b", "crash", "-t", "200"])
                 .output();
             if let Ok(o) = out {
                 let text = String::from_utf8_lossy(&o.stdout);
-                let recent: Vec<&str> = text.lines().rev().take(12).collect();
+                // 40 行才能覆盖异常头（FATAL EXCEPTION / 异常类名 / Process 行）：
+                // 只取 12 行会把栈中部留下、根因行丢掉（设备日志曾验证此坑）。
+                let recent: Vec<&str> = text.lines().rev().take(40).collect();
                 for line in recent.into_iter().rev() {
                     if line.trim().is_empty() {
                         continue;
@@ -750,6 +804,9 @@ pub fn launch_via_game_process(
                         let mut buf = Vec::new();
                         if f.read_to_end(&mut buf).is_ok() {
                             pos += buf.len() as u64;
+                            if let Ok(mut p) = GAME_LOG_POS.lock() {
+                                *p = pos;
+                            }
                             let text = String::from_utf8_lossy(&buf);
                             for line in text.lines() {
                                 if line.trim().is_empty() {
@@ -882,9 +939,44 @@ unsafe fn bridge_init_with(env: EnvPtr, ctx: jni_sys::jobject) -> Result<(), Str
     Ok(())
 }
 
+/// JNI 返回码符号化（设备日志直读，不再对着 252 猜）。
+fn jvm_rc_name(rc: jint) -> &'static str {
+    match rc {
+        0 => "JNI_OK",
+        -1 => "JNI_ERR",
+        -2 => "JNI_EDETACHED",
+        -3 => "JNI_EVERSION",
+        -4 => "JNI_ENOMEM（内存/地址空间预留失败）",
+        -5 => "JNI_EEXIST（VM 已存在）",
+        -6 => "JNI_EINVAL（参数非法）",
+        _ => "未知返回码",
+    }
+}
+
+/// 进程内存态势（CreateJavaVM 失败诊断用）。
+fn memory_profile() -> String {
+    let mut out = Vec::new();
+    if let Ok(s) = std::fs::read_to_string("/proc/self/status") {
+        for l in s.lines() {
+            if l.starts_with("VmSize") || l.starts_with("VmRSS") {
+                out.push(l.trim().to_string());
+            }
+        }
+    }
+    if let Ok(s) = std::fs::read_to_string("/proc/meminfo") {
+        if let Some(l) = s.lines().find(|l| l.starts_with("MemAvailable")) {
+            out.push(l.trim().to_string());
+        }
+    }
+    if out.is_empty() {
+        out.push("(内存信息不可读)".into());
+    }
+    out.join(" | ")
+}
+
 /// :game 进程入口（GameService.nativeRunGame JNI 调用）：
 /// 读取启动规格 -> 日志重定向 -> 环境准备 -> Surface 等待 ->
-/// dlopen JVM -> CreateJavaVM -> 安装退出捕获 -> 调用 main。
+/// dlopen JVM -> CreateJavaVM（失败带诊断+最小集重试）-> 退出捕获 -> 调用 main。
 unsafe fn run_game_from_spec(
     env: EnvPtr,
     ctx: jni_sys::jobject,
@@ -1089,16 +1181,20 @@ unsafe fn run_game_from_spec(
         }
         std::mem::transmute(p)
     };
-    let mut jvm_options: Vec<jni_sys::JavaVMOption> = Vec::new();
-    let mut leaked: Vec<CString> = Vec::new();
-    for opt in &options {
-        let cs = CString::new(opt.clone()).map_err(|_| "JVM 参数含 NUL".to_string())?;
-        jvm_options.push(jni_sys::JavaVMOption {
-            optionString: cs.as_ptr() as *mut c_char,
-            extraInfo: ptr::null_mut(),
-        });
-        leaked.push(cs); // 保活
-    }
+    let make_args = |opts: &[String]| -> Result<(Vec<jni_sys::JavaVMOption>, Vec<CString>), String> {
+        let mut vopts: Vec<jni_sys::JavaVMOption> = Vec::new();
+        let mut leaked: Vec<CString> = Vec::new();
+        for opt in opts {
+            let cs = CString::new(opt.clone()).map_err(|_| "JVM 参数含 NUL".to_string())?;
+            vopts.push(jni_sys::JavaVMOption {
+                optionString: cs.as_ptr() as *mut c_char,
+                extraInfo: ptr::null_mut(),
+            });
+            leaked.push(cs); // 保活
+        }
+        Ok((vopts, leaked))
+    };
+    let (mut jvm_options, _leaked) = make_args(&options)?;
     let mut init_args = jni_sys::JavaVMInitArgs {
         version: JNI_VERSION_1_8,
         nOptions: jvm_options.len() as jint,
@@ -1109,7 +1205,53 @@ unsafe fn run_game_from_spec(
     let mut jenv: EnvPtr = ptr::null_mut();
     let rc = create(&mut vm, &mut jenv, &mut init_args);
     if rc != JNI_OK || vm.is_null() || jenv.is_null() {
-        return Err(format!("JNI_CreateJavaVM 失败（rc={rc}）"));
+        // 诊断直达游戏日志（退出时同步排干进控制台）：rc 符号名 + 内存态势，
+        // 并用最小参数集自动重试 —— 区分「JVM 起不来」与「某参数不被接受」。
+        eprintln!(
+            "[quartz] JNI_CreateJavaVM 失败：rc={rc}（{}）；进程内存：{}；参数 {} 项",
+            jvm_rc_name(rc),
+            memory_profile(),
+            options.len()
+        );
+        let mut minimal: Vec<String> = Vec::new();
+        for o in &options {
+            let keep = o.starts_with("-Djava.class.path=")
+                || o.starts_with("-Djava.library.path=")
+                || o.starts_with("-Djava.io.tmpdir=")
+                || o.starts_with("-Djava.security.manager=")
+                || o.starts_with("-XX:ErrorFile=");
+            if keep {
+                minimal.push(o.clone());
+            }
+        }
+        minimal.push("-Xmx512M".into());
+        minimal.push("-XX:-UsePerfData".into());
+        eprintln!(
+            "[quartz] 最小参数集（{} 项）重试 CreateJavaVM…",
+            minimal.len()
+        );
+        let (mut opts2, _leaked2) = make_args(&minimal)?;
+        let mut args2 = jni_sys::JavaVMInitArgs {
+            version: JNI_VERSION_1_8,
+            nOptions: opts2.len() as jint,
+            options: opts2.as_mut_ptr(),
+            ignoreUnrecognized: 0,
+        };
+        vm = ptr::null_mut();
+        jenv = ptr::null_mut();
+        let rc2 = create(&mut vm, &mut jenv, &mut args2);
+        if rc2 != JNI_OK || vm.is_null() || jenv.is_null() {
+            return Err(format!(
+                "JNI_CreateJavaVM 失败：全参数 rc={rc}（{}），最小集 rc={rc2}（{}）；内存：{}",
+                jvm_rc_name(rc),
+                jvm_rc_name(rc2),
+                memory_profile()
+            ));
+        }
+        eprintln!(
+            "[quartz] 最小参数集重试成功 —— 全参数集存在该 JVM 构建不接受的项（首次 rc={rc}，{}）",
+            jvm_rc_name(rc)
+        );
     }
     eprintln!("[quartz] :game 进程内 JVM 创建成功（OpenJDK 17，与 ART 并存）");
     // JVM 初始化会覆盖 SIGABRT 处理器（HotSpot 崩溃报告用）：重装拦截 ——
