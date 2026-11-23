@@ -1,7 +1,7 @@
 [package]
 name = "quartz-shell-tauri"
 description = "Quartz 桌面/移动 Tauri 2 壳层（方案 A：系统 WebView UI + Rust 核心直调）"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 license = "GPL-3.0-or-later"
 

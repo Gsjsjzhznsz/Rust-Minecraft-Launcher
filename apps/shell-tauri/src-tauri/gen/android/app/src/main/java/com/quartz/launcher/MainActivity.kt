@@ -2,6 +2,7 @@ package com.quartz.launcher
 
 import android.Manifest
 import android.content.Intent
+import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
@@ -27,6 +28,25 @@ class MainActivity : TauriActivity() {
     @JvmStatic
     fun requestStorageAccessStatic() {
       instance?.requestStorageAccess()
+    }
+
+    /**
+     * Rust 侧经 JNI 调用的方向切换入口：进游戏切横屏，游戏退出切回竖屏。
+     * 与权限申请同链路 —— ndk-context 提供给 Rust 的是 Application 对象，
+     * 其上不存在实例方法，必须经类静态方法转发到当前 Activity。
+     * runOnUiThread：requestedOrientation 只能在主线程改；切方向不重建
+     * Activity（Manifest 已声明 configChanges 含 orientation|screenSize）。
+     */
+    @JvmStatic
+    fun setGameOrientationStatic(landscape: Boolean) {
+      val act = instance ?: return
+      act.runOnUiThread {
+        act.requestedOrientation = if (landscape) {
+          ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+        } else {
+          ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+        }
+      }
     }
   }
 

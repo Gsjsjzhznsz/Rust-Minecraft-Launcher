@@ -25,7 +25,11 @@
             android:launchMode="singleTask"
             android:label="@string/main_activity_title"
             android:name=".MainActivity"
-            android:exported="true">
+            android:exported="true"
+            android:screenOrientation="portrait">
+            <!-- 启动器 UI 固定竖屏（启动器界面为竖屏设计）；configChanges 含
+                 orientation/screenSize：进游戏切横屏时不重建 Activity（WebView 状态不丢）。
+                 横屏切换经 MainActivity 伴生对象静态方法（Rust JNI 调用）实现 -->
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />

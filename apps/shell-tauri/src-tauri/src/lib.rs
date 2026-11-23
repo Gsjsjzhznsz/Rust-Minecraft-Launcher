@@ -264,6 +264,47 @@ fn request_storage_permission() -> Result<bool, String> {
     }
 }
 
+/// Android 方向切换：进入游戏 → 横屏，游戏退出 → 竖屏。
+/// 与权限申请同链路（MainActivity 伴生对象静态方法转发到当前 Activity 实例；
+/// ndk-context 的 context 是 Application，其上无实例方法）。失败静默：
+/// 方向切换绝不阻塞/中止游戏启动。
+#[cfg(target_os = "android")]
+fn android_set_orientation(landscape: bool) {
+    let ok = with_jni(|env, ctx| {
+        use jni::objects::{JClass, JValue};
+        let loader = env
+            .call_method(ctx, "getClassLoader", "()Ljava/lang/ClassLoader;", &[])
+            .ok()?
+            .l()
+            .ok()?;
+        let name = env
+            .new_string("com.quartz.launcher.MainActivity")
+            .ok()?;
+        let cls_obj = env
+            .call_method(
+                &loader,
+                "loadClass",
+                "(Ljava/lang/String;)Ljava/lang/Class;",
+                &[JValue::Object(&name.into())],
+            )
+            .ok()?
+            .l()
+            .ok()?;
+        let cls = JClass::from(cls_obj);
+        env.call_static_method(
+            &cls,
+            "setGameOrientationStatic",
+            "(Z)V",
+            &[JValue::Bool(u8::from(landscape))],
+        )
+        .ok()?;
+        Some(())
+    });
+    if ok.is_none() {
+        eprintln!("[quartz] 方向切换 JNI 调用失败（忽略，不影响启动）");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Android 存储解析（error13 / os error 13 = EACCES 根因修复 + 权限分级）
 // ---------------------------------------------------------------------------
@@ -1641,9 +1682,18 @@ fn spawn_game(
         }
     }
 
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("游戏进程启动失败：{e}"))?;
+    // 进入游戏自动切横屏（游戏退出时在退出看护线程切回竖屏）。
+    // 放在全部前置就绪之后：JVM/渲染层/LWJGL 任一失败都不切方向，用户仍处竖屏 UI。
+    #[cfg(target_os = "android")]
+    android_set_orientation(true);
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            #[cfg(target_os = "android")]
+            android_set_orientation(false);
+            return Err(format!("游戏进程启动失败：{e}"));
+        }
+    };
     let pid = child.id();
     if let Ok(mut slot) = game_pid.lock() {
         *slot = Some(pid);
@@ -1679,6 +1729,9 @@ fn spawn_game(
     let game_pid_exit = game_pid;
     std::thread::spawn(move || {
         let code = child.wait().map(|st| exit_status_code(&st)).unwrap_or(-1);
+        // 游戏已退出：立即切回竖屏（启动器 UI 恢复竖屏布局）。
+        #[cfg(target_os = "android")]
+        android_set_orientation(false);
         if let Ok(mut slot) = game_pid_exit.lock() {
             // stop_game 已 take 时这里已是 None，避免覆盖后续新进程
             if slot.is_some() {
