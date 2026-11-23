@@ -1,21 +1,35 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- Android 10- 旧存储模型（targetSdk 28）：运行时弹窗授权后获得
+         /storage/emulated/0 完整读写；弹窗由 MainActivity.requestStorageAccess 触发 -->
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
+    <!-- Android 11+「所有文件访问」（完整文件权限主通道）：
+         经系统设置页授权（授权不杀进程；存储权限弹窗在 11+ 上会杀进程刷新
+         FUSE 挂载视图，表现为授权后闪退），MainActivity 按系统版本分流 -->
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
 
     <!-- AndroidTV support -->
     <uses-feature android:name="android.software.leanback" android:required="false" />
 
     <application
+        android:name=".QuartzApp"
         android:icon="@mipmap/ic_launcher"
         android:label="@string/app_name"
         android:theme="@style/Theme.quartz_shell_tauri"
+        android:requestLegacyExternalStorage="true"
         android:usesCleartextTraffic="${usesCleartextTraffic}">
         <activity
             android:configChanges="orientation|keyboardHidden|keyboard|screenSize|locale|smallestScreenSize|screenLayout|uiMode"
             android:launchMode="singleTask"
             android:label="@string/main_activity_title"
             android:name=".MainActivity"
-            android:exported="true">
+            android:exported="true"
+            android:screenOrientation="portrait">
+            <!-- 启动器 UI 固定竖屏（启动器界面为竖屏设计）；configChanges 含
+                 orientation/screenSize：进游戏切横屏时不重建 Activity（WebView 状态不丢）。
+                 横屏切换经 MainActivity 伴生对象静态方法（Rust JNI 调用）实现 -->
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
@@ -23,6 +37,14 @@
                 <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- 游戏运行进程（v0.1.7 崩溃隔离）：OpenJDK JVM + quartz-bridge 全部在
+             :game 进程内运行，游戏崩溃（SIGSEGV/SIGABRT/System.exit）只终止该
+             进程；主进程经 ServiceConnection binder death 回调恢复启动器 UI。 -->
+        <service
+            android:name=".GameService"
+            android:exported="false"
+            android:process=":game" />
 
         <provider
           android:name="androidx.core.content.FileProvider"
