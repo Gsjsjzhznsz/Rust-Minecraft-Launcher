@@ -169,3 +169,44 @@ GitHub 直连极易握手超时/传输重置。v6 新增 `crates/quartz-core/src
 - 环境备注：构建 JDK 已落 .toolchain/jdk-21.0.13.1+2（Temurin 完整版，
   含 javac）；setup-env.sh 自动在 .toolchain 与 /usr/lib/jvm 间回退。
   UI 依赖位置 apps/shell-tauri/ui（src-tauri/ui 为符号链接，回收后需重建）。
+
+## v0.1.5 —— 游戏显示接入（Rust 重构 Pojav C 桥）+ 竖屏 UI 修复
+
+### 游戏 255 退出根因（jar↔so 版本错位）
+- gladiolus 发布 APK 内的 `libpojavexec.so`（旧 C 桥）JNI_OnLoad 会
+  RegisterNatives 注册 `nativeSetUseInputStackQueue`，而同包内
+  `lwjgl-glfw-classes.jar` 的 CallbackBridge 根本没有该方法
+  → RegisterNatives NoSuchMethodError → 游戏退出码 255。
+- 处置：**完全弃用 Pojav C 桥**。新增 `crates/quartz-bridge`
+  （Rust cdylib，约 1200 行）以同名 `libpojavexec.so` 落位覆盖，
+  接口契约以 jar 字节码为准（javap 逐方法核对）：
+  - `GLFW$Functions` 函数表 11 符号（pojavInit/CreateContext/MakeCurrent/
+    SwapBuffers/PumpEvents/Start|StopPumping/...）；
+  - CallbackBridge 4 个 native（nativeSendData/nativeSetInputReady/
+    nativeClipboard/nativeSetGrabbing）+ GLFW 全部 native 方法；
+  - 不做任何 RegisterNatives；JNI_OnLoad 只缓存 GLFW 类与按键缓冲地址。
+
+### 显示链路（进程内 JVM，Pojav 同架构、纯 Rust 实现）
+1. 壳层 SurfaceView（横屏）→ ANativeWindow_fromSurface 交桥；
+2. 壳层 dlopen JRE 的 libjvm.so → JNI_CreateJavaVM（与 ART 并存）；
+3. EGL 上下文经渲染层自带 EGL（POJAVEXEC_EGL=libmobileglues.so，
+   LIBGL_ES=3）；桌面 GL 语义由 LWJGL 函数指针绑定 MobileGlues；
+4. 输入：Kotlin SurfaceView/虚拟按键 → QuartzBridge(ART) → 桥 C ABI
+   → 事件队列 → 渲染线程 PumpEvents → LWJGL 回调。
+- 新文件：crates/quartz-bridge、src/game_bridge.rs、
+  Kotlin QuartzBridge/GameView/GameControls。
+- 退出语义：main 返回=优雅恢复；MC 崩溃 System.exit=进程终止（JRE 无
+  exit 补丁），日志已落盘；再次启动自动重启应用重置 JVM（单进程单 JVM）。
+
+### 竖屏 UI 修复
+- 根因：`.app-shell` 固定 `flex-direction: row`，窄屏时顶栏被挤成左侧
+  竖列（文字竖排）。修复：窄屏 column、宽屏(≥880px) row；
+- 缩放：viewport `user-scalable=no, maximum-scale=1` + WebView settings
+  禁 zoom（MainActivity 轮询配置）。
+
+### 交付
+- Quartz.apk 28,263,519 字节；签名证书与 v5/v6 相同（63860a42…783，
+  覆盖安装免卸载）；930 条目、so STORED、5 个 META-INF/services 保留；
+  桥 so（411KB，strip 后）以 include_bytes 内嵌于壳层 lib。
+- 工具链：quartz-bridge 经 cargo release 构建（NDK r27 linker），脚本
+  scripts/build-android.sh 已并入两阶段构建。

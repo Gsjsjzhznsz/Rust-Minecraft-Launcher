@@ -1,0 +1,19 @@
+[package]
+name = "quartz-bridge"
+description = "Quartz 游戏显示桥（Rust 重构 Pojav C 桥）：GLFW 函数表 + 输入事件队列 + EGL/ANativeWindow 接线"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+
+[lib]
+name = "quartz_bridge"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# 仅类型/ABI 定义（raw JNI 表），无运行时逻辑依赖
+jni-sys = { version = "0.3", optional = true }
+libc = { version = "0.2", optional = true }
+
+[features]
+default = ["bridge"]
+bridge = ["jni-sys", "libc"]

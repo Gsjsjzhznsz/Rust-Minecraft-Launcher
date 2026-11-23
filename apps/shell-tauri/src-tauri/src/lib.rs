@@ -35,6 +35,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, State};
 
+#[cfg(target_os = "android")]
+mod game_bridge;
+
 /// 下载并发互斥：同一时刻只允许一个下载任务。
 #[derive(Default)]
 pub struct AppState {
@@ -268,6 +271,8 @@ fn request_storage_permission() -> Result<bool, String> {
 /// 与权限申请同链路（MainActivity 伴生对象静态方法转发到当前 Activity 实例；
 /// ndk-context 的 context 是 Application，其上无实例方法）。失败静默：
 /// 方向切换绝不阻塞/中止游戏启动。
+/// v0.1.5：主链路改由 showGameSurfaceStatic/hideGameSurfaceStatic 承担，保留备用。
+#[cfg_attr(target_os = "android", allow(dead_code))]
 #[cfg(target_os = "android")]
 fn android_set_orientation(landscape: bool) {
     let ok = with_jni(|env, ctx| {
@@ -1354,9 +1359,8 @@ fn ensure_tagfix_lib() -> Option<PathBuf> {
 }
 
 /// 拉起 JVM 子进程并托管日志/退出（`launch://log` / `launch://exit` 事件）。
-///
-/// 前置：JVM pack 已安装（Android 内部目录，targetSdk 28 允许 exec）。
-/// smoke test 先跑 `java -version` 把 JRE 版本写进控制台，失败时给出明确报错。
+/// v0.1.5 起仅桌面端使用；Android 走 game_bridge::launch_in_process。
+#[cfg_attr(target_os = "android", allow(dead_code))]
 fn spawn_game(
     version_id: String,
     plan: jvmops::LaunchPlan,
@@ -1804,6 +1808,7 @@ fn spawn_game(
 }
 
 /// ExitStatus -> 退出码：正常退出取 code()；信号死亡取 128+signal。
+#[cfg_attr(target_os = "android", allow(dead_code))]
 fn exit_status_code(st: &std::process::ExitStatus) -> i32 {
     #[cfg(unix)]
     {
@@ -1823,6 +1828,9 @@ fn exit_status_code(st: &std::process::ExitStatus) -> i32 {
 /// bionic 的 abort 不写 stderr、JVM 不写 hs_err，唯一记录在 logd：
 /// crash 缓冲（Fatal signal / Abort message）与 main 缓冲（同 uid 可读）。
 /// 另附运行时组件清单，验证 pack 落位与 so 齐全。
+/// （v0.1.5 起仅桌面子进程路径使用；Android 进程内模式崩溃即进程死亡，
+/// 证据由启动日志 + QuartzApp 崩溃落盘承接。）
+#[cfg_attr(target_os = "android", allow(dead_code))]
 #[cfg(target_os = "android")]
 fn dump_crash_evidence(
     pid: Option<u32>,
@@ -1983,11 +1991,22 @@ fn ensure_renderer(app: &AppHandle) -> Result<(), String> {
     Ok(())
 }
 
-/// 真实启动：版本 JSON -> LaunchPlan -> JVM 子进程（M0 已接入）。
-/// JVM pack 缺失时返回 `RUNTIME_MISSING:<major>`，UI 自动触发运行时下载。
+/// 真实启动：版本 JSON -> LaunchPlan -> 游戏运行（M0 已接入）。
+/// Android：进程内 JVM + 显示桥（SurfaceView + EGL，v0.1.5 游戏显示接入）；
+/// 桌面：JVM 子进程。JVM pack 缺失时返回 `RUNTIME_MISSING:<major>`，UI 自动触发下载。
 #[tauri::command]
 fn launch_game(version_id: String, app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
-    if state.game_pid.lock().map_err(|_| "内部状态锁异常")?.is_some() {
+    let running = {
+        #[cfg(target_os = "android")]
+        {
+            crate::game_bridge::game_running()
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            state.game_pid.lock().map_err(|_| "内部状态锁异常")?.is_some()
+        }
+    };
+    if running {
         return Err("已有游戏进程在运行，请先停止后再启动".to_string());
     }
     let (_version, plan, major) = build_plan_for(&version_id)?;
@@ -1998,30 +2017,112 @@ fn launch_game(version_id: String, app: AppHandle, state: State<'_, AppState>) -
     {
         ensure_lwjgl_pack(&app)?;
         ensure_renderer(&app)?;
+        // 显示桥落位：覆盖 Pojav APK 提取的旧 C 版 pojavexec（jar↔so 错位根因），
+        // 再 dlopen 注入 ART 侧。
+        let _ = &state;
+        game_bridge::ensure_bridge_lib()?;
+        game_bridge::ensure_bridge_loaded()?;
+        // tagged-pointer 兼容层落盘（进程内 dlopen 用，Android 12+ GC SIGABRT 修复）
+        if ensure_tagfix_lib().is_none() {
+            eprintln!("[quartz] tagfix 落盘失败（Android 12+ 可能 GC abort）");
+        }
     }
     std::fs::create_dir_all(&plan.working_dir).ok();
     std::fs::create_dir_all(&plan.natives_dir).ok();
-    spawn_game(version_id.clone(), plan, major, state.game_pid.clone(), app.clone())?;
-    Ok(())
+
+    #[cfg(target_os = "android")]
+    {
+        // 同进程内 JVM 只能创建一次：上次游戏退出后再次启动 -> 自动重启应用重置。
+        if game_bridge::jvm_spent() {
+            let _ = app.emit(
+                "launch://log",
+                &LaunchLog {
+                    source: "quartz".into(),
+                    line: "[quartz] 同一应用进程内 JVM 无法二次创建，自动重启应用（重新打开后再次点启动即可）".into(),
+                },
+            );
+            game_bridge::restart_app();
+            return Ok(());
+        }
+        // 持久化启动日志（进程内路径）
+        let logs_dir = paths::game_root().join("logs");
+        let _ = std::fs::create_dir_all(&logs_dir);
+        let log_path = logs_dir.join(format!(
+            "launch-{}.log",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0)
+        ));
+        let log_file: Arc<Mutex<Option<std::fs::File>>> =
+            Arc::new(Mutex::new(std::fs::File::create(&log_path).ok()));
+        if let Ok(mut guard) = log_file.lock() {
+            if let Some(f) = guard.as_mut() {
+                use std::io::Write;
+                let _ = writeln!(f, "==== Quartz launch {version_id} (java {major}, in-process) ====");
+                let _ = writeln!(f, "mode: in-process JVM + quartz-bridge (Rust display bridge)");
+                let _ = writeln!(f, "main_class: {}", plan.main_class);
+                let _ = writeln!(f, "---- jvm options ({} 个) ----", plan.jvm_args.len());
+                for a in &plan.jvm_args {
+                    let _ = writeln!(f, "  {a}");
+                }
+                let _ = writeln!(f, "---- game args ({} 个) ----", plan.game_args.len());
+                for a in &plan.game_args {
+                    let _ = writeln!(f, "  {a}");
+                }
+                let _ = f.flush();
+            }
+        }
+        let _ = app.emit(
+            "launch://log",
+            &LaunchLog {
+                source: "quartz".into(),
+                line: format!("[quartz] 启动模式：进程内 JVM + Rust 显示桥（{version_id}）"),
+            },
+        );
+        game_bridge::launch_in_process(version_id.clone(), plan, major, app.clone(), log_file)?;
+        return Ok(());
+    }
+
+    #[cfg(not(target_os = "android"))]
+    {
+        spawn_game(version_id.clone(), plan, major, state.game_pid.clone(), app.clone())?;
+        Ok(())
+    }
 }
 
-/// 终止运行中的游戏进程（SIGKILL）。
+/// 终止运行中的游戏。
+/// Android（进程内 JVM）：System.exit 结束应用进程（日志已落盘，应用重启取证）；
+/// 桌面：SIGKILL 游戏子进程。
 #[tauri::command]
-fn stop_game(state: State<'_, AppState>) -> Result<bool, String> {
-    let pid = state
-        .game_pid
-        .lock()
-        .map_err(|_| "内部状态锁异常")?
-        .take();
-    match pid {
-        Some(pid) => {
-            #[cfg(unix)]
-            unsafe {
-                libc::kill(pid as libc::pid_t, libc::SIGKILL);
-            }
-            Ok(true)
+fn stop_game(state: State<'_, AppState>, app: AppHandle) -> Result<bool, String> {
+    #[cfg(target_os = "android")]
+    {
+        let _ = &state;
+        if crate::game_bridge::game_running() {
+            crate::game_bridge::stop_in_process(&app);
+            return Ok(true);
         }
-        None => Ok(false),
+        return Ok(false);
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = &app;
+        let pid = state
+            .game_pid
+            .lock()
+            .map_err(|_| "内部状态锁异常")?
+            .take();
+        match pid {
+            Some(pid) => {
+                #[cfg(unix)]
+                unsafe {
+                    libc::kill(pid as libc::pid_t, libc::SIGKILL);
+                }
+                Ok(true)
+            }
+            None => Ok(false),
+        }
     }
 }
 

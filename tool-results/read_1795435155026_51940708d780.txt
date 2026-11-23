@@ -1,0 +1,1102 @@
+     1→     1→//! Quartz Tauri 壳层。
+     2→     2→//!
+     3→     3→//! 架构契约（方案 A）：UI（WebView/JS）只调用本文件注册的 command；
+     4→     4→//! command 是 quartz-core 能力的薄封装，不含业务逻辑。
+     5→     5→//!
+     6→     6→//! 命令契约（v3 蓝图 + M0 启动接入）：
+     7→     7→//! - `offline_login(name)`        离线登录：MD5("OfflinePlayer:"+name) -> accounts.json
+     8→     8→//! - `get_account()`              当前选中账号
+     9→     9→//! - `list_accounts()`            全部账号 + 选中标记
+    10→    10→//! - `select_account(uuid)`       切换选中账号
+    11→    11→//! - `remove_account(uuid)`       删除账号
+    12→    12→//! - `list_versions()`            真实 manifest 版本列表（release 优先）
+    13→    13→//! - `list_installed_versions()`  本地 versions/ 已安装版本
+    14→    14→//! - `download_game(version_id)`  后台 spawn 完整下载管线，
+    15→    15→//!                                经 `download://progress` 事件上报 {stage,current,total,percent,file}
+    16→    16→//! - `get_game_dir()`             标准游戏根目录绝对路径（UI 常显）
+    17→    17→//! - `get_env_info()`             存储诊断：根目录 + 可写性 + 存储模式 + 完整文件权限
+    18→    18→//! - `get_permission_state()`     存储权限状态 {granted}
+    19→    19→//! - `request_storage_permission()` 触发系统权限弹窗（授权后经 focus/visibility 重检）
+    20→    20→//! - `reinit_storage()`           权限变化后重解析存储根 + 后台迁移旧数据
+    21→    21→//!                                （`quartz://migrate` 事件上报迁移进度）
+    22→    22→//! - `launch_preflight(version_id)` 启动前自检（版本/账号/Java 运行时）
+    23→    23→//! - `get_runtime_status(java_major)` JVM pack 状态（installed/version/path）
+    24→    24→//! - `download_runtime(java_major)` 下载 JVM 运行时 pack（`runtime://progress` 事件）
+    25→    25→//! - `launch_game(version_id)`    M0 已接入：JRE pack + LaunchPlan 子进程启动，
+    26→    26→//!                                `launch://log` / `launch://exit` 事件实时上报
+    27→    27→//! - `stop_game()`                终止游戏进程（SIGKILL）
+    28→    28→
+    29→    29→use quartz_core::instance::DownloadProgress;
+    30→    30→use quartz_core::renderbus::{self, DeviceCaps};
+    31→    31→use quartz_core::{auth, host_arch, instance, jvmops, lwjgl, meta, model, paths, platform, renderers, rules, runtime, RuntimeCtx};
+    32→    32→use serde::Serialize;
+    33→    33→use serde_json::json;
+    34→    34→use std::path::{Path, PathBuf};
+    35→    35→use std::sync::{Arc, Mutex};
+    36→    36→use tauri::{AppHandle, Emitter, State};
+    37→    37→
+    38→    38→/// 下载并发互斥：同一时刻只允许一个下载任务。
+    39→    39→#[derive(Default)]
+    40→    40→pub struct AppState {
+    41→    41→    downloading: Arc<std::sync::Mutex<bool>>,
+    42→    42→    /// 运行时 pack 下载互斥。
+    43→    43→    runtime_busy: Arc<std::sync::atomic::AtomicBool>,
+    44→    44→    /// 渲染层 pack 下载互斥。
+    45→    45→    renderer_busy: Arc<std::sync::atomic::AtomicBool>,
+    46→    46→    /// LWJGL pack 下载互斥。
+    47→    47→    lwjgl_busy: Arc<std::sync::atomic::AtomicBool>,
+    48→    48→    /// 运行中的游戏进程 pid（None = 空闲）。
+    49→    49→    game_pid: Arc<Mutex<Option<u32>>>,
+    50→    50→}
+    51→    51→
+    52→    52→// ---------------------------------------------------------------------------
+    53→    53→// Android JNI 基础（存储解析 / 权限检测共用）
+    54→    54→// ---------------------------------------------------------------------------
+    55→    55→
+    56→    56→#[cfg(target_os = "android")]
+    57→    57→fn with_jni<T>(
+    58→    58→    f: impl FnOnce(&mut jni::JNIEnv, &jni::objects::JObject) -> Option<T>,
+    59→    59→) -> Option<T> {
+    60→    60→    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    61→    61→        let ctx = ndk_context::android_context();
+    62→    62→        let vm = unsafe { jni::JavaVM::from_raw(ctx.vm().cast()) }.ok()?;
+    63→    63→        let mut env = vm.attach_current_thread().ok()?;
+    64→    64→        let context = unsafe { jni::objects::JObject::from_raw(ctx.context().cast()) };
+    65→    65→        // 防御：清掉上游遗留的挂起异常。JNIEnv 按线程复用，任何未清理的异常都会让
+    66→    66→        // 本闭包内的下一个 JNI 调用（甚至 Tauri 内部调用）在 CheckJNI 下直接 abort。
+    67→    67→        if env.exception_check().unwrap_or(false) {
+    68→    68→            let _ = env.exception_clear();
+    69→    69→        }
+    70→    70→        let result = f(&mut env, &context);
+    71→    71→        // 关键：闭包内任何 JNI Err（如 NoSuchMethodError）都会把异常留在挂起态，
+    72→    72→        // 若不清掉，下一次 NewStringUTF 等调用即触发
+    73→    73→        // "JNI NewStringUTF called with pending exception" abort 闪退。
+    74→    74→        if env.exception_check().unwrap_or(false) {
+    75→    75→            let _ = env.exception_clear();
+    76→    76→        }
+    77→    77→        result
+    78→    78→    }))
+    79→    79→    .ok()
+    80→    80→    .flatten()
+    81→    81→}
+    82→    82→
+    83→    83→#[cfg(target_os = "android")]
+    84→    84→fn jni_file_path(env: &mut jni::JNIEnv, file: &jni::objects::JObject) -> Option<PathBuf> {
+    85→    85→    let path = env
+    86→    86→        .call_method(file, "getAbsolutePath", "()Ljava/lang/String;", &[])
+    87→    87→        .ok()?
+    88→    88→        .l()
+    89→    89→        .ok()?;
+    90→    90→    let s: String = env.get_string((&path).into()).ok()?.into();
+    91→    91→    if s.is_empty() {
+    92→    92→        None
+    93→    93→    } else {
+    94→    94→        Some(PathBuf::from(s))
+    95→    95→    }
+    96→    96→}
+    97→    97→
+    98→    98→#[cfg(target_os = "android")]
+    99→    99→fn jni_external_files_dir(env: &mut jni::JNIEnv, context: &jni::objects::JObject) -> Option<PathBuf> {
+   100→   100→    use jni::objects::JValue;
+   101→   101→    let file = env
+   102→   102→        .call_method(
+   103→   103→            context,
+   104→   104→            "getExternalFilesDir",
+   105→   105→            "(Ljava/lang/String;)Ljava/io/File;",
+   106→   106→            &[JValue::Object(&jni::objects::JObject::null())],
+   107→   107→        )
+   108→   108→        .ok()?
+   109→   109→        .l()
+   110→   110→        .ok()?;
+   111→   111→    if file.is_null() {
+   112→   112→        return None;
+   113→   113→    }
+   114→   114→    jni_file_path(env, &file)
+   115→   115→}
+   116→   116→
+   117→   117→#[cfg(target_os = "android")]
+   118→   118→fn jni_internal_files_dir(env: &mut jni::JNIEnv, context: &jni::objects::JObject) -> Option<PathBuf> {
+   119→   119→    let file = env
+   120→   120→        .call_method(context, "getFilesDir", "()Ljava/io/File;", &[])
+   121→   121→        .ok()?
+   122→   122→        .l()
+   123→   123→        .ok()?;
+   124→   124→    if file.is_null() {
+   125→   125→        return None;
+   126→   126→    }
+   127→   127→    jni_file_path(env, &file)
+   128→   128→}
+   129→   129→
+   130→   130→// ---------------------------------------------------------------------------
+   131→   131→// 存储权限（完整文件权限）
+   132→   132→// ---------------------------------------------------------------------------
+   133→   133→//
+   134→   134→// 设计：APK 固定 targetSdk 28（Android 10 前的存储模型 + 允许 exec() 应用目录
+   135→   135→// 内的 JVM —— Pojav/Termux 同款方案）。
+   136→   136→//
+   137→   137→// 授权通道按系统版本分流（MainActivity.requestStorageAccess）:
+   138→   138→// - Android 11+（API 30+）：MANAGE_EXTERNAL_STORAGE「所有文件访问」系统设置页。
+   139→   139→//   不走 WRITE 弹窗的原因：targetSdk<=29 应用在 Android 11+ 经弹窗授予存储权限时，
+   140→   140→//   系统会杀掉应用进程刷新 FUSE 挂载视图 —— 用户视角即「授权后闪退」。
+   141→   141→//   所有文件访问页授权不杀进程，返回后 focus 重检即可切换标准目录。
+   142→   142→// - Android 10 及以下（API <= 29）：READ/WRITE_EXTERNAL_STORAGE 运行时弹窗
+   143→   143→//   （旧存储模型，授权即时生效不杀进程）。
+   144→   144→// 游戏文件即可放在文件管理器可见的标准目录 /storage/emulated/0/Quartz/files。
+   145→   145→
+   146→   146→/// Android 端存储权限是否已授权（纯系统 API，不依赖 Activity 实例）。
+   147→   147→///
+   148→   148→/// 注意：ndk-context 给到的 context 是 **Application** 对象（不是 MainActivity），
+   149→   149→/// 其上不存在任何自定义方法 —— 在它上面 GetMethodID("isStorageAccessGranted")
+   150→   150→/// 必抛 NoSuchMethodError。故全部改用静态方法 / Context 自有方法：
+   151→   151→/// - Android 11+（API 30+）：静态 Environment.isExternalStorageManager()
+   152→   152→///   （MANAGE_EXTERNAL_STORAGE「所有文件访问」）
+   153→   153→/// - Android 10 及以下：Context.checkSelfPermission(WRITE_EXTERNAL_STORAGE)
+   154→   154→///   （targetSdk 28 旧存储模型，Application 即 Context，可直接调）
+   155→   155→#[cfg(target_os = "android")]
+   156→   156→fn android_storage_permission_granted() -> bool {
+   157→   157→    use jni::objects::JValue;
+   158→   158→    with_jni(|env, ctx| {
+   159→   159→        let sdk = env
+   160→   160→            .get_static_field("android/os/Build$VERSION", "SDK_INT", "I")
+   161→   161→            .ok()?
+   162→   162→            .i()
+   163→   163→            .ok()?;
+   164→   164→        if sdk >= 30 {
+   165→   165→            let granted = env
+   166→   166→                .call_static_method(
+   167→   167→                    "android/os/Environment",
+   168→   168→                    "isExternalStorageManager",
+   169→   169→                    "()Z",
+   170→   170→                    &[],
+   171→   171→                )
+   172→   172→                .ok()?
+   173→   173→                .z()
+   174→   174→                .ok()?;
+   175→   175→            Some(granted)
+   176→   176→        } else {
+   177→   177→            let perm = env
+   178→   178→                .new_string("android.permission.WRITE_EXTERNAL_STORAGE")
+   179→   179→                .ok()?;
+   180→   180→            let granted = env
+   181→   181→                .call_method(
+   182→   182→                    ctx,
+   183→   183→                    "checkSelfPermission",
+   184→   184→                    "(Ljava/lang/String;)I",
+   185→   185→                    &[JValue::Object(&perm.into())],
+   186→   186→                )
+   187→   187→                .ok()?
+   188→   188→                .i()
+   189→   189→                .ok()?;
+   190→   190→            // PackageManager.PERMISSION_GRANTED == 0
+   191→   191→            Some(granted == 0)
+   192→   192→        }
+   193→   193→    })
+   194→   194→    .unwrap_or(false)
+   195→   195→}
+   196→   196→
+   197→   197→/// 存储权限是否已授权（桌面端恒真）。
+   198→   198→fn storage_permission_granted() -> bool {
+   199→   199→    #[cfg(target_os = "android")]
+   200→   200→    {
+   201→   201→        android_storage_permission_granted()
+   202→   202→    }
+   203→   203→    #[cfg(not(target_os = "android"))]
+   204→   204→    {
+   205→   205→        true
+   206→   206→    }
+   207→   207→}
+   208→   208→
+   209→   209→/// 权限状态查询。
+   210→   210→#[tauri::command]
+   211→   211→fn get_permission_state() -> serde_json::Value {
+   212→   212→    json!({ "granted": storage_permission_granted() })
+   213→   213→}
+   214→   214→
+   215→   215→/// 申请完整文件权限：Android 11+ 跳系统「所有文件访问」设置页（授权不杀进程），
+   216→   216→/// Android 10- 触发运行时弹窗。结果不通过本命令返回：UI 在 focus/visibilitychange
+   217→   217→/// 时重新查询状态（回到应用后自动重检）。
+   218→   218→#[tauri::command]
+   219→   219→fn request_storage_permission() -> Result<bool, String> {
+   220→   220→    #[cfg(target_os = "android")]
+   221→   221→    {
+   222→   222→        // MainActivity 伴生对象静态方法（GetStaticMethodID，不依赖接收对象类型）：
+   223→   223→        // 内部持有当前 Activity 实例，按系统版本分流（11+「所有文件访问」设置页 /
+   224→   224→        // 10- 运行时弹窗）。此前直接在 ndk-context 的 Application 对象上调实例方法
+   225→   225→        // requestStorageAccess —— 其上查无此方法，NoSuchMethodError 未清理即 abort。
+   226→   226→        let via_kotlin = with_jni(|env, ctx| {
+   227→   227→            use jni::objects::JClass;
+   228→   228→            use jni::objects::JValue;
+   229→   229→            // 注意：FindClass 在 AttachCurrentThread 的原生线程上走系统类加载器，
+   230→   230→            // 解析不到 APK 内的应用类；必须经 context.getClassLoader().loadClass()
+   231→   231→            // 显式解析壳层 MainActivity（Application 即 Context，链路稳定）。
+   232→   232→            let loader = env
+   233→   233→                .call_method(ctx, "getClassLoader", "()Ljava/lang/ClassLoader;", &[])
+   234→   234→                .ok()?
+   235→   235→                .l()
+   236→   236→                .ok()?;
+   237→   237→            let name = env
+   238→   238→                .new_string("com.quartz.launcher.MainActivity")
+   239→   239→                .ok()?;
+   240→   240→            let cls_obj = env
+   241→   241→                .call_method(
+   242→   242→                    &loader,
+   243→   243→                    "loadClass",
+   244→   244→                    "(Ljava/lang/String;)Ljava/lang/Class;",
+   245→   245→                    &[JValue::Object(&name.into())],
+   246→   246→                )
+   247→   247→                .ok()?
+   248→   248→                .l()
+   249→   249→                .ok()?;
+   250→   250→            let cls = JClass::from(cls_obj);
+   251→   251→            env.call_static_method(&cls, "requestStorageAccessStatic", "()V", &[])
+   252→   252→                .ok()?;
+   253→   253→            Some(())
+   254→   254→        });
+   255→   255→        if via_kotlin.is_some() {
+   256→   256→            return Ok(true);
+   257→   257→        }
+   258→   258→        // 到这里说明 JNI 链路本身异常（with_jni 已清异常）；给用户明确的手动指引。
+   259→   259→        Err("无法唤起系统权限界面。请手动授予：系统设置 → 应用 → Quartz → 权限 → 所有文件访问权限".to_string())
+   260→   260→    }
+   261→   261→    #[cfg(not(target_os = "android"))]
+   262→   262→    {
+   263→   263→        Ok(true)
+   264→   264→    }
+   265→   265→}
+   266→   266→
+   267→   267→/// Android 方向切换：进入游戏 → 横屏，游戏退出 → 竖屏。
+   268→   268→/// 与权限申请同链路（MainActivity 伴生对象静态方法转发到当前 Activity 实例；
+   269→   269→/// ndk-context 的 context 是 Application，其上无实例方法）。失败静默：
+   270→   270→/// 方向切换绝不阻塞/中止游戏启动。
+   271→   271→#[cfg(target_os = "android")]
+   272→   272→fn android_set_orientation(landscape: bool) {
+   273→   273→    let ok = with_jni(|env, ctx| {
+   274→   274→        use jni::objects::{JClass, JValue};
+   275→   275→        let loader = env
+   276→   276→            .call_method(ctx, "getClassLoader", "()Ljava/lang/ClassLoader;", &[])
+   277→   277→            .ok()?
+   278→   278→            .l()
+   279→   279→            .ok()?;
+   280→   280→        let name = env
+   281→   281→            .new_string("com.quartz.launcher.MainActivity")
+   282→   282→            .ok()?;
+   283→   283→        let cls_obj = env
+   284→   284→            .call_method(
+   285→   285→                &loader,
+   286→   286→                "loadClass",
+   287→   287→                "(Ljava/lang/String;)Ljava/lang/Class;",
+   288→   288→                &[JValue::Object(&name.into())],
+   289→   289→            )
+   290→   290→            .ok()?
+   291→   291→            .l()
+   292→   292→            .ok()?;
+   293→   293→        let cls = JClass::from(cls_obj);
+   294→   294→        env.call_static_method(
+   295→   295→            &cls,
+   296→   296→            "setGameOrientationStatic",
+   297→   297→            "(Z)V",
+   298→   298→            &[JValue::Bool(u8::from(landscape))],
+   299→   299→        )
+   300→   300→        .ok()?;
+   301→   301→        Some(())
+   302→   302→    });
+   303→   303→    if ok.is_none() {
+   304→   304→        eprintln!("[quartz] 方向切换 JNI 调用失败（忽略，不影响启动）");
+   305→   305→    }
+   306→   306→}
+   307→   307→
+   308→   308→// ---------------------------------------------------------------------------
+   309→   309→// Android 存储解析（error13 / os error 13 = EACCES 根因修复 + 权限分级）
+   310→   310→// ---------------------------------------------------------------------------
+   311→   311→
+   312→   312→/// 存储诊断信息（启动时确定，UI 经 get_env_info 展示）。
+   313→   313→#[derive(Debug, Clone)]
+   314→   314→pub struct StorageDiag {
+   315→   315→    pub mode: &'static str,
+   316→   316→    pub root: PathBuf,
+   317→   317→    pub layout_ok: bool,
+   318→   318→    pub layout_error: Option<String>,
+   319→   319→}
+   320→   320→
+   321→   321→static STORAGE_DIAG: Mutex<Option<StorageDiag>> = Mutex::new(None);
+   322→   322→
+   323→   323→/// 迁移互斥：焦点/可见性事件可能连续触发多次 reinit_storage，防止并发重复拷贝。
+   324→   324→static MIGRATING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+   325→   325→
+   326→   326→/// Android 平台解析真实可写目录；ndk-context 未初始化等异常一律回退硬编码路径。
+   327→   327→///
+   328→   328→/// 优先级（与授权状态联动）：
+   329→   329→/// 1. 已授权完整文件权限 -> 公共标准目录 /storage/emulated/0/Quartz/files（可见、卸载不丢）
+   330→   330→/// 2. 应用外部私有目录（getExternalFilesDir，可浏览，卸载丢失）
+   331→   331→/// 3. 应用内部私有目录（getFilesDir，必定可写）
+   332→   332→#[cfg(target_os = "android")]
+   333→   333→fn resolve_android_root() -> (PathBuf, &'static str) {
+   334→   334→    if storage_permission_granted() {
+   335→   335→        let public = PathBuf::from("/storage/emulated/0/Quartz/files");
+   336→   336→        if std::fs::create_dir_all(&public).is_ok() {
+   337→   337→            return (public, "public");
+   338→   338→        }
+   339→   339→        eprintln!("[quartz] 公共标准目录创建失败，回退应用私有目录");
+   340→   340→    }
+   341→   341→    let result = with_jni(|env, context| {
+   342→   342→        // 外部私有目录（用户可用文件管理器查看 .minecraft）
+   343→   343→        if let Some(p) = jni_external_files_dir(env, context) {
+   344→   344→            return Some((p, "external"));
+   345→   345→        }
+   346→   346→        // 内部私有目录（必定可写）
+   347→   347→        jni_internal_files_dir(env, context).map(|p| (p, "internal"))
+   348→   348→    });
+   349→   349→    result.unwrap_or_else(|| {
+   350→   350→        (
+   351→   351→            PathBuf::from(format!(
+   352→   352→                "/storage/emulated/0/Android/data/{}/files",
+   353→   353→                paths::ANDROID_PACKAGE_ID
+   354→   354→            )),
+   355→   355→            "fallback",
+   356→   356→        )
+   357→   357→    })
+   358→   358→}
+   359→   359→
+   360→   360→/// Android 内部私有目录（Context.getFilesDir()，任何设备必定可写；exec 可用）。
+   361→   361→#[cfg(target_os = "android")]
+   362→   362→fn resolve_android_internal() -> Option<PathBuf> {
+   363→   363→    with_jni(|env, context| jni_internal_files_dir(env, context))
+   364→   364→}
+   365→   365→
+   366→   366→/// 初始化游戏根目录与 JVM pack 目录并创建标准布局；返回诊断信息。
+   367→   367→fn init_storage() -> StorageDiag {
+   368→   368→    #[cfg(target_os = "android")]
+   369→   369→    let (root, mode) = resolve_android_root();
+   370→   370→    #[cfg(not(target_os = "android"))]
+   371→   371→    let (root, mode) = (paths::game_root(), "desktop");
+   372→   372→
+   373→   373→    let _ = paths::set_runtime_root(root.clone());
+   374→   374→    let mut layout = paths::ensure_layout();
+   375→   375→
+   376→   376→    // 外部目录不可写（EACCES / os error 13）时回退内部私有目录，
+   377→   377→    // 保证离线登录与下载在任何设备上永远可用。
+   378→   378→    #[cfg(target_os = "android")]
+   379→   379→    let mut mode = mode;
+   380→   380→    #[cfg(target_os = "android")]
+   381→   381→    if layout.is_err() && mode != "internal" {
+   382→   382→        eprintln!(
+   383→   383→            "[quartz] 当前根目录不可写（{:?}），回退内部存储",
+   384→   384→            layout.as_ref().err()
+   385→   385→        );
+   386→   386→        if let Some(internal) = resolve_android_internal() {
+   387→   387→            let _ = paths::set_runtime_root(internal.clone());
+   388→   388→            layout = paths::ensure_layout();
+   389→   389→            mode = "internal";
+   390→   390→        }
+   391→   391→    }
+   392→   392→
+   393→   393→    // JVM pack 必须放在可 exec 的内部目录（FUSE noexec + targetSdk>=29 禁 exec 的约束）
+   394→   394→    #[cfg(target_os = "android")]
+   395→   395→    if let Some(internal) = resolve_android_internal() {
+   396→   396→        paths::set_runtime_jres_root(internal.join("jres"));
+   397→   397→    }
+   398→   398→
+   399→   399→    let diag = StorageDiag {
+   400→   400→        mode,
+   401→   401→        root: paths::game_root(),
+   402→   402→        layout_ok: layout.is_ok(),
+   403→   403→        layout_error: layout.err().map(|e| format!("{e}")),
+   404→   404→    };
+   405→   405→    eprintln!(
+   406→   406→        "[quartz] 存储初始化：mode={} root={} jres={}",
+   407→   407→        diag.mode,
+   408→   408→        diag.root.display(),
+   409→   409→        paths::runtime_dir().display()
+   410→   410→    );
+   411→   411→    diag
+   412→   412→}
+   413→   413→
+   414→   414→fn storage_json(diag: &StorageDiag) -> serde_json::Value {
+   415→   415→    json!({
+   416→   416→        "gameDir": diag.root.to_string_lossy(),
+   417→   417→        "storageMode": diag.mode,
+   418→   418→        "layoutOk": diag.layout_ok,
+   419→   419→        "layoutError": diag.layout_error,
+   420→   420→        "fullAccess": storage_permission_granted(),
+   421→   421→        "freeBytes": quartz_core::space::free_space(&diag.root),
+   422→   422→    })
+   423→   423→}
+   424→   424→
+   425→   425→// ---------------------------------------------------------------------------
+   426→   426→// 崩溃证据落盘 + 启动自愈（v8「一打开就闪退」加固）
+   427→   427→// ---------------------------------------------------------------------------
+   428→   428→//
+   429→   429→// 「闪退」的三类根因都在这里落证据 / 自愈：
+   430→   430→// 1. Rust panic（任意线程）：panic hook 追加标记到唯一崩溃日志，下次启动 UI 横幅
+   431→   431→//    直接展示原因 —— 不再是黑盒闪退；
+   432→   432→// 2. Java/Kotlin 未捕获异常：QuartzApp（gen/android）同一文件追加 JAVA 标记；
+   433→   433→// 3. WebView 状态损坏导致的打开即崩：QuartzApp 检测 2 分钟内 ≥2 次崩溃，
+   434→   434→//    在 WebView 创建前清理 app_webview（Chromium profile）自愈。
+   435→   435→//
+   436→   436→// 另：失败下载每次重试都留下大文件（.qz-part/.part/.staging，PoJav APK 154MB /
+   437→   437→// JRE pack 38MB），反复失败会把 userdata 分区塞满 —— FUSE 与应用私有目录同分区，
+   438→   438→// 塞满后 WebView 无法初始化即「打开就闪退」。启动时自动清理残留 + 下载前空间
+   439→   439→// 门槛（space 模块）从根上折断这个循环。
+   440→   440→
+   441→   441→/// 崩溃日志唯一权威路径（run() 最早阶段解析；panic hook 与 get_diagnostics 共用）。
+   442→   442→/// Android 用内部私有目录（必定可写，无需任何权限）。
+   443→   443→static CRASH_LOG: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+   444→   444→
+   445→   445→fn crash_log_path() -> PathBuf {
+   446→   446→    #[cfg(target_os = "android")]
+   447→   447→    {
+   448→   448→        if let Some(p) = resolve_android_internal() {
+   449→   449→            return p.join("crash").join("quartz-crash.log");
+   450→   450→        }
+   451→   451→        // JNI 不可用时的壳层回退（应用私有目录固定路径）
+   452→   452→        PathBuf::from("/data/data/com.quartz.launcher/files/crash/quartz-crash.log")
+   453→   453→    }
+   454→   454→    #[cfg(not(target_os = "android"))]
+   455→   455→    {
+   456→   456→        paths::game_root().join("logs").join("quartz-crash.log")
+   457→   457→    }
+   458→   458→}
+   459→   459→
+   460→   460→/// 追加一条崩溃标记。格式（Rust/Java 两端约定，QuartzApp.kt 同款解析）：
+   461→   461→/// `==== CRASH @<epoch秒> <KIND> ====` 换行正文。失败静默（panic hook 内不能报错）。
+   462→   462→fn append_crash_marker(kind: &str, body: &str) {
+   463→   463→    let Some(path) = CRASH_LOG.get() else { return };
+   464→   464→    if let Some(parent) = path.parent() {
+   465→   465→        let _ = std::fs::create_dir_all(parent);
+   466→   466→    }
+   467→   467→    let epoch = std::time::SystemTime::now()
+   468→   468→        .duration_since(std::time::UNIX_EPOCH)
+   469→   469→        .map(|d| d.as_secs())
+   470→   470→        .unwrap_or(0);
+   471→   471→    use std::io::Write as _;
+   472→   472→    let text = format!("==== CRASH @{epoch} {kind} ====\n{body}\n");
+   473→   473→    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+   474→   474→        let _ = writeln!(f, "{text}");
+   475→   475→        let _ = f.flush();
+   476→   476→    }
+   477→   477→    // 授权时同步一份到公共目录：用户可用文件管理器直接取出日志（不依赖 UI）
+   478→   478→    #[cfg(target_os = "android")]
+   479→   479→    {
+   480→   480→        if storage_permission_granted() {
+   481→   481→            let public = paths::game_root().join("logs").join("quartz-crash.log");
+   482→   482→            if let Some(parent) = public.parent() {
+   483→   483→                let _ = std::fs::create_dir_all(parent);
+   484→   484→            }
+   485→   485→            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(public) {
+   486→   486→                let _ = writeln!(f, "{text}");
+   487→   487→            }
+   488→   488→        }
+   489→   489→    }
+   490→   490→}
+   491→   491→
+   492→   492→/// 安装 panic hook：Rust panic（任意线程）先落盘再交回默认打印（logcat 保留）。
+   493→   493→/// 必须在 tauri::Builder 构建前调用 —— setup 钩子/主线程 panic 由此才有证据。
+   494→   494→fn install_panic_hook() {
+   495→   495→    let _ = CRASH_LOG.set(crash_log_path());
+   496→   496→    let default_hook = std::panic::take_hook();
+   497→   497→    std::panic::set_hook(Box::new(move |info| {
+   498→   498→        let location = info
+   499→   499→            .location()
+   500→   500→            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+   501→   501→            .unwrap_or_else(|| "未知位置".into());
+   502→   502→        let msg = info
+   503→   503→            .payload()
+   504→   504→            .downcast_ref::<&str>()
+   505→   505→            .map(|s| s.to_string())
+   506→   506→            .or_else(|| info.payload().downcast_ref::<String>().cloned())
+   507→   507→            .unwrap_or_else(|| "非字符串 panic 载荷".into());
+   508→   508→        let thread = std::thread::current()
+   509→   509→            .name()
+   510→   510→            .unwrap_or("<unnamed>")
+   511→   511→            .to_string();
+   512→   512→        let bt = std::backtrace::Backtrace::force_capture().to_string();
+   513→   513→        let bt_tail = bt
+   514→   514→            .lines()
+   515→   515→            .filter(|l| !l.trim().is_empty())
+   516→   516→            .take(40)
+   517→   517→            .collect::<Vec<_>>()
+   518→   518→            .join("\n");
+   519→   519→        append_crash_marker(
+   520→   520→            "RUST-PANIC",
+   521→   521→            &format!(
+   522→   522→                "thread: {thread}\nlocation: {location}\nmessage: {msg}\nbacktrace(40):\n{bt_tail}"
+   523→   523→            ),
+   524→   524→        );
+   525→   525→        eprintln!("[quartz-panic] {msg} @ {location}");
+   526→   526→        default_hook(info);
+   527→   527→    }));
+   528→   528→}
+   529→   529→
+   530→   530→/// 清理失败下载残留的临时文件（*.qz-part / *.part / *.tmp 与 .*.staging 目录）。
+   531→   531→/// 只动顶层明确的临时名，绝不碰正常数据。返回回收字节数（eprintln 汇报）。
+   532→   532→fn cleanup_stale_partials() {
+   533→   533→    let roots = [paths::runtime_dir(), paths::game_root()];
+   534→   534→    let mut reclaimed: u64 = 0;
+   535→   535→    for root in roots {
+   536→   536→        for entry in std::fs::read_dir(&root).into_iter().flatten().flatten() {
+   537→   537→            let p = entry.path();
+   538→   538→            let name = entry.file_name().to_string_lossy().into_owned();
+   539→   539→            let is_dir = p.is_dir();
+   540→   540→            let stale_part = !is_dir
+   541→   541→                && (name.ends_with(".qz-part")
+   542→   542→                    || name.ends_with(".part")
+   543→   543→                    || name.ends_with(".tmp"));
+   544→   544→            let stale_staging = is_dir && name.starts_with('.') && name.ends_with(".staging");
+   545→   545→            if stale_part || stale_staging {
+   546→   546→                let size = entry
+   547→   547→                    .metadata()
+   548→   548→                    .map(|m| if m.is_dir() { 0 } else { m.len() })
+   549→   549→                    .unwrap_or(0);
+   550→   550→                let ok = if is_dir {
+   551→   551→                    std::fs::remove_dir_all(&p).is_ok()
+   552→   552→                } else {
+   553→   553→                    std::fs::remove_file(&p).is_ok()
+   554→   554→                };
+   555→   555→                if ok {
+   556→   556→                    reclaimed += size;
+   557→   557→                    eprintln!("[quartz] 已清理残留下载缓存：{}（{} 字节）", p.display(), size);
+   558→   558→                }
+   559→   559→            }
+   560→   560→        }
+   561→   561→    }
+   562→   562→    if reclaimed > 0 {
+   563→   563→        eprintln!("[quartz] 共回收残留下载缓存 {} 字节", reclaimed);
+   564→   564→    }
+   565→   565→}
+   566→   566→
+   567→   567→/// 下载类命令的可用空间下限（精确需求在 core 各下载函数内按实际字节数校验）。
+   568→   568→const DOWNLOAD_FLOOR: u64 = 200 * 1024 * 1024;
+   569→   569→
+   570→   570→/// 下载前底线检查：可用空间 < 200MB 直接拦（ENOSPC 在 WebView/系统层面后果严重）。
+   571→   571→fn check_download_floor(target: &Path) -> Result<(), String> {
+   572→   572→    match quartz_core::space::free_space(target) {
+   573→   573→        Some(free) if free < DOWNLOAD_FLOOR => Err(quartz_core::space::insufficient(
+   574→   574→            DOWNLOAD_FLOOR,
+   575→   575→            free,
+   576→   576→            "执行下载",
+   577→   577→        )),
+   578→   578→        _ => Ok(()),
+   579→   579→    }
+   580→   580→}
+   581→   581→
+   582→   582→/// 字符安全截断（按 char 而非字节，避免切断 UTF-8）。
+   583→   583→fn clamp_chars(s: &str, max: usize) -> String {
+   584→   584→    if s.chars().count() <= max {
+   585→   585→        return s.to_string();
+   586→   586→    }
+   587→   587→    s.chars().take(max).collect()
+   588→   588→}
+   589→   589→
+   590→   590→/// 从崩溃日志提取最后一个标记块（含标记行，最多 60 行）。
+   591→   591→fn last_crash_summary() -> Option<String> {
+   592→   592→    let path = CRASH_LOG.get()?;
+   593→   593→    let text = std::fs::read_to_string(path).ok()?;
+   594→   594→    let mut blocks: Vec<Vec<&str>> = Vec::new();
+   595→   595→    for line in text.lines() {
+   596→   596→        if line.starts_with("==== CRASH @") {
+   597→   597→            blocks.push(vec![line]);
+   598→   598→        } else if let Some(last) = blocks.last_mut() {
+   599→   599→            last.push(line);
+   600→   600→        }
+   601→   601→    }
+   602→   602→    let last = blocks.last()?;
+   603→   603→    let body = last
+   604→   604→        .iter()
+   605→   605→        .take(60)
+   606→   606→        .copied()
+   607→   607→        .collect::<Vec<&str>>()
+   608→   608→        .join("\n");
+   609→   609→    Some(clamp_chars(&body, 3000))
+   610→   610→}
+   611→   611→
+   612→   612→/// 最近一次游戏启动日志尾部（SIGABRT/退出码诊断在 UI 上直达，无需文件管理器）。
+   613→   613→fn last_launch_tail() -> Option<String> {
+   614→   614→    let dir = paths::game_root().join("logs");
+   615→   615→    let mut best: Option<(PathBuf, std::time::SystemTime)> = None;
+   616→   616→    for e in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+   617→   617→        let name = e.file_name().to_string_lossy().into_owned();
+   618→   618→        if name.starts_with("launch-") && name.ends_with(".log") {
+   619→   619→            let t = e
+   620→   620→                .metadata()
+   621→   621→                .and_then(|m| m.modified())
+   622→   622→                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+   623→   623→            if best.as_ref().map(|(_, bt)| t > *bt).unwrap_or(true) {
+   624→   624→                best = Some((e.path(), t));
+   625→   625→            }
+   626→   626→        }
+   627→   627→    }
+   628→   628→    let (p, _) = best?;
+   629→   629→    let text = std::fs::read_to_string(&p).ok()?;
+   630→   630→    let lines: Vec<&str> = text.lines().collect();
+   631→   631→    let tail = lines.len().saturating_sub(60);
+   632→   632→    Some(clamp_chars(&lines[tail..].join("\n"), 3000))
+   633→   633→}
+   634→   634→
+   635→   635→/// 启动诊断：上次崩溃原因 + 存储剩余 + 最近启动日志尾部（UI 开屏横幅展示）。
+   636→   636→#[tauri::command]
+   637→   637→fn get_diagnostics() -> serde_json::Value {
+   638→   638→    json!({
+   639→   639→        "lastCrash": last_crash_summary(),
+   640→   640→        "lastLaunchTail": last_launch_tail(),
+   641→   641→        "freeBytes": quartz_core::space::free_space(&paths::game_root()),
+   642→   642→        "crashLogPath": CRASH_LOG.get().map(|p| p.display().to_string()),
+   643→   643→    })
+   644→   644→}
+   645→   645→
+   646→   646→/// 递归收集「源存在且目标缺失/不一致」的文件（不覆盖目标已有的同名同尺寸文件）。
+   647→   647→fn collect_migrate_files(src: &Path, dst: &Path, out: &mut Vec<(PathBuf, PathBuf, u64)>) {
+   648→   648→    let Ok(entries) = std::fs::read_dir(src) else {
+   649→   649→        return;
+   650→   650→    };
+   651→   651→    for entry in entries.flatten() {
+   652→   652→        let sp = entry.path();
+   653→   653→        let dp = dst.join(entry.file_name());
+   654→   654→        if sp.is_dir() {
+   655→   655→            collect_migrate_files(&sp, &dp, out);
+   656→   656→        } else if sp.is_file() {
+   657→   657→            let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+   658→   658→            let dst_size = std::fs::metadata(&dp).map(|m| m.len()).unwrap_or(u64::MAX);
+   659→   659→            if dst_size != size {
+   660→   660→                out.push((sp, dp, size));
+   661→   661→            }
+   662→   662→        }
+   663→   663→    }
+   664→   664→}
+   665→   665→
+   666→   666→/// 后台迁移：把旧根（私有目录）的数据搬到新根（公共标准目录），
+   667→   667→/// 经 `quartz://migrate` 事件上报 {percent,done,error}。
+   668→   668→fn migrate_root(from: PathBuf, to: PathBuf, app: AppHandle) {
+   669→   669→    let mut plan: Vec<(PathBuf, PathBuf, u64)> = Vec::new();
+   670→   670→    collect_migrate_files(&from.join(".minecraft"), &to.join(".minecraft"), &mut plan);
+   671→   671→    let old_accounts = from.join("accounts.json");
+   672→   672→    let new_accounts = to.join("accounts.json");
+   673→   673→    let migrate_accounts = old_accounts.exists() && !new_accounts.exists();
+   674→   674→    if migrate_accounts {
+   675→   675→        let size = std::fs::metadata(&old_accounts).map(|m| m.len()).unwrap_or(0);
+   676→   676→        plan.push((old_accounts, new_accounts, size));
+   677→   677→    }
+   678→   678→
+   679→   679→    if plan.is_empty() {
+   680→   680→        let _ = app.emit(
+   681→   681→            "quartz://migrate",
+   682→   682→            &json!({ "percent": 100.0, "done": true, "error": null }),
+   683→   683→        );
+   684→   684→        return;
+   685→   685→    }
+   686→   686→
+   687→   687→    let total: u64 = plan.iter().map(|(_, _, s)| *s).sum::<u64>().max(1);
+   688→   688→    eprintln!("[quartz] 开始迁移存储：{} 个文件（{} 字节）", plan.len(), total);
+   689→   689→    let mut copied: u64 = 0;
+   690→   690→    let mut last = std::time::Instant::now() - std::time::Duration::from_secs(1);
+   691→   691→    for (src, dst, size) in plan {
+   692→   692→        if let Some(parent) = dst.parent() {
+   693→   693→            if std::fs::create_dir_all(parent).is_err() {
+   694→   694→                let _ = app.emit(
+   695→   695→                    "quartz://migrate",
+   696→   696→                    &json!({ "percent": (copied as f64 / total as f64) * 100.0, "done": false,
+   697→   697→                             "error": format!("无法创建目录 {}", parent.display()) }),
+   698→   698→                );
+   699→   699→                return;
+   700→   700→            }
+   701→   701→        }
+   702→   702→        if std::fs::copy(&src, &dst).is_err() {
+   703→   703→            let _ = app.emit(
+   704→   704→                "quartz://migrate",
+   705→   705→                &json!({ "percent": (copied as f64 / total as f64) * 100.0, "done": false,
+   706→   706→                         "error": format!("复制失败：{} -> {}", src.display(), dst.display()) }),
+   707→   707→            );
+   708→   708→            return;
+   709→   709→        }
+   710→   710→        copied += size;
+   711→   711→        let now = std::time::Instant::now();
+   712→   712→        if now.duration_since(last) >= std::time::Duration::from_millis(150) {
+   713→   713→            last = now;
+   714→   714→            let _ = app.emit(
+   715→   715→                "quartz://migrate",
+   716→   716→                &json!({ "percent": (copied as f64 / total as f64) * 100.0, "done": false, "error": null }),
+   717→   717→            );
+   718→   718→        }
+   719→   719→    }
+   720→   720→    eprintln!("[quartz] 存储迁移完成");
+   721→   721→    let _ = app.emit(
+   722→   722→        "quartz://migrate",
+   723→   723→        &json!({ "percent": 100.0, "done": true, "error": null }),
+   724→   724→    );
+   725→   725→}
+   726→   726→
+   727→   727→/// 权限变化后重解析存储根；根变化时后台迁移旧数据（幂等，跳过目标已有文件）。
+   728→   728→#[tauri::command]
+   729→   729→fn reinit_storage(app: AppHandle, state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+   730→   730→    let old_root = paths::game_root();
+   731→   731→    let diag = init_storage();
+   732→   732→    *STORAGE_DIAG.lock().map_err(|_| "内部状态锁异常")? = Some(diag.clone());
+   733→   733→    let new_root = paths::game_root();
+   734→   734→    // 游戏运行中不迁移（避免拷贝正在被 JVM 读写的文件）；同时防并发迁移。
+   735→   735→    let game_running = state
+   736→   736→        .game_pid
+   737→   737→        .lock()
+   738→   738→        .map_err(|_| "内部状态锁异常")?
+   739→   739→        .is_some();
+   740→   740→    let mut do_migrate = old_root != new_root && old_root.exists() && !game_running;
+   741→   741→    if do_migrate {
+   742→   742→        do_migrate = !MIGRATING.swap(true, std::sync::atomic::Ordering::SeqCst);
+   743→   743→    }
+   744→   744→    if do_migrate {
+   745→   745→        let app2 = app.clone();
+   746→   746→        std::thread::spawn(move || {
+   747→   747→            migrate_root(old_root, new_root, app2);
+   748→   748→            MIGRATING.store(false, std::sync::atomic::Ordering::SeqCst);
+   749→   749→        });
+   750→   750→    }
+   751→   751→    Ok(storage_json(&diag))
+   752→   752→}
+   753→   753→
+   754→   754→// ---------------------------------------------------------------------------
+   755→   755→// 应用信息
+   756→   756→// ---------------------------------------------------------------------------
+   757→   757→
+   758→   758→/// 应用基础信息。
+   759→   759→#[tauri::command]
+   760→   760→fn app_meta() -> serde_json::Value {
+   761→   761→    let hal = platform::default_hal();
+   762→   762→    json!({
+   763→   763→        "name": "Quartz Launcher",
+   764→   764→        "version": env!("CARGO_PKG_VERSION"),
+   765→   765→        "os": hal.os().rule_name(),
+   766→   766→        "arch": host_arch(),
+   767→   767→    })
+   768→   768→}
+   769→   769→
+   770→   770→/// 存储诊断：根目录绝对路径、是否可写、存储模式、完整文件权限状态。
+   771→   771→#[tauri::command]
+   772→   772→fn get_env_info() -> serde_json::Value {
+   773→   773→    let diag = STORAGE_DIAG
+   774→   774→        .lock()
+   775→   775→        .map_err(|_| "内部状态锁异常")
+   776→   776→        .ok()
+   777→   777→        .and_then(|g| g.clone())
+   778→   778→        .unwrap_or_else(init_storage);
+   779→   779→    storage_json(&diag)
+   780→   780→}
+   781→   781→
+   782→   782→/// 渲染器建议：按平台默认能力 + 手动覆盖。
+   783→   783→#[tauri::command]
+   784→   784→fn renderer_advice(mc: String, caps: Option<serde_json::Value>) -> serde_json::Value {
+   785→   785→    let hal = platform::default_hal();
+   786→   786→    let os = hal.os().bus_name();
+   787→   787→    let caps = caps
+   788→   788→        .and_then(|v| serde_json::from_value::<DeviceCaps>(v).ok())
+   789→   789→        .unwrap_or_else(|| DeviceCaps::for_os(os));
+   790→   790→    let required = renderbus::required_profile(&mc);
+   791→   791→    match renderbus::select(os, host_arch(), required, &caps) {
+   792→   792→        Some(p) => json!({
+   793→   793→            "id": p.id, "backend": p.backend, "provides": p.provides,
+   794→   794→            "note": p.note, "required": required,
+   795→   795→        }),
+   796→   796→        None => json!({ "id": null, "required": required,
+   797→   797→            "reason": "设备无满足 GL 语义的加速路径（性能红线）" }),
+   798→   798→    }
+   799→   799→}
+   800→   800→
+   801→   801→/// 生成启动计划（离线演示：内嵌 1.20.4 样例 + 离线账号）。
+   802→   802→#[tauri::command]
+   803→   803→fn plan_offline(player: String, memory_mb: u32) -> Result<serde_json::Value, String> {
+   804→   804→    let version: model::VersionJson =
+   805→   805→        serde_json::from_str(quartz_core::fixtures::VERSION_1_20_4)
+   806→   806→            .map_err(|e| e.to_string())?;
+   807→   807→    let ctx = RuntimeCtx::new("linux", host_arch());
+   808→   808→    let allowed: Vec<&model::Library> = version
+   809→   809→        .libraries
+   810→   810→        .iter()
+   811→   811→        .filter(|l| meta::library_allowed(l, &ctx))
+   812→   812→        .collect();
+   813→   813→    let account = auth::offline_account(&player);
+   814→   814→    let root = paths::minecraft_dir();
+   815→   815→
+   816→   816→    let plan = jvmops::build_launch_plan(&jvmops::PlanInputs {
+   817→   817→        ctx: &ctx,
+   818→   818→        version: &version,
+   819→   819→        allowed_libs: &allowed,
+   820→   820→        libraries_root: &root.join("libraries"),
+   821→   821→        natives_root: &root.join("natives"),
+   822→   822→        assets_root: &root.join("assets"),
+   823→   823→        versions_root: &root.join("versions"),
+   824→   824→        instance_dir: &paths::game_root().join("instances").join("demo"),
+   825→   825→        account: &account,
+   826→   826→        memory_mb,
+   827→   827→        java_major: version.java_version.as_ref().map(|j| j.major_version).unwrap_or(17),
+   828→   828→        java_path: None,
+   829→   829→        window: None,
+   830→   830→        lwjgl_classes_jar: None,
+   831→   831→    })
+   832→   832→    .map_err(|e| e.to_string())?;
+   833→   833→
+   834→   834→    serde_json::to_value(&plan).map_err(|e| e.to_string())
+   835→   835→}
+   836→   836→
+   837→   837→// ---------------------------------------------------------------------------
+   838→   838→// 离线账号
+   839→   839→// ---------------------------------------------------------------------------
+   840→   840→
+   841→   841→/// 离线登录：校验用户名 -> MD5 离线 UUID -> 写 files/accounts.json -> 直接进主界面。
+   842→   842→#[tauri::command]
+   843→   843→fn offline_login(name: String) -> Result<auth::Account, String> {
+   844→   844→    auth::add_offline_account(&name).map_err(|e| e.to_string())
+   845→   845→}
+   846→   846→
+   847→   847→/// 当前选中账号；未登录返回 null。
+   848→   848→#[tauri::command]
+   849→   849→fn get_account() -> Option<auth::Account> {
+   850→   850→    auth::active_account().unwrap_or(None)
+   851→   851→}
+   852→   852→
+   853→   853→/// 账号列表条目（附选中标记）。
+   854→   854→#[derive(Serialize)]
+   855→   855→pub struct AccountEntry {
+   856→   856→    #[serde(flatten)]
+   857→   857→    pub account: auth::Account,
+   858→   858→    pub selected: bool,
+   859→   859→}
+   860→   860→
+   861→   861→/// 全部账号（供账户页管理）。
+   862→   862→#[tauri::command]
+   863→   863→fn list_accounts() -> Result<Vec<AccountEntry>, String> {
+   864→   864→    let store = auth::load_store().map_err(|e| e.to_string())?;
+   865→   865→    Ok(store
+   866→   866→        .accounts
+   867→   867→        .into_iter()
+   868→   868→        .map(|a| {
+   869→   869→            let selected = store.selected.as_deref() == Some(a.uuid.as_str());
+   870→   870→            AccountEntry { account: a, selected }
+   871→   871→        })
+   872→   872→        .collect())
+   873→   873→}
+   874→   874→
+   875→   875→/// 切换选中账号。
+   876→   876→#[tauri::command]
+   877→   877→fn select_account(uuid: String) -> Result<auth::Account, String> {
+   878→   878→    let mut store = auth::load_store().map_err(|e| e.to_string())?;
+   879→   879→    let account = store
+   880→   880→        .accounts
+   881→   881→        .iter()
+   882→   882→        .find(|a| a.uuid == uuid)
+   883→   883→        .cloned()
+   884→   884→        .ok_or_else(|| "账号不存在".to_string())?;
+   885→   885→    store.selected = Some(uuid);
+   886→   886→    auth::save_store(&store).map_err(|e| e.to_string())?;
+   887→   887→    Ok(account)
+   888→   888→}
+   889→   889→
+   890→   890→/// 删除账号；若删除的是选中账号，则自动选中剩余的最后一个。
+   891→   891→#[tauri::command]
+   892→   892→fn remove_account(uuid: String) -> Result<bool, String> {
+   893→   893→    let mut store = auth::load_store().map_err(|e| e.to_string())?;
+   894→   894→    let before = store.accounts.len();
+   895→   895→    store.accounts.retain(|a| a.uuid != uuid);
+   896→   896→    let removed = store.accounts.len() != before;
+   897→   897→    if !removed {
+   898→   898→        return Ok(false);
+   899→   899→    }
+   900→   900→    if store.selected.as_deref() == Some(uuid.as_str()) {
+   901→   901→        store.selected = store.accounts.last().map(|a| a.uuid.clone());
+   902→   902→    }
+   903→   903→    auth::save_store(&store).map_err(|e| e.to_string())?;
+   904→   904→    Ok(true)
+   905→   905→}
+   906→   906→
+   907→   907→// ---------------------------------------------------------------------------
+   908→   908→// 版本列表与下载
+   909→   909→// ---------------------------------------------------------------------------
+   910→   910→
+   911→   911→/// 版本列表条目（release 优先排序）。
+   912→   912→#[derive(Debug, Clone, Serialize)]
+   913→   913→pub struct VersionInfo {
+   914→   914→    pub id: String,
+   915→   915→    #[serde(rename = "type")]
+   916→   916→    pub version_type: String,
+   917→   917→    pub url: String,
+   918→   918→}
+   919→   919→
+   920→   920→/// 拉取真实 version_manifest_v2 并排序：release -> snapshot -> old_beta -> old_alpha。
+   921→   921→#[tauri::command]
+   922→   922→async fn list_versions() -> Result<Vec<VersionInfo>, String> {
+   923→   923→    let client = meta::http_client();
+   924→   924→    let manifest = meta::fetch_version_manifest(&client)
+   925→   925→        .await
+   926→   926→        .map_err(|e| format!("版本清单拉取失败：{e}"))?;
+   927→   927→    const KIND_ORDER: [&str; 4] = ["release", "snapshot", "old_beta", "old_alpha"];
+   928→   928→    let mut out = Vec::with_capacity(manifest.versions.len());
+   929→   929→    for kind in KIND_ORDER {
+   930→   930→        for v in manifest.versions.iter().filter(|v| v.kind == kind) {
+   931→   931→            out.push(VersionInfo {
+   932→   932→                id: v.id.clone(),
+   933→   933→                version_type: v.kind.clone(),
+   934→   934→                url: v.url.clone(),
+   935→   935→            });
+   936→   936→        }
+   937→   937→    }
+   938→   938→    for v in manifest
+   939→   939→        .versions
+   940→   940→        .iter()
+   941→   941→        .filter(|v| !KIND_ORDER.contains(&v.kind.as_str()))
+   942→   942→    {
+   943→   943→        out.push(VersionInfo {
+   944→   944→            id: v.id.clone(),
+   945→   945→            version_type: v.kind.clone(),
+   946→   946→            url: v.url.clone(),
+   947→   947→        });
+   948→   948→    }
+   949→   949→    Ok(out)
+   950→   950→}
+   951→   951→
+   952→   952→/// 本地已安装版本（versions/<v>/<v>.jar 存在即为已安装）。
+   953→   953→#[tauri::command]
+   954→   954→fn list_installed_versions() -> Vec<String> {
+   955→   955→    let dir = paths::versions_dir();
+   956→   956→    let mut out = Vec::new();
+   957→   957→    if let Ok(entries) = std::fs::read_dir(&dir) {
+   958→   958→        for entry in entries.flatten() {
+   959→   959→            let name = entry.file_name().to_string_lossy().into_owned();
+   960→   960→            if name.starts_with('.') {
+   961→   961→                continue;
+   962→   962→            }
+   963→   963→            if paths::version_jar(&name).exists() {
+   964→   964→                out.push(name);
+   965→   965→            }
+   966→   966→        }
+   967→   967→    }
+   968→   968→    out.sort();
+   969→   969→    out.reverse();
+   970→   970→    out
+   971→   971→}
+   972→   972→
+   973→   973→/// 后台启动完整下载管线（8 并发 + SHA-1 校验 + 3 次重试 + 原子落盘），
+   974→   974→/// 进度经 `download://progress` 事件上报 {stage,current,total,percent,file,done,error}。
+   975→   975→#[tauri::command]
+   976→   976→async fn download_game(
+   977→   977→    version_id: String,
+   978→   978→    app: AppHandle,
+   979→   979→    state: State<'_, AppState>,
+   980→   980→) -> Result<(), String> {
+   981→   981→    {
+   982→   982→        let mut busy = state.downloading.lock().map_err(|_| "内部状态锁异常")?;
+   983→   983→        if *busy {
+   984→   984→            return Err("已有下载任务正在进行，请等待完成后再试".to_string());
+   985→   985→        }
+   986→   986→        *busy = true;
+   987→   987→    }
+   988→   988→    // 空间底线检查（精确需求在 instance::install_standard 内按缺失任务字节数校验）
+   989→   989→    check_download_floor(&paths::game_root())?;
+   990→   990→    let busy = state.downloading.clone();
+   991→   991→    let app = app.clone();
+   992→   992→
+   993→   993→    tauri::async_runtime::spawn(async move {
+   994→   994→        let (tx, mut rx) = tokio::sync::mpsc::channel::<instance::DownloadProgress>(128);
+   995→   995→        let forwarder_app = app.clone();
+   996→   996→        let forwarder = tokio::spawn(async move {
+   997→   997→            while let Some(ev) = rx.recv().await {
+   998→   998→                let _ = forwarder_app.emit("download://progress", &ev);
+   999→   999→            }
+  1000→  1000→        });
+  1001→  1001→
+  1002→  1002→        let client = meta::http_client();
+  1003→  1003→        let result = instance::install_standard(&client, &version_id, tx).await;
+  1004→  1004→        if let Err(e) = &result {
+  1005→  1005→            // 失败也走事件通道（UI 红字报错 + 可重试），绝不静默。
+  1006→  1006→            let _ = app.emit(
+  1007→  1007→                "download://progress",
+  1008→  1008→                &instance::DownloadProgress {
+  1009→  1009→                    stage: "error".to_string(),
+  1010→  1010→                    current: 0,
+  1011→  1011→                    total: 0,
+  1012→  1012→                    percent: 0.0,
+  1013→  1013→                    file: String::new(),
+  1014→  1014→                    done: false,
+  1015→  1015→                    error: Some(e.to_string()),
+  1016→  1016→                },
+  1017→  1017→            );
+  1018→  1018→        }
+  1019→  1019→        drop(result);
+  1020→  1020→        if let Ok(mut busy) = busy.lock() {
+  1021→  1021→            *busy = false;
+  1022→  1022→        }
+  1023→  1023→        // forwarder 在 tx 关闭后自然退出
+  1024→  1024→        let _ = forwarder.await;
+  1025→  1025→    });
+  1026→  1026→
+  1027→  1027→    Ok(())
+  1028→  1028→}
+  1029→  1029→
+  1030→  1030→/// 标准游戏根目录绝对路径（UI 常显）。
+  1031→  1031→#[tauri::command]
+  1032→  1032→fn get_game_dir() -> String {
+  1033→  1033→    paths::game_root().to_string_lossy().into_owned()
+  1034→  1034→}
+  1035→  1035→
+  1036→  1036→// ---------------------------------------------------------------------------
+  1037→  1037→// JVM 运行时 pack（M0 启动链路）
+  1038→  1038→// ---------------------------------------------------------------------------
+  1039→  1039→
+  1040→  1040→/// JVM pack 状态：installed / version / path / 是否有下载源。
+  1041→  1041→#[tauri::command]
+  1042→  1042→fn get_runtime_status(java_major: u32) -> serde_json::Value {
+  1043→  1043→    json!({
+  1044→  1044→        "installed": runtime::is_installed(java_major),
+  1045→  1045→        "version": runtime::installed_version(java_major),
+  1046→  1046→        "path": runtime::install_dir(java_major).to_string_lossy(),
+  1047→  1047→        "specAvailable": runtime::spec_for(java_major, host_arch()).is_some(),
+  1048→  1048→    })
+  1049→  1049→}
+  1050→  1050→
+  1051→  1051→/// 后台下载 JVM 运行时 pack，进度经 `runtime://progress` 上报（与下载游戏事件同构）。
+  1052→  1052→#[tauri::command]
+  1053→  1053→async fn download_runtime(java_major: u32, app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+  1054→  1054→    if state
+  1055→  1055→        .runtime_busy
+  1056→  1056→        .swap(true, std::sync::atomic::Ordering::SeqCst)
+  1057→  1057→    {
+  1058→  1058→        return Err("已有运行时下载任务正在进行".to_string());
+  1059→  1059→    }
+  1060→  1060→    check_download_floor(&paths::runtime_dir())?;
+  1061→  1061→    let busy = state.runtime_busy.clone();
+  1062→  1062→    let app = app.clone();
+  1063→  1063→
+  1064→  1064→    tauri::async_runtime::spawn(async move {
+  1065→  1065→        let (tx, mut rx) = tokio::sync::mpsc::channel::<DownloadProgress>(64);
+  1066→  1066→        let forwarder_app = app.clone();
+  1067→  1067→        let forwarder = tokio::spawn(async move {
+  1068→  1068→            while let Some(ev) = rx.recv().await {
+  1069→  1069→                let _ = forwarder_app.emit("runtime://progress", &ev);
+  1070→  1070→            }
+  1071→  1071→        });
+  1072→  1072→
+  1073→  1073→        let client = meta::http_client();
+  1074→  1074→        let result = runtime::download_and_install(&client, java_major, host_arch(), tx).await;
+  1075→  1075→        if let Err(e) = &result {
+  1076→  1076→            let _ = app.emit(
+  1077→  1077→                "runtime://progress",
+  1078→  1078→                &DownloadProgress {
+  1079→  1079→                    stage: "error".to_string(),
+  1080→  1080→                    current: 0,
+  1081→  1081→                    total: 0,
+  1082→  1082→                    percent: 0.0,
+  1083→  1083→                    file: String::new(),
+  1084→  1084→                    done: false,
+  1085→  1085→                    error: Some(e.to_string()),
+  1086→  1086→                },
+  1087→  1087→            );
+  1088→  1088→        }
+  1089→  1089→        drop(result);
+  1090→  1090→        busy.store(false, std::sync::atomic::Ordering::SeqCst);
+  1091→  1091→        let _ = forwarder.await;
+  1092→  1092→    });
+  1093→  1093→
+  1094→  1094→    Ok(())
+  1095→  1095→}
+  1096→  1096→
+  1097→  1097→// ---------------------------------------------------------------------------
+  1098→  1098→// 渲染层 pack + LWJGL 安卓 pack（全部在线下载，APK 不内置）
+  1099→  1099→// ---------------------------------------------------------------------------
+  1100→  1100→
+  1101→
+  1102→[showing lines 1-1100 of 2074; use offset=1101 with limit to continue reading]

@@ -23,6 +23,7 @@ class QuartzApp : Application() {
 
   override fun onCreate() {
     super.onCreate()
+    instance = this
     installCrashHandler()
     recoverWebViewCrashLoop()
   }
@@ -88,6 +89,11 @@ class QuartzApp : Application() {
   }
 
   companion object {
+    /** 当前 Application（QuartzBridge 剪贴板回调取 Context 用）。 */
+    @JvmStatic
+    var instance: QuartzApp? = null
+      private set
+
     /** 崩溃循环判定窗口与阈值。 */
     const val LOOP_WINDOW_MS: Long = 120_000L
     const val LOOP_THRESHOLD: Int = 2

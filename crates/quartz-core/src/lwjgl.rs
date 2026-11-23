@@ -34,12 +34,17 @@ const POJAV_APK: &str =
     "https://github.com/PojavLauncherTeam/PojavLauncher/releases/download/gladiolus/PojavLauncher.apk";
 
 /// APK 内需提取的文件清单：(APK 条目路径, 落盘相对路径)。
+///
+/// 注意：`libpojavexec.so` **不再**从 Pojav APK 提取 —— gladiolus 发布包内
+/// 旧版 C 桥的 JNI_OnLoad 会 RegisterNatives 注册 jar 里不存在的
+/// `nativeSetUseInputStackQueue`，RegisterNatives 直接 NoSuchMethodError
+/// （v0.1.4 退出码 255 的根因）。该符号位现在由 Rust 重构的 quartz-bridge
+/// 以同名 libpojavexec.so 落位覆盖（见壳层 game_bridge::ensure_bridge_lib）。
 const APK_FILES: &[(&str, &str)] = &[
     (
         "assets/components/lwjgl3/lwjgl-glfw-classes.jar",
         "lwjgl-glfw-classes.jar",
     ),
-    ("lib/arm64-v8a/libpojavexec.so", "natives/libpojavexec.so"),
     ("lib/arm64-v8a/liblwjgl.so", "natives/liblwjgl.so"),
     ("lib/arm64-v8a/liblwjgl_opengl.so", "natives/liblwjgl_opengl.so"),
     ("lib/arm64-v8a/liblwjgl_stb.so", "natives/liblwjgl_stb.so"),
@@ -64,10 +69,11 @@ pub fn natives_dir() -> PathBuf {
     install_dir().join("natives")
 }
 
-/// 是否已安装（类 jar + pojavexec/lwjgl/opengl 三核心 so 判定）。
+/// 是否已安装（类 jar + LWJGL core/opengl 双核心 so 判定）。
+/// 注意：libpojavexec.so 不在判定内 —— v0.1.5 起它由壳层显示桥在启动前
+/// 落位覆盖（quartz-bridge Rust 重构版），不再来自 Pojav APK 提取。
 pub fn is_installed() -> bool {
     classes_jar().exists()
-        && natives_dir().join("libpojavexec.so").exists()
         && natives_dir().join("liblwjgl.so").exists()
         && natives_dir().join("liblwjgl_opengl.so").exists()
 }
@@ -210,8 +216,10 @@ mod tests {
 
     #[test]
     fn manifest_requires_pojavexec() {
-        // 关键回归：pojavexec 必须在提取清单里（v5 缺它导致游戏启动即 abort）
-        assert!(APK_FILES.iter().any(|(p, _)| p.ends_with("libpojavexec.so")));
+        // 关键回归：pojavexec 符号位必须有人提供 —— v0.1.5 起不再从 Pojav APK
+        // 提取（旧 C 桥 RegisterNatives 版本错位致 255），改由 Rust 显示桥落位。
+        // 此处断言：提取清单不再包含 pojavexec，但 jar 必须在（桥的接口契约来源）。
+        assert!(APK_FILES.iter().all(|(p, _)| !p.ends_with("libpojavexec.so")));
         assert!(APK_FILES.iter().any(|(p, _)| p.ends_with("libjnidispatch.so")));
         assert!(APK_FILES.iter().any(|(p, _)| p.ends_with("liblwjgl_stb.so")));
         assert!(APK_FILES.iter().any(|(p, _)| p.ends_with("lwjgl-glfw-classes.jar")));

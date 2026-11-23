@@ -4,6 +4,7 @@ members = [
     "crates/quartz-core",
     "crates/quartz-cli",
     "crates/quartz-ffi",
+    "crates/quartz-bridge",
 ]
 # apps/shell-tauri/src-tauri 是独立 package（自带空 [workspace] 声明），
 # 因为其构建依赖 Tauri 与各平台系统库（webkit2gtk / Xcode / NDK），

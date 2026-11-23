@@ -9,6 +9,12 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Environment
 import android.provider.Settings
+import android.view.KeyEvent
+import android.view.View
+import android.view.ViewGroup
+import android.view.WindowManager
+import android.webkit.WebView
+import android.widget.FrameLayout
 import androidx.activity.enableEdgeToEdge
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
@@ -32,8 +38,6 @@ class MainActivity : TauriActivity() {
 
     /**
      * Rust 侧经 JNI 调用的方向切换入口：进游戏切横屏，游戏退出切回竖屏。
-     * 与权限申请同链路 —— ndk-context 提供给 Rust 的是 Application 对象，
-     * 其上不存在实例方法，必须经类静态方法转发到当前 Activity。
      * runOnUiThread：requestedOrientation 只能在主线程改；切方向不重建
      * Activity（Manifest 已声明 configChanges 含 orientation|screenSize）。
      */
@@ -48,11 +52,75 @@ class MainActivity : TauriActivity() {
         }
       }
     }
+
+    /**
+     * 显示游戏层（Rust 显示桥启动前调用）：横屏 + SurfaceView 覆盖 WebView +
+     * 虚拟按键层 + 屏幕常亮。Surface 创建回调交接给 quartz-bridge。
+     */
+    @JvmStatic
+    fun showGameSurfaceStatic() {
+      val act = instance ?: return
+      act.runOnUiThread {
+        act.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+        act.showGameSurface()
+      }
+    }
+
+    /** 隐藏游戏层并恢复竖屏启动器 UI（游戏退出 / 启动失败时调用）。 */
+    @JvmStatic
+    fun hideGameSurfaceStatic() {
+      val act = instance ?: return
+      act.runOnUiThread {
+        act.hideGameSurface()
+        act.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+      }
+    }
+
+    /**
+     * 重启应用进程：同进程内 OpenJDK JVM 只能 JNI_CreateJavaVM 一次，
+     * 游戏退出后再次启动前用它重置进程（新任务启动后立刻结束旧进程）。
+     */
+    @JvmStatic
+    fun restartAppStatic() {
+      val act = instance ?: return
+      act.runOnUiThread {
+        try {
+          val intent = act.packageManager.getLaunchIntentForPackage(act.packageName)
+          if (intent != null) {
+            intent.addFlags(
+              Intent.FLAG_ACTIVITY_NEW_TASK or
+                Intent.FLAG_ACTIVITY_CLEAR_TOP or
+                Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED
+            )
+            act.startActivity(intent)
+          }
+        } catch (_: Throwable) {
+        }
+        // 新任务已入栈，结束本进程（不经 crash 通道）
+        android.os.Process.killProcess(android.os.Process.myPid())
+      }
+    }
+
+    /** QuartzBridge 回调入口（游戏鼠标 grab 状态变化）。 */
+    @JvmStatic
+    fun onGameGrabStateChangedNative(grabbed: Boolean) {
+      val act = instance ?: return
+      act.runOnUiThread { act.onGrabStateChanged(grabbed) }
+    }
   }
+
+  // ---- 游戏层状态 ----
+  private var gameView: GameView? = null
+  private var gameControls: GameControls? = null
+  private var webView: WebView? = null
+  private var webViewVisibleBeforeGame = true
 
   override fun onCreate(savedInstanceState: Bundle?) {
     enableEdgeToEdge()
     super.onCreate(savedInstanceState)
+    // 竖屏 UI 修复配套：禁用 WebView 缩放（viewport meta 同时 user-scalable=no）。
+    // Tauri 的 WebView 为异步创建，轮询等待并配置。
+    scheduleWebViewZoomConfigure(0)
   }
 
   override fun onResume() {
@@ -66,6 +134,129 @@ class MainActivity : TauriActivity() {
       instance = null
     }
   }
+
+  // ------------------------------------------------------------------
+  // WebView 配置（禁缩放）
+  // ------------------------------------------------------------------
+
+  private fun scheduleWebViewZoomConfigure(attempt: Int) {
+    if (attempt > 30) return
+    window.decorView.postDelayed({
+      val wv = findWebView(window.decorView)
+      if (wv != null) {
+        webView = wv
+        try {
+          wv.settings.apply {
+            setSupportZoom(false)
+            builtInZoomControls = false
+            displayZoomControls = false
+            textZoom = 100
+          }
+        } catch (_: Throwable) {
+        }
+      } else {
+        scheduleWebViewZoomConfigure(attempt + 1)
+      }
+    }, 150)
+  }
+
+  private fun findWebView(root: View): WebView? {
+    if (root is WebView) return root
+    if (root is ViewGroup) {
+      for (i in 0 until root.childCount) {
+        findWebView(root.getChildAt(i))?.let { return it }
+      }
+    }
+    return null
+  }
+
+  // ------------------------------------------------------------------
+  // 游戏层显隐（Rust 经 showGameSurfaceStatic/hideGameSurfaceStatic 调用）
+  // ------------------------------------------------------------------
+
+  fun showGameSurface() {
+    val content = findViewById<ViewGroup>(android.R.id.content) ?: return
+    if (gameView != null) return
+    webViewVisibleBeforeGame = webView?.visibility == View.VISIBLE
+    webView?.visibility = View.GONE
+    window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+    val gv = GameView(this)
+    val controls = GameControls(this)
+    gameView = gv
+    gameControls = controls
+    content.addView(
+      gv,
+      FrameLayout.LayoutParams(
+        ViewGroup.LayoutParams.MATCH_PARENT,
+        ViewGroup.LayoutParams.MATCH_PARENT
+      )
+    )
+    content.addView(
+      controls,
+      FrameLayout.LayoutParams(
+        ViewGroup.LayoutParams.MATCH_PARENT,
+        ViewGroup.LayoutParams.MATCH_PARENT
+      )
+    )
+  }
+
+  fun hideGameSurface() {
+    val content = findViewById<ViewGroup>(android.R.id.content) ?: return
+    window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+    gameControls?.let {
+      (it.parent as? ViewGroup)?.removeView(it)
+    }
+    // GameView 的 surfaceDestroyed 回调负责 releaseSurface（移除视图即触发）
+    gameView?.let {
+      (it.parent as? ViewGroup)?.removeView(it)
+    }
+    gameControls = null
+    gameView = null
+    if (webViewVisibleBeforeGame) {
+      webView?.visibility = View.VISIBLE
+    }
+  }
+
+  /** 游戏鼠标 grab 状态变化（QuartzBridge 经静态方法回调）。 */
+  fun onGrabStateChanged(grabbed: Boolean) {
+    gameControls?.alpha = if (grabbed) 1f else 0.85f
+  }
+
+  // ------------------------------------------------------------------
+  // 物理键盘（蓝牙键盘 / 部分游戏手柄的键盘模式）转发
+  // ------------------------------------------------------------------
+
+  override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+    if (gameView != null) {
+      val bridge = QuartzBridge.instance
+      val glfw = GlfwKeys.toGlfwKey(event.keyCode)
+      val action = when (event.action) {
+        KeyEvent.ACTION_DOWN -> 1
+        KeyEvent.ACTION_UP -> 0
+        else -> -1
+      }
+      if (glfw != 0 && action >= 0) {
+        val mods = GlfwKeys.mods(event.metaState)
+        val repeats = if (event.action == KeyEvent.ACTION_DOWN) event.repeatCount else 0
+        if (action == 1 && repeats == 0) {
+          bridge.sendKey(glfw, 0, 1, mods)
+          // 可打印字符同步发 char 事件（聊天输入）
+          if (event.isPrintingKey) {
+            val ch = event.unicodeChar
+            if (ch > 0) bridge.sendChar(ch, mods)
+          }
+        } else if (action == 0) {
+          bridge.sendKey(glfw, 0, 0, mods)
+        }
+        return true
+      }
+    }
+    return super.dispatchKeyEvent(event)
+  }
+
+  // ------------------------------------------------------------------
+  // 存储权限（完整文件权限）
+  // ------------------------------------------------------------------
 
   /**
    * 存储权限（完整文件权限）是否已授权：

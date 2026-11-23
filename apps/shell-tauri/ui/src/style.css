@@ -133,7 +133,14 @@ input::placeholder { color: var(--text-faint); }
 .btn-launch:disabled { opacity: 0.5; cursor: not-allowed; }
 
 /* ============ 应用骨架 ============ */
-.app-shell { display: flex; }
+/* 竖屏修复：窄屏时顶栏/内容/底导航必须是纵向 flex 列。
+   旧版固定 row 布局在窄屏把顶栏挤成左侧竖列（截图 bug 的根因）。
+   侧栏+内容的双列布局只在宽屏（≥880px，顶栏隐藏时）使用。 */
+.app-shell {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
 
 .sidebar {
   display: flex; flex-direction: column;
@@ -412,8 +419,9 @@ select { appearance: none; background-image: linear-gradient(45deg, transparent 
   .content { padding: 16px 14px; }
   .btn-launch { width: 100%; }
 }
-/* 宽屏隐藏底部导航 */
+/* 宽屏：侧栏 + 内容双列（顶栏隐藏），纵向骨架切回横向 */
 @media (min-width: 880px) {
+  .app-shell { flex-direction: row; }
   .content { padding-bottom: 24px; }
 }
 

@@ -180,8 +180,12 @@ pub fn launch_env(id: &str) -> Vec<(String, String)> {
             ("LIBGL_NOINTOVLHACK".into(), "1".into()),
             ("LIBGL_NORMALIZE".into(), "1".into()),
         ],
-        // MobileGlues 自带配置文件；这里只给固定语义开关
-        "mobileglues" => vec![("MOBILEGLUES_DISABLE_DSA".into(), "1".into())],
+        // MobileGlues 自带配置文件；这里给桥接层需要的固定语义开关：
+        // LIBGL_ES=3 -> EGL 上下文 GLES3（桌面 GL 语义转译的底线，MC 1.17+ 需要）
+        "mobileglues" => vec![
+            ("MOBILEGLUES_DISABLE_DSA".into(), "1".into()),
+            ("LIBGL_ES".into(), "3".into()),
+        ],
         "vgpu" => vec![("VGPU_NOERROR".into(), "1".into())],
         "zink" => vec![
             ("MESA_LOADER_DRIVER_OVERRIDE".into(), "zink".into()),

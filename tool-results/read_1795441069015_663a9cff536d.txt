@@ -1,0 +1,1473 @@
+     1→//! Quartz 游戏显示桥核心（Rust 重构 Pojav C 桥 libpojavexec.so）。
+     2→//!
+     3→//! 契约来源：gladiolus 官方 `lwjgl-glfw-classes.jar` 字节码（javap 反编译核对）。
+     4→//! 所有 JNI 导出符号严格使用 `Java_<类路径>_<方法>` 命名（JVM 按名绑定）。
+     5→//!
+     6→//! 与 Pojav C 版的关键差异（v0.1.5 修复 gladiolus 发布包 jar↔so 版本错位崩溃）：
+     7→//! - 不做任何 RegisterNatives（旧 so 的 JNI_OnLoad 注册 jar 不存在的
+     8→//!   nativeSetUseInputStackQueue -> RegisterNatives NoSuchMethodError -> 退出码 255）
+     9→//! - 输入事件常驻队列模式（新 jar 的 glfwPollEvents 恒走 Start/Pump/StopPumping）
+    10→//! - ART/OpenJDK 双 JVM 经显式 C ABI init 传递（不依赖 POJAV_ENVIRON 指针技巧）；
+    11→//!   本库仅被游戏侧 OpenJDK dlopen，壳层（ART）经 dlsym 调 C ABI
+    12→
+    13→use jni_sys::{
+    14→    jboolean, jbyteArray, jclass, jint, jlong, jmethodID, jobject, jstring, jvalue, JNIEnv, JavaVM,
+    15→    JNI_OK, JNI_VERSION_1_4,
+    16→};
+    17→use std::collections::HashMap;
+    18→use std::ffi::{c_char, c_int, c_void, CStr, CString};
+    19→use std::ptr;
+    20→use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicPtr, AtomicUsize, Ordering};
+    21→use std::sync::{Arc, Mutex, OnceLock};
+    22→
+    23→// ---------------------------------------------------------------------------
+    24→// 事件常量（对齐 Pojav input_bridge_v3.c）
+    25→// ---------------------------------------------------------------------------
+    26→
+    27→const EVENT_TYPE_CHAR: i32 = 1000;
+    28→const EVENT_TYPE_CHAR_MODS: i32 = 1001;
+    29→const EVENT_TYPE_CURSOR_ENTER: i32 = 1002;
+    30→const EVENT_TYPE_CURSOR_POS: i32 = 1003;
+    31→const EVENT_TYPE_KEY: i32 = 1005;
+    32→const EVENT_TYPE_MOUSE_BUTTON: i32 = 1006;
+    33→const EVENT_TYPE_SCROLL: i32 = 1007;
+    34→const EVENT_TYPE_WINDOW_SIZE: i32 = 1008;
+    35→const EVENT_TYPE_FRAMEBUFFER_SIZE: i32 = 1009;
+    36→
+    37→const RENDERER_GL4ES: i32 = 1;
+    38→const RENDERER_VK_ZINK: i32 = 2;
+    39→
+    40→// jar 静态初始化的直读缓冲尺寸（字节码核对）：keyDownBuffer=317、mouseDownBuffer=8。
+    41→// keyDownBuffer 下标 = GLFW 键码 - 32（GLFW_KEY_SPACE=32 -> 0）。
+    42→const KEY_BUF_SIZE: usize = 317;
+    43→const MOUSE_BUF_SIZE: usize = 8;
+    44→const WINDOW_FORMAT_RGBX_8888: i32 = 2;
+    45→
+    46→fn log(line: &str) {
+    47→    // stderr 会被壳层 fd 重定向捕获进启动控制台（与 [quartz] 行同流）。
+    48→    eprintln!("[quartz-bridge] {line}");
+    49→}
+    50→
+    51→/// JNI 导出函数内 panic 会 abort 整个进程（游戏与壳层同进程）——统一吞掉并留痕。
+    52→/// 宏体内整体 unsafe：这些导出函数本质全是 FFI 边界，unsafe 是默认语境。
+    53→macro_rules! guard {
+    54→    ($body:block) => {
+    55→        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+    56→            $body
+    57→        }));
+    58→    };
+    59→}
+    60→
+    61→// ---------------------------------------------------------------------------
+    62→// JNI 指针辅助（jni-sys 0.3：JavaVM/JNIEnv 均为「函数表指针」别名）
+    63→// ---------------------------------------------------------------------------
+    64→
+    65→type EnvPtr = *mut JNIEnv; // C JNIEnv*
+    66→type VmPtr = *mut JavaVM; // C JavaVM*
+    67→
+    68→#[inline]
+    69→unsafe fn env_tbl(env: EnvPtr) -> &'static jni_sys::JNINativeInterface_ {
+    70→    &**env
+    71→}
+    72→
+    73→#[inline]
+    74→unsafe fn vm_tbl(vm: VmPtr) -> &'static jni_sys::JNIInvokeInterface_ {
+    75→    &**vm
+    76→}
+    77→
+    78→unsafe fn jstring_to_rust(env: EnvPtr, s: jstring) -> Option<String> {
+    79→    if s.is_null() {
+    80→        return None;
+    81→    }
+    82→    let tbl = env_tbl(env);
+    83→    let chars = (tbl.GetStringUTFChars.unwrap())(env, s, ptr::null_mut());
+    84→    if chars.is_null() {
+    85→        return None;
+    86→    }
+    87→    let text = CStr::from_ptr(chars).to_string_lossy().into_owned();
+    88→    (tbl.ReleaseStringUTFChars.unwrap())(env, s, chars);
+    89→    Some(text)
+    90→}
+    91→
+    92→unsafe fn rust_to_jstring(env: EnvPtr, text: &str) -> Option<jstring> {
+    93→    let cs = CString::new(text).ok()?;
+    94→    let tbl = env_tbl(env);
+    95→    let out = (tbl.NewStringUTF.unwrap())(env, cs.as_ptr());
+    96→    if env_tbl(env).ExceptionCheck.unwrap()(env) != 0 {
+    97→        env_tbl(env).ExceptionClear.unwrap()(env);
+    98→        return None;
+    99→    }
+   100→    Some(out)
+   101→}
+   102→
+   103→/// 线程附着的 OpenJDK（runtime）env：GetEnv -> EDETACHED 则 Attach。
+   104→unsafe fn runtime_env() -> Option<EnvPtr> {
+   105→    let s = state();
+   106→    let vm = s.rt_vm.load(Ordering::Acquire);
+   107→    if vm.is_null() {
+   108→        return None;
+   109→    }
+   110→    let iface = vm_tbl(vm);
+   111→    let mut env: EnvPtr = ptr::null_mut();
+   112→    let rc = (iface.GetEnv.unwrap())(vm, &mut env as *mut EnvPtr as *mut *mut c_void, JNI_VERSION_1_4);
+   113→    if rc == JNI_OK && !env.is_null() {
+   114→        return Some(env);
+   115→    }
+   116→    if rc == jni_sys::JNI_EDETACHED {
+   117→        let rc = (iface.AttachCurrentThread.unwrap())(
+   118→            vm,
+   119→            &mut env as *mut EnvPtr as *mut *mut c_void,
+   120→            ptr::null_mut(),
+   121→        );
+   122→        if rc == JNI_OK && !env.is_null() {
+   123→            return Some(env);
+   124→        }
+   125→    }
+   126→    None
+   127→}
+   128→
+   129→/// 线程附着的 ART（壳层）env。
+   130→unsafe fn art_env() -> Option<EnvPtr> {
+   131→    let s = state();
+   132→    let vm = s.art_vm.load(Ordering::Acquire);
+   133→    if vm.is_null() {
+   134→        return None;
+   135→    }
+   136→    let iface = vm_tbl(vm);
+   137→    let mut env: EnvPtr = ptr::null_mut();
+   138→    let rc = (iface.GetEnv.unwrap())(vm, &mut env as *mut EnvPtr as *mut *mut c_void, JNI_VERSION_1_4);
+   139→    if rc == JNI_OK && !env.is_null() {
+   140→        return Some(env);
+   141→    }
+   142→    if rc == jni_sys::JNI_EDETACHED {
+   143→        let rc = (iface.AttachCurrentThread.unwrap())(
+   144→            vm,
+   145→            &mut env as *mut EnvPtr as *mut *mut c_void,
+   146→            ptr::null_mut(),
+   147→        );
+   148→        if rc == JNI_OK && !env.is_null() {
+   149→            return Some(env);
+   150→        }
+   151→    }
+   152→    None
+   153→}
+   154→
+   155→// ---------------------------------------------------------------------------
+   156→// 事件
+   157→// ---------------------------------------------------------------------------
+   158→
+   159→#[derive(Clone, Copy, Debug)]
+   160→pub struct Event {
+   161→    pub typ: i32,
+   162→    pub i1: i32,
+   163→    pub i2: i32,
+   164→    pub i3: i32,
+   165→    pub i4: i32,
+   166→    pub dx: f64,
+   167→    pub dy: f64,
+   168→}
+   169→
+   170→impl Event {
+   171→    fn ints(typ: i32, i1: i32, i2: i32, i3: i32, i4: i32) -> Self {
+   172→        Event { typ, i1, i2, i3, i4, dx: 0.0, dy: 0.0 }
+   173→    }
+   174→}
+   175→
+   176→// ---------------------------------------------------------------------------
+   177→// 全局状态
+   178→// ---------------------------------------------------------------------------
+   179→
+   180→struct State {
+   181→    /// ART（壳层）JavaVM，由壳层经 quartz_bridge_init 显式注入。
+   182→    art_vm: AtomicPtr<JavaVM>,
+   183→    /// OpenJDK（游戏）JavaVM，由 JNI_OnLoad（jar 的 System.loadLibrary）设置。
+   184→    rt_vm: AtomicPtr<JavaVM>,
+   185→    /// com.quartz.launcher.QuartzBridge 全局引用 + 方法 ID（壳层 init 注入）。
+   186→    art_class: AtomicPtr<c_void>,
+   187→    m_on_grab: AtomicPtr<c_void>,
+   188→    m_clipboard: AtomicPtr<c_void>,
+   189→    /// org.lwjgl.glfw.GLFW 全局引用 + 回调方法 ID（JNI_OnLoad 缓存）。
+   190→    rt_glfw_class: AtomicPtr<c_void>,
+   191→    m_monitor_size: AtomicPtr<c_void>,
+   192→    m_window_size: AtomicPtr<c_void>,
+   193→    /// jar 直读按键缓冲地址（allocateDirect，GetDirectBufferAddress 取得）。
+   194→    key_buf: AtomicPtr<u8>,
+   195→    mouse_buf: AtomicPtr<u8>,
+   196→
+   197→    /// 当前 ANativeWindow（壳层 Surface 交接）。
+   198→    window: AtomicPtr<ANativeWindow>,
+   199→
+   200→    /// 输入事件队列（ART 线程生产 → 渲染线程 pump 消费）。
+   201→    queue: Mutex<Vec<Event>>,
+   202→    /// 本帧 pump 快照（Pojav StartPumping 语义）。
+   203→    pump_buf: Mutex<Vec<Event>>,
+   204→
+   205→    cursor: Mutex<(f64, f64)>,
+   206→    cursor_last: Mutex<(f64, f64)>,
+   207→    showing: AtomicI64,
+   208→    input_ready: AtomicBool,
+   209→    grabbing: AtomicBool,
+   210→    cursor_entered: AtomicBool,
+   211→    upd_mouse: AtomicBool,
+   212→    upd_monitor: AtomicBool,
+   213→    monitor_consumed: AtomicBool,
+   214→    saved_w: AtomicI32,
+   215→    saved_h: AtomicI32,
+   216→
+   217→    cb_char: AtomicUsize,
+   218→    cb_char_mods: AtomicUsize,
+   219→    cb_cursor_enter: AtomicUsize,
+   220→    cb_cursor_pos: AtomicUsize,
+   221→    cb_key: AtomicUsize,
+   222→    cb_mouse: AtomicUsize,
+   223→    cb_scroll: AtomicUsize,
+   224→
+   225→    renderer: AtomicI32,
+   226→    windows: Mutex<HashMap<usize, Arc<RenderWindow>>>,
+   227→    main_window: Mutex<Option<usize>>,
+   228→}
+   229→
+   230→static STATE: OnceLock<State> = OnceLock::new();
+   231→
+   232→fn state() -> &'static State {
+   233→    STATE.get_or_init(|| State {
+   234→        art_vm: AtomicPtr::new(ptr::null_mut()),
+   235→        rt_vm: AtomicPtr::new(ptr::null_mut()),
+   236→        art_class: AtomicPtr::new(ptr::null_mut()),
+   237→        m_on_grab: AtomicPtr::new(ptr::null_mut()),
+   238→        m_clipboard: AtomicPtr::new(ptr::null_mut()),
+   239→        rt_glfw_class: AtomicPtr::new(ptr::null_mut()),
+   240→        m_monitor_size: AtomicPtr::new(ptr::null_mut()),
+   241→        m_window_size: AtomicPtr::new(ptr::null_mut()),
+   242→        key_buf: AtomicPtr::new(ptr::null_mut()),
+   243→        mouse_buf: AtomicPtr::new(ptr::null_mut()),
+   244→        window: AtomicPtr::new(ptr::null_mut()),
+   245→        queue: Mutex::new(Vec::new()),
+   246→        pump_buf: Mutex::new(Vec::new()),
+   247→        cursor: Mutex::new((0.0, 0.0)),
+   248→        cursor_last: Mutex::new((0.0, 0.0)),
+   249→        showing: AtomicI64::new(0),
+   250→        input_ready: AtomicBool::new(false),
+   251→        grabbing: AtomicBool::new(false),
+   252→        cursor_entered: AtomicBool::new(false),
+   253→        upd_mouse: AtomicBool::new(false),
+   254→        upd_monitor: AtomicBool::new(false),
+   255→        monitor_consumed: AtomicBool::new(false),
+   256→        saved_w: AtomicI32::new(0),
+   257→        saved_h: AtomicI32::new(0),
+   258→        cb_char: AtomicUsize::new(0),
+   259→        cb_char_mods: AtomicUsize::new(0),
+   260→        cb_cursor_enter: AtomicUsize::new(0),
+   261→        cb_cursor_pos: AtomicUsize::new(0),
+   262→        cb_key: AtomicUsize::new(0),
+   263→        cb_mouse: AtomicUsize::new(0),
+   264→        cb_scroll: AtomicUsize::new(0),
+   265→        renderer: AtomicI32::new(RENDERER_GL4ES),
+   266→        windows: Mutex::new(HashMap::new()),
+   267→        main_window: Mutex::new(None),
+   268→    })
+   269→}
+   270→
+   271→// ---------------------------------------------------------------------------
+   272→// ANativeWindow（libandroid）
+   273→// ---------------------------------------------------------------------------
+   274→
+   275→#[repr(C)]
+   276→pub struct ANativeWindow {
+   277→    _p: [u8; 0],
+   278→}
+   279→
+   280→extern "C" {
+   281→    fn ANativeWindow_fromSurface(env: *mut JNIEnv, surface: jobject) -> *mut ANativeWindow;
+   282→    fn ANativeWindow_acquire(window: *mut ANativeWindow);
+   283→    fn ANativeWindow_release(window: *mut ANativeWindow);
+   284→    fn ANativeWindow_getWidth(window: *mut ANativeWindow) -> i32;
+   285→    fn ANativeWindow_getHeight(window: *mut ANativeWindow) -> i32;
+   286→    fn ANativeWindow_setBuffersGeometry(
+   287→        window: *mut ANativeWindow,
+   288→        width: i32,
+   289→        height: i32,
+   290→        format: i32,
+   291→    ) -> i32;
+   292→}
+   293→
+   294→// ---------------------------------------------------------------------------
+   295→// EGL（运行期 dlopen 渲染层 EGL 实现：POJAVEXEC_EGL，兜底 libEGL.so）
+   296→// ---------------------------------------------------------------------------
+   297→
+   298→pub mod egl {
+   299→    use super::*;
+   300→
+   301→    pub type EGLDisplay = *mut c_void;
+   302→    pub type EGLConfig = *mut c_void;
+   303→    pub type EGLContext = *mut c_void;
+   304→    pub type EGLSurface = *mut c_void;
+   305→
+   306→    pub const EGL_TRUE: u32 = 1;
+   307→    pub const EGL_NO_DISPLAY: EGLDisplay = ptr::null_mut();
+   308→    pub const EGL_NO_SURFACE: EGLSurface = ptr::null_mut();
+   309→    pub const EGL_NO_CONTEXT: EGLContext = ptr::null_mut();
+   310→    pub const EGL_DEFAULT_DISPLAY: *mut c_void = ptr::null_mut();
+   311→    pub const EGL_OPENGL_ES_API: u32 = 0x30A0;
+   312→    pub const EGL_OPENGL_API: u32 = 0x30A2;
+   313→    pub const EGL_SURFACE_TYPE: i32 = 0x1233;
+   314→    pub const EGL_WINDOW_BIT: i32 = 0x0004;
+   315→    pub const EGL_PBUFFER_BIT: i32 = 0x0001;
+   316→    pub const EGL_BLUE_SIZE: i32 = 0x1222;
+   317→    pub const EGL_GREEN_SIZE: i32 = 0x1223;
+   318→    pub const EGL_RED_SIZE: i32 = 0x1224;
+   319→    pub const EGL_ALPHA_SIZE: i32 = 0x1221;
+   320→    pub const EGL_DEPTH_SIZE: i32 = 0x1225;
+   321→    pub const EGL_RENDERABLE_TYPE: i32 = 0x1240;
+   322→    pub const EGL_OPENGL_ES2_BIT: i32 = 0x0004;
+   323→    pub const EGL_NONE: i32 = 0x3038;
+   324→    pub const EGL_CONTEXT_CLIENT_VERSION: i32 = 0x3098;
+   325→    pub const EGL_NATIVE_VISUAL_ID: i32 = 0x302E;
+   326→    pub const EGL_BAD_SURFACE: i32 = 0x300D;
+   327→    pub const EGL_WIDTH: i32 = 0x3057;
+   328→    pub const EGL_HEIGHT: i32 = 0x3056;
+   329→
+   330→    type EglMakeCurrentFn =
+   331→        unsafe extern "system" fn(EGLDisplay, EGLSurface, EGLSurface, EGLContext) -> u32;
+   332→    type EglDisplayFn = unsafe extern "system" fn(*mut c_void) -> EGLDisplay;
+   333→    type EglInitializeFn = unsafe extern "system" fn(EGLDisplay, *mut i32, *mut i32) -> u32;
+   334→    type EglChooseConfigFn =
+   335→        unsafe extern "system" fn(EGLDisplay, *const i32, *mut EGLConfig, i32, *mut i32) -> u32;
+   336→    type EglConfigAttribFn = unsafe extern "system" fn(EGLDisplay, EGLConfig, i32, *mut i32) -> u32;
+   337→    type EglBindApiFn = unsafe extern "system" fn(u32) -> u32;
+   338→    type EglCreateContextFn =
+   339→        unsafe extern "system" fn(EGLDisplay, EGLConfig, EGLContext, *const i32) -> EGLContext;
+   340→    type EglCreateWindowSurfaceFn =
+   341→        unsafe extern "system" fn(EGLDisplay, EGLConfig, *mut c_void, *const i32) -> EGLSurface;
+   342→    type EglCreatePbufferSurfaceFn =
+   343→        unsafe extern "system" fn(EGLDisplay, EGLConfig, *const i32) -> EGLSurface;
+   344→    type EglDestroyFn = unsafe extern "system" fn(EGLDisplay, EGLSurface) -> u32;
+   345→    type EglTerminateFn = unsafe extern "system" fn(EGLDisplay) -> u32;
+   346→    type EglSwapBuffersFn = unsafe extern "system" fn(EGLDisplay, EGLSurface) -> u32;
+   347→    type EglSwapIntervalFn = unsafe extern "system" fn(EGLDisplay, i32) -> u32;
+   348→    type EglQuerySurfaceFn = unsafe extern "system" fn(EGLDisplay, EGLSurface, i32, *mut i32) -> u32;
+   349→    type EglGetErrorFn = unsafe extern "system" fn() -> i32;
+   350→
+   351→    #[derive(Clone, Copy)]
+   352→    pub struct EglApi {
+   353→        pub make_current: Option<EglMakeCurrentFn>,
+   354→        pub destroy_surface: Option<EglDestroyFn>,
+   355→        pub destroy_context: Option<EglDestroyFn>,
+   356→        pub terminate: Option<EglTerminateFn>,
+   357→        pub get_display: Option<EglDisplayFn>,
+   358→        pub initialize: Option<EglInitializeFn>,
+   359→        pub choose_config: Option<EglChooseConfigFn>,
+   360→        pub get_config_attrib: Option<EglConfigAttribFn>,
+   361→        pub bind_api: Option<EglBindApiFn>,
+   362→        pub create_context: Option<EglCreateContextFn>,
+   363→        pub create_window_surface: Option<EglCreateWindowSurfaceFn>,
+   364→        pub create_pbuffer_surface: Option<EglCreatePbufferSurfaceFn>,
+   365→        pub swap_buffers: Option<EglSwapBuffersFn>,
+   366→        pub swap_interval: Option<EglSwapIntervalFn>,
+   367→        pub query_surface: Option<EglQuerySurfaceFn>,
+   368→        pub get_error: Option<EglGetErrorFn>,
+   369→    }
+   370→
+   371→    /// dlopen 渲染层 EGL 实现并解析符号（Pojav egl_loader.c 的 dlsym_EGL 语义）。
+   372→    pub fn load_api() -> Option<EglApi> {
+   373→        extern "C" {
+   374→            fn dlopen(filename: *const c_char, flag: c_int) -> *mut c_void;
+   375→            fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+   376→        }
+   377→        const RTLD_LAZY: c_int = 1;
+   378→        const RTLD_LOCAL: c_int = 0;
+   379→
+   380→        let configured = std::env::var("POJAVEXEC_EGL").unwrap_or_default();
+   381→        let path = if configured.is_empty() { "libEGL.so".to_string() } else { configured };
+   382→        let cpath = CString::new(path.clone()).ok()?;
+   383→        let handle = unsafe { dlopen(cpath.as_ptr(), RTLD_LAZY | RTLD_LOCAL) };
+   384→        if handle.is_null() {
+   385→            log(&format!("EGL 库加载失败：{path}"));
+   386→            return None;
+   387→        }
+   388→        let mut api = EglApi {
+   389→            make_current: None,
+   390→            destroy_surface: None,
+   391→            destroy_context: None,
+   392→            terminate: None,
+   393→            get_display: None,
+   394→            initialize: None,
+   395→            choose_config: None,
+   396→            get_config_attrib: None,
+   397→            bind_api: None,
+   398→            create_context: None,
+   399→            create_window_surface: None,
+   400→            create_pbuffer_surface: None,
+   401→            swap_buffers: None,
+   402→            swap_interval: None,
+   403→            query_surface: None,
+   404→            get_error: None,
+   405→        };
+   406→        macro_rules! get {
+   407→            ($field:ident, $name:literal, $ty:ty) => {{
+   408→                let cname = CString::new($name).unwrap();
+   409→                let p = unsafe { dlsym(handle, cname.as_ptr()) };
+   410→                if p.is_null() {
+   411→                    log(&concat!("EGL 符号缺失：", $name));
+   412→                    return None;
+   413→                }
+   414→                api.$field = Some(unsafe { std::mem::transmute::<*mut c_void, $ty>(p) });
+   415→            }};
+   416→        }
+   417→        get!(make_current, "eglMakeCurrent", EglMakeCurrentFn);
+   418→        get!(destroy_surface, "eglDestroySurface", EglDestroyFn);
+   419→        get!(destroy_context, "eglDestroyContext", EglDestroyFn);
+   420→        get!(terminate, "eglTerminate", EglTerminateFn);
+   421→        get!(get_display, "eglGetDisplay", EglDisplayFn);
+   422→        get!(initialize, "eglInitialize", EglInitializeFn);
+   423→        get!(choose_config, "eglChooseConfig", EglChooseConfigFn);
+   424→        get!(get_config_attrib, "eglGetConfigAttrib", EglConfigAttribFn);
+   425→        get!(bind_api, "eglBindAPI", EglBindApiFn);
+   426→        get!(create_context, "eglCreateContext", EglCreateContextFn);
+   427→        get!(create_window_surface, "eglCreateWindowSurface", EglCreateWindowSurfaceFn);
+   428→        get!(create_pbuffer_surface, "eglCreatePbufferSurface", EglCreatePbufferSurfaceFn);
+   429→        get!(swap_buffers, "eglSwapBuffers", EglSwapBuffersFn);
+   430→        get!(swap_interval, "eglSwapInterval", EglSwapIntervalFn);
+   431→        get!(query_surface, "eglQuerySurface", EglQuerySurfaceFn);
+   432→        get!(get_error, "eglGetError", EglGetErrorFn);
+   433→        Some(api)
+   434→    }
+   435→
+   436→    pub const STATE_ALIVE: i32 = 0;
+   437→    pub const STATE_NEW_WINDOW: i32 = 1;
+   438→
+   439→    /// GL 渲染窗口（Pojav gl_render_window_t 语义）。
+   440→    /// 裸指针 Cell：RenderWindow 仅经由 windows/main_window 锁访问（渲染线程 +
+   441→    /// 壳层 UI 线程），字段访问点全部持锁 —— Send/Sync 手工声明是受控的。
+   442→    pub struct RenderWindow {
+   443→        pub state: std::cell::Cell<i32>,
+   444→        pub config: std::cell::Cell<EGLConfig>,
+   445→        pub context: std::cell::Cell<EGLContext>,
+   446→        pub surface: std::cell::Cell<EGLSurface>,
+   447→        pub format: std::cell::Cell<i32>,
+   448→        pub native_surface: std::cell::Cell<*mut ANativeWindow>,
+   449→        pub new_native_surface: std::cell::Cell<*mut ANativeWindow>,
+   450→    }
+   451→
+   452→    unsafe impl Send for RenderWindow {}
+   453→    unsafe impl Sync for RenderWindow {}
+   454→}
+   455→
+   456→pub use egl::RenderWindow;
+   457→
+   458→/// EGL 句柄存 usize（raw 指针非 Send/Sync，无法进 static Mutex；使用点再回转）。
+   459→static EGL_STATE: Mutex<Option<(egl::EglApi, usize)>> = Mutex::new(None);
+   460→
+   461→// ---------------------------------------------------------------------------
+   462→// GLFW Java 侧回调（internalChangeMonitorSize / internalWindowSizeChanged）
+   463→// ---------------------------------------------------------------------------
+   464→
+   465→unsafe fn call_glfw_void(method_slot: &AtomicPtr<c_void>, label: &str, args: &[jvalue]) {
+   466→    let Some(env) = (unsafe { runtime_env() }) else { return };
+   467→    unsafe {
+   468→        let cls = state().rt_glfw_class.load(Ordering::Acquire) as jclass;
+   469→        let mid = method_slot.load(Ordering::Acquire) as jmethodID;
+   470→        if cls.is_null() || mid.is_null() {
+   471→            return;
+   472→        }
+   473→        let tbl = env_tbl(env);
+   474→        let Some(call) = tbl.CallStaticVoidMethodA else { return };
+   475→        if tbl.ExceptionCheck.unwrap()(env) != 0 {
+   476→            tbl.ExceptionClear.unwrap()(env);
+   477→        }
+   478→        call(env, cls, mid, args.as_ptr());
+   479→        if tbl.ExceptionCheck.unwrap()(env) != 0 {
+   480→            tbl.ExceptionClear.unwrap()(env);
+   481→            log(&format!("GLFW 回调异常已清除（{label}）"));
+   482→        }
+   483→    }
+   484→}
+   485→
+   486→fn update_monitor_size_call() {
+   487→    let s = state();
+   488→    let w = s.saved_w.load(Ordering::Acquire);
+   489→    let h = s.saved_h.load(Ordering::Acquire);
+   490→    let args = [jvalue { i: w }, jvalue { i: h }];
+   491→    unsafe {
+   492→        call_glfw_void(&s.m_monitor_size, "internalChangeMonitorSize", &args);
+   493→    }
+   494→}
+   495→
+   496→fn update_window_size_call(window: usize) {
+   497→    let args = [jvalue { j: window as jlong }];
+   498→    unsafe {
+   499→        call_glfw_void(&state().m_window_size, "internalWindowSizeChanged", &args);
+   500→    }
+   501→}
+   502→
+   503→// ---------------------------------------------------------------------------
+   504→// pojav* 函数表（jar 的 GLFW$Functions 逐名解析；ABI 与字节码核对）
+   505→// ---------------------------------------------------------------------------
+   506→
+   507→/// `int pojavInit(void)` —— glfwInit。
+   508→#[no_mangle]
+   509→pub extern "C" fn pojav_init() -> c_int {
+   510→    let mut ok = false;
+   511→    guard!({
+   512→        let s = state();
+   513→        let window = s.window.load(Ordering::Acquire);
+   514→        let (mut w, mut h) = (0, 0);
+   515→        if !window.is_null() {
+   516→            ANativeWindow_acquire(window);
+   517→            w = ANativeWindow_getWidth(window);
+   518→            h = ANativeWindow_getHeight(window);
+   519→            s.saved_w.store(w, Ordering::Release);
+   520→            s.saved_h.store(h, Ordering::Release);
+   521→            ANativeWindow_setBuffersGeometry(window, w, h, WINDOW_FORMAT_RGBX_8888);
+   522→            s.upd_monitor.store(true, Ordering::Release);
+   523→            s.monitor_consumed.store(false, Ordering::Release);
+   524→        } else {
+   525→            log("pojavInit：ANativeWindow 尚未就绪（等待壳层 Surface）");
+   526→        }
+   527→        let renderer_env = std::env::var("POJAV_RENDERER").unwrap_or_default();
+   528→        if renderer_env.starts_with("vulkan_zink") {
+   529→            s.renderer.store(RENDERER_VK_ZINK, Ordering::Release);
+   530→            log("渲染桥：Zink 路径待 M2（Mesa pack 未接入）");
+   531→            return;
+   532→        }
+   533→        s.renderer.store(RENDERER_GL4ES, Ordering::Release);
+   534→        if let Some(api) = egl::load_api() {
+   535→            let display = (api.get_display.unwrap())(egl::EGL_DEFAULT_DISPLAY);
+   536→            if display != egl::EGL_NO_DISPLAY
+   537→                && (api.initialize.unwrap())(display, ptr::null_mut(), ptr::null_mut()) == egl::EGL_TRUE
+   538→            {
+   539→                *EGL_STATE.lock().unwrap() = Some((api, display as usize));
+   540→                log("EGL 桥就绪（渲染层实现库）");
+   541→                ok = true;
+   542→            } else {
+   543→                let err = (api.get_error.unwrap())();
+   544→                log(&format!("EGL 初始化失败：{err:#06x}"));
+   545→            }
+   546→        }
+   547→        log(&format!("pojavInit：窗口 {w}x{h}"));
+   548→    });
+   549→    if ok { 1 } else { 1 } // 与 Pojav 一致恒返 1（失败细节已写日志，MC 会再报错）
+   550→}
+   551→
+   552→/// `void* pojavCreateContext(void* share)` —— nglfwCreateContext。
+   553→#[no_mangle]
+   554→pub extern "C" fn pojav_create_context(share: *mut c_void) -> *mut c_void {
+   555→    let mut result: *mut c_void = ptr::null_mut();
+   556→    guard!({
+   557→        let s = state();
+   558→        let guard = EGL_STATE.lock().unwrap();
+   559→        let Some((api, display)) = guard.as_ref() else {
+   560→            log("pojavCreateContext：EGL 未初始化");
+   561→            return;
+   562→        };
+   563→        let display = *display as egl::EGLDisplay;
+   564→        let attributes: [i32; 15] = [
+   565→            egl::EGL_BLUE_SIZE, 8,
+   566→            egl::EGL_GREEN_SIZE, 8,
+   567→            egl::EGL_RED_SIZE, 8,
+   568→            egl::EGL_ALPHA_SIZE, 8,
+   569→            egl::EGL_DEPTH_SIZE, 24,
+   570→            egl::EGL_SURFACE_TYPE, egl::EGL_WINDOW_BIT | egl::EGL_PBUFFER_BIT,
+   571→            egl::EGL_RENDERABLE_TYPE, egl::EGL_OPENGL_ES2_BIT,
+   572→            egl::EGL_NONE,
+   573→        ];
+   574→        let mut num_configs: i32 = 0;
+   575→        if (api.choose_config.unwrap())(display, attributes.as_ptr(), ptr::null_mut(), 0, &mut num_configs)
+   576→            != egl::EGL_TRUE
+   577→            || num_configs == 0
+   578→        {
+   579→            let err = (api.get_error.unwrap())();
+   580→            log(&format!("eglChooseConfig 失败：{err:#06x}（configs={num_configs}）"));
+   581→            return;
+   582→        }
+   583→        let mut config: egl::EGLConfig = ptr::null_mut();
+   584→        let mut got: i32 = 0;
+   585→        (api.choose_config.unwrap())(display, attributes.as_ptr(), &mut config, 1, &mut got);
+   586→        let mut format: i32 = 0;
+   587→        (api.get_config_attrib.unwrap())(display, config, egl::EGL_NATIVE_VISUAL_ID, &mut format);
+   588→
+   589→        let renderer_env = std::env::var("POJAV_RENDERER").unwrap_or_default();
+   590→        let bind = if renderer_env.contains("desktopgl") {
+   591→            (api.bind_api.unwrap())(egl::EGL_OPENGL_API)
+   592→        } else {
+   593→            (api.bind_api.unwrap())(egl::EGL_OPENGL_ES_API)
+   594→        };
+   595→        if bind != egl::EGL_TRUE {
+   596→            log("eglBindAPI 失败");
+   597→        }
+   598→
+   599→        // GLES 主版本：LIBGL_ES 显式指定（mobileglues 默认 3，gl4es 默认 2）
+   600→        let es = std::env::var("LIBGL_ES")
+   601→            .ok()
+   602→            .and_then(|v| v.trim().parse::<i32>().ok())
+   603→            .filter(|v| (1..=3).contains(v))
+   604→            .unwrap_or(if renderer_env.contains("mobileglues") { 3 } else { 2 });
+   605→        let ctx_attrs = [egl::EGL_CONTEXT_CLIENT_VERSION, es, egl::EGL_NONE];
+   606→        let share_ctx = if share.is_null() {
+   607→            egl::EGL_NO_CONTEXT
+   608→        } else {
+   609→            let windows = s.windows.lock().unwrap();
+   610→            match windows.get(&(share as usize)) {
+   611→                Some(w) => w.context.get(),
+   612→                None => egl::EGL_NO_CONTEXT,
+   613→            }
+   614→        };
+   615→        let context = (api.create_context.unwrap())(display, config, share_ctx, ctx_attrs.as_ptr());
+   616→        if context == egl::EGL_NO_CONTEXT {
+   617→            let err = (api.get_error.unwrap())();
+   618→            log(&format!("eglCreateContext 失败：{err:#06x}（client_version={es}）"));
+   619→            return;
+   620→        }
+   621→        let bundle = Arc::new(RenderWindow {
+   622→            state: std::cell::Cell::new(egl::STATE_ALIVE),
+   623→            config: std::cell::Cell::new(config),
+   624→            context: std::cell::Cell::new(context),
+   625→            surface: std::cell::Cell::new(ptr::null_mut()),
+   626→            format: std::cell::Cell::new(format),
+   627→            native_surface: std::cell::Cell::new(ptr::null_mut()),
+   628→            new_native_surface: std::cell::Cell::new(ptr::null_mut()),
+   629→        });
+   630→        let handle = Arc::as_ptr(&bundle) as usize;
+   631→        s.windows.lock().unwrap().insert(handle, bundle);
+   632→        log(&format!("pojavCreateContext：窗口 {handle:#x}（GLES{es}）"));
+   633→        result = handle as *mut c_void;
+   634→    });
+   635→    result
+   636→}
+   637→
+   638→thread_local! {
+   639→    static CURRENT_WINDOW: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+   640→}
+   641→
+   642→/// `void* pojavGetCurrentContext(void)`。
+   643→#[no_mangle]
+   644→pub extern "C" fn pojav_get_current_context() -> *mut c_void {
+   645→    let cur = CURRENT_WINDOW.with(|c| c.get());
+   646→    if cur == 0 { ptr::null_mut() } else { cur as *mut c_void }
+   647→}
+   648→
+   649→/// Pojav gl_bridge.c gl_swap_surface：换绑新 Surface 或 1x1 pbuffer 兜底。
+   650→unsafe fn gl_swap_surface(bundle: &Arc<RenderWindow>, display: egl::EGLDisplay, api: &egl::EglApi) {
+   651→    let old_native = bundle.native_surface.get();
+   652→    if !old_native.is_null() {
+   653→        ANativeWindow_release(old_native);
+   654→        bundle.native_surface.set(ptr::null_mut());
+   655→    }
+   656→    if !bundle.surface.get().is_null() {
+   657→        (api.destroy_surface.unwrap())(display, bundle.surface.get());
+   658→        bundle.surface.set(ptr::null_mut());
+   659→    }
+   660→    let new_native = bundle.new_native_surface.get();
+   661→    if !new_native.is_null() {
+   662→        bundle.new_native_surface.set(ptr::null_mut());
+   663→        bundle.native_surface.set(new_native);
+   664→        ANativeWindow_acquire(new_native);
+   665→        ANativeWindow_setBuffersGeometry(new_native, 0, 0, bundle.format.get());
+   666→        let surface =
+   667→            (api.create_window_surface.unwrap())(display, bundle.config.get(), new_native as *mut c_void, ptr::null());
+   668→        bundle.surface.set(surface);
+   669→        if surface.is_null() {
+   670→            let err = (api.get_error.unwrap())();
+   671→            log(&format!("eglCreateWindowSurface 失败：{err:#06x}"));
+   672→        }
+   673→    } else {
+   674→        log("无新 Surface，切 1x1 pbuffer 兜底");
+   675→        let pbuf_attrs = [egl::EGL_WIDTH, 1, egl::EGL_HEIGHT, 1, egl::EGL_NONE];
+   676→        bundle
+   677→            .surface
+   678→            .set((api.create_pbuffer_surface.unwrap())(display, bundle.config.get(), pbuf_attrs.as_ptr()));
+   679→    }
+   680→}
+   681→
+   682→/// `void pojavMakeCurrent(void* window)`。
+   683→#[no_mangle]
+   684→pub extern "C" fn pojav_make_current(window: *mut c_void) {
+   685→    guard!({
+   686→        let s = state();
+   687→        let handle = window as usize;
+   688→        if window.is_null() {
+   689→            let guard = EGL_STATE.lock().unwrap();
+   690→            if let Some((api, display)) = guard.as_ref() {
+   691→                let display = *display as egl::EGLDisplay;
+   692→                (api.make_current.unwrap())(display, egl::EGL_NO_SURFACE, egl::EGL_NO_SURFACE, egl::EGL_NO_CONTEXT);
+   693→            }
+   694→            CURRENT_WINDOW.with(|c| c.set(0));
+   695→            return;
+   696→        }
+   697→        let Some(bundle) = s.windows.lock().unwrap().get(&handle).cloned() else { return };
+   698→        let guard = EGL_STATE.lock().unwrap();
+   699→        let Some((api, display)) = guard.as_ref() else { return };
+   700→        let display = *display as egl::EGLDisplay;
+   701→        let mut first_main = false;
+   702→        {
+   703→            let mut main_slot = s.main_window.lock().unwrap();
+   704→            if main_slot.is_none() {
+   705→                *main_slot = Some(handle);
+   706→                first_main = true;
+   707→                bundle.new_native_surface.set(s.window.load(Ordering::Acquire));
+   708→                log(&format!("主窗口 bundle = {handle:#x}"));
+   709→            }
+   710→        }
+   711→        if bundle.surface.get().is_null() {
+   712→            gl_swap_surface(&bundle, display, api);
+   713→        }
+   714→        if (api.make_current.unwrap())(display, bundle.surface.get(), bundle.surface.get(), bundle.context.get())
+   715→            == egl::EGL_TRUE
+   716→        {
+   717→            CURRENT_WINDOW.with(|c| c.set(handle));
+   718→        } else {
+   719→            let err = (api.get_error.unwrap())();
+   720→            log(&format!("eglMakeCurrent 失败：{err:#06x}（首帧={first_main}）"));
+   721→            if first_main {
+   722→                bundle.new_native_surface.set(ptr::null_mut());
+   723→                gl_swap_surface(&bundle, display, api);
+   724→                s.main_window.lock().unwrap().take();
+   725→            }
+   726→        }
+   727→    });
+   728→}
+   729→
+   730→/// `void pojavSwapBuffers(void* window)`。
+   731→#[no_mangle]
+   732→pub extern "C" fn pojav_swap_buffers(_window: *mut c_void) {
+   733→    guard!({
+   734→        let guard = EGL_STATE.lock().unwrap();
+   735→        let Some((api, display)) = guard.as_ref() else { return };
+   736→        let display = *display as egl::EGLDisplay;
+   737→        let handle = CURRENT_WINDOW.with(|c| c.get());
+   738→        if handle == 0 {
+   739→            return;
+   740→        }
+   741→        let Some(bundle) = state().windows.lock().unwrap().get(&handle).cloned() else { return };
+   742→        if bundle.state.get() == egl::STATE_NEW_WINDOW {
+   743→            (api.make_current.unwrap())(display, egl::EGL_NO_SURFACE, egl::EGL_NO_SURFACE, egl::EGL_NO_CONTEXT);
+   744→            gl_swap_surface(&bundle, display, api);
+   745→            (api.make_current.unwrap())(display, bundle.surface.get(), bundle.surface.get(), bundle.context.get());
+   746→            bundle.state.set(egl::STATE_ALIVE);
+   747→        }
+   748→        if !bundle.surface.get().is_null()
+   749→            && (api.swap_buffers.unwrap())(display, bundle.surface.get()) == 0
+   750→            && (api.get_error.unwrap())() == egl::EGL_BAD_SURFACE
+   751→        {
+   752→            log("EGL surface 失效（surfaceChanged），等待新窗口");
+   753→            (api.make_current.unwrap())(display, egl::EGL_NO_SURFACE, egl::EGL_NO_SURFACE, egl::EGL_NO_CONTEXT);
+   754→            bundle.new_native_surface.set(ptr::null_mut());
+   755→            gl_swap_surface(&bundle, display, api);
+   756→            (api.make_current.unwrap())(display, bundle.surface.get(), bundle.surface.get(), bundle.context.get());
+   757→        }
+   758→    });
+   759→}
+   760→
+   761→/// `void pojavSwapInterval(int)`。
+   762→#[no_mangle]
+   763→pub extern "C" fn pojav_swap_interval(interval: c_int) {
+   764→    guard!({
+   765→        let mut interval = interval;
+   766→        if std::env::var("FORCE_VSYNC").map(|v| v == "true").unwrap_or(false) {
+   767→            interval = 1;
+   768→        }
+   769→        let guard = EGL_STATE.lock().unwrap();
+   770→        if let Some((api, display)) = guard.as_ref() {
+   771→            let display = *display as egl::EGLDisplay;
+   772→            (api.swap_interval.unwrap())(display, interval);
+   773→        }
+   774→    });
+   775→}
+   776→
+   777→/// `void pojavSetWindowHint(int, int)` —— hint 全部 Java 侧消化，无需动作。
+   778→#[no_mangle]
+   779→pub extern "C" fn pojav_set_window_hint(_hint: c_int, _value: c_int) {}
+   780→
+   781→/// `void pojavTerminate(void)`。
+   782→#[no_mangle]
+   783→pub extern "C" fn pojav_terminate() {
+   784→    guard!({
+   785→        let s = state();
+   786→        s.input_ready.store(false, Ordering::Release);
+   787→        let guard = EGL_STATE.lock().unwrap();
+   788→        if let Some((api, display)) = guard.as_ref() {
+   789→            let display = *display as egl::EGLDisplay;
+   790→            (api.make_current.unwrap())(display, egl::EGL_NO_SURFACE, egl::EGL_NO_SURFACE, egl::EGL_NO_CONTEXT);
+   791→            let mut windows = s.windows.lock().unwrap();
+   792→            for (_, bundle) in windows.iter() {
+   793→                if !bundle.surface.get().is_null() {
+   794→                    (api.destroy_surface.unwrap())(display, bundle.surface.get());
+   795→                }
+   796→                (api.destroy_context.unwrap())(display, bundle.context.get());
+   797→                let native = bundle.native_surface.get();
+   798→                if !native.is_null() {
+   799→                    ANativeWindow_release(native);
+   800→                }
+   801→            }
+   802→            windows.clear();
+   803→            s.main_window.lock().unwrap().take();
+   804→            (api.terminate.unwrap())(display);
+   805→        }
+   806→        drop(guard);
+   807→        *EGL_STATE.lock().unwrap() = None;
+   808→        log("pojavTerminate 完成");
+   809→    });
+   810→}
+   811→
+   812→/// `void pojavStartPumping(void)`。
+   813→#[no_mangle]
+   814→pub extern "C" fn pojav_start_pumping() {
+   815→    let s = state();
+   816→    {
+   817→        let cursor = *s.cursor.lock().unwrap();
+   818→        let mut last = s.cursor_last.lock().unwrap();
+   819→        if *last != cursor {
+   820→            *last = cursor;
+   821→            s.upd_mouse.store(true, Ordering::Release);
+   822→        }
+   823→    }
+   824→    if s.upd_monitor.load(Ordering::Acquire) {
+   825→        update_monitor_size_call();
+   826→        s.monitor_consumed.store(true, Ordering::Release);
+   827→    }
+   828→    let mut queue = s.queue.lock().unwrap();
+   829→    let mut pump = s.pump_buf.lock().unwrap();
+   830→    pump.clear();
+   831→    std::mem::swap(&mut *queue, &mut *pump);
+   832→}
+   833→
+   834→/// `void pojavPumpEvents(void* window)` —— 对每个窗口派发本帧事件。
+   835→#[no_mangle]
+   836→pub extern "C" fn pojav_pump_events(window: *mut c_void) {
+   837→    guard!({
+   838→        let s = state();
+   839→        if s.upd_mouse.load(Ordering::Acquire) {
+   840→            let cb = s.cb_cursor_pos.load(Ordering::Acquire);
+   841→            if cb != 0 {
+   842→                let cursor = *s.cursor.lock().unwrap();
+   843→                let f: unsafe extern "system" fn(*mut c_void, f64, f64) = std::mem::transmute(cb);
+   844→                unsafe { f(window, cursor.0, cursor.1) };
+   845→            }
+   846→        }
+   847→        if s.upd_monitor.load(Ordering::Acquire) {
+   848→            update_window_size_call(window as usize);
+   849→        }
+   850→        let events: Vec<Event> = std::mem::take(&mut *s.pump_buf.lock().unwrap());
+   851→        for ev in events {
+   852→            match ev.typ {
+   853→                EVENT_TYPE_CHAR => {
+   854→                    let cb = s.cb_char.load(Ordering::Acquire);
+   855→                    if cb != 0 {
+   856→                        let f: unsafe extern "system" fn(*mut c_void, u32) = std::mem::transmute(cb);
+   857→                        unsafe { f(window, ev.i1 as u32) };
+   858→                    }
+   859→                }
+   860→                EVENT_TYPE_CHAR_MODS => {
+   861→                    let cb = s.cb_char_mods.load(Ordering::Acquire);
+   862→                    if cb != 0 {
+   863→                        let f: unsafe extern "system" fn(*mut c_void, u32, i32) = std::mem::transmute(cb);
+   864→                        unsafe { f(window, ev.i1 as u32, ev.i2) };
+   865→                    }
+   866→                }
+   867→                EVENT_TYPE_CURSOR_ENTER => {
+   868→                    let cb = s.cb_cursor_enter.load(Ordering::Acquire);
+   869→                    if cb != 0 {
+   870→                        let f: unsafe extern "system" fn(*mut c_void, i32) = std::mem::transmute(cb);
+   871→                        unsafe { f(window, ev.i1) };
+   872→                    }
+   873→                }
+   874→                EVENT_TYPE_KEY => {
+   875→                    let cb = s.cb_key.load(Ordering::Acquire);
+   876→                    if cb != 0 {
+   877→                        let f: unsafe extern "system" fn(*mut c_void, i32, i32, i32, i32) =
+   878→                            std::mem::transmute(cb);
+   879→                        unsafe { f(window, ev.i1, ev.i2, ev.i3, ev.i4) };
+   880→                    }
+   881→                }
+   882→                EVENT_TYPE_MOUSE_BUTTON => {
+   883→                    let cb = s.cb_mouse.load(Ordering::Acquire);
+   884→                    if cb != 0 {
+   885→                        let f: unsafe extern "system" fn(*mut c_void, i32, i32, i32) =
+   886→                            std::mem::transmute(cb);
+   887→                        unsafe { f(window, ev.i1, ev.i2, ev.i3) };
+   888→                    }
+   889→                }
+   890→                EVENT_TYPE_SCROLL => {
+   891→                    let cb = s.cb_scroll.load(Ordering::Acquire);
+   892→                    if cb != 0 {
+   893→                        let f: unsafe extern "system" fn(*mut c_void, f64, f64) =
+   894→                            std::mem::transmute(cb);
+   895→                        unsafe { f(window, ev.dx, ev.dy) };
+   896→                    }
+   897→                }
+   898→                _ => {}
+   899→            }
+   900→        }
+   901→    });
+   902→}
+   903→
+   904→/// `void pojavStopPumping(void)`。
+   905→#[no_mangle]
+   906→pub extern "C" fn pojav_stop_pumping() {
+   907→    let s = state();
+   908→    s.pump_buf.lock().unwrap().clear();
+   909→    s.upd_mouse.store(false, Ordering::Release);
+   910→    if s.upd_monitor.load(Ordering::Acquire) && s.monitor_consumed.load(Ordering::Acquire) {
+   911→        s.upd_monitor.store(false, Ordering::Release);
+   912→        s.monitor_consumed.store(false, Ordering::Release);
+   913→    }
+   914→}
+   915→
+   916→// ---------------------------------------------------------------------------
+   917→// 输入派发（Pojav critical_send_* 语义，队列模式恒开）
+   918→// ---------------------------------------------------------------------------
+   919→
+   920→fn dispatch_event(ev: Event) {
+   921→    let s = state();
+   922→    match ev.typ {
+   923→        EVENT_TYPE_CURSOR_POS => {
+   924→            // Pojav 语义：isCursorEntered 联动（无 enter 回调时 grab 下自行置位）
+   925→            if !s.cursor_entered.load(Ordering::Acquire) {
+   926→                if s.cb_cursor_enter.load(Ordering::Acquire) != 0 {
+   927→                    s.cursor_entered.store(true, Ordering::Release);
+   928→                    s.queue
+   929→                        .lock()
+   930→                        .unwrap()
+   931→                        .push(Event::ints(EVENT_TYPE_CURSOR_ENTER, 1, 0, 0, 0));
+   932→                } else if s.grabbing.load(Ordering::Acquire) {
+   933→                    s.cursor_entered.store(true, Ordering::Release);
+   934→                }
+   935→            }
+   936→            *s.cursor.lock().unwrap() = (ev.dx, ev.dy);
+   937→        }
+   938→        EVENT_TYPE_KEY => {
+   939→            let buf = s.key_buf.load(Ordering::Acquire);
+   940→            if !buf.is_null() {
+   941→                let key = ev.i1 as i64;
+   942→                if key >= 32 {
+   943→                    let idx = (key - 32) as usize;
+   944→                    if idx < KEY_BUF_SIZE {
+   945→                        unsafe { *buf.add(idx) = ev.i3 as u8 };
+   946→                    }
+   947→                }
+   948→            }
+   949→            s.queue.lock().unwrap().push(ev);
+   950→        }
+   951→        EVENT_TYPE_MOUSE_BUTTON => {
+   952→            let buf = s.mouse_buf.load(Ordering::Acquire);
+   953→            if !buf.is_null() {
+   954→                let btn = ev.i1.clamp(0, MOUSE_BUF_SIZE as i32 - 1) as usize;
+   955→                unsafe { *buf.add(btn) = ev.i2 as u8 };
+   956→            }
+   957→            s.queue.lock().unwrap().push(ev);
+   958→        }
+   959→        EVENT_TYPE_WINDOW_SIZE | EVENT_TYPE_FRAMEBUFFER_SIZE => {
+   960→            s.saved_w.store(ev.i1, Ordering::Release);
+   961→            s.saved_h.store(ev.i2, Ordering::Release);
+   962→            s.upd_monitor.store(true, Ordering::Release);
+   963→            s.monitor_consumed.store(false, Ordering::Release);
+   964→        }
+   965→        _ => {
+   966→            s.queue.lock().unwrap().push(ev);
+   967→        }
+   968→    }
+   969→}
+   970→
+   971→/// 解析 nativeSendData 的字符串载荷（壳层 Kotlin 与本桥的约定协议）：
+   972→/// 空格分隔 token，整型/浮点按事件类型解析。
+   973→fn parse_send_data(typ: i32, data: &str) -> Option<Event> {
+   974→    let mut it = data.split_whitespace();
+   975→    let mut next_i = |it: &mut std::str::SplitWhitespace| it.next().and_then(|t| t.parse::<i64>().ok());
+   976→    let mut next_f = |it: &mut std::str::SplitWhitespace| it.next().and_then(|t| t.parse::<f64>().ok());
+   977→    match typ {
+   978→        EVENT_TYPE_CHAR => Some(Event::ints(EVENT_TYPE_CHAR, next_i(&mut it)? as i32, 0, 0, 0)),
+   979→        EVENT_TYPE_CHAR_MODS => Some(Event::ints(
+   980→            EVENT_TYPE_CHAR_MODS,
+   981→            next_i(&mut it)? as i32,
+   982→            next_i(&mut it)? as i32,
+   983→            0,
+   984→            0,
+   985→        )),
+   986→        EVENT_TYPE_CURSOR_ENTER => Some(Event::ints(EVENT_TYPE_CURSOR_ENTER, next_i(&mut it)? as i32, 0, 0, 0)),
+   987→        EVENT_TYPE_CURSOR_POS => {
+   988→            let dx = next_f(&mut it)?;
+   989→            let dy = next_f(&mut it)?;
+   990→            Some(Event { typ: EVENT_TYPE_CURSOR_POS, i1: 0, i2: 0, i3: 0, i4: 0, dx, dy })
+   991→        }
+   992→        EVENT_TYPE_KEY => Some(Event::ints(
+   993→            EVENT_TYPE_KEY,
+   994→            next_i(&mut it)? as i32,
+   995→            next_i(&mut it)? as i32,
+   996→            next_i(&mut it)? as i32,
+   997→            next_i(&mut it)? as i32,
+   998→        )),
+   999→        EVENT_TYPE_MOUSE_BUTTON => Some(Event::ints(
+  1000→            EVENT_TYPE_MOUSE_BUTTON,
+  1001→            next_i(&mut it)? as i32,
+  1002→            next_i(&mut it)? as i32,
+  1003→            next_i(&mut it)? as i32,
+  1004→            0,
+  1005→        )),
+  1006→        EVENT_TYPE_SCROLL => {
+  1007→            let dx = next_f(&mut it)?;
+  1008→            let dy = next_f(&mut it)?;
+  1009→            Some(Event { typ: EVENT_TYPE_SCROLL, i1: 0, i2: 0, i3: 0, i4: 0, dx, dy })
+  1010→        }
+  1011→        EVENT_TYPE_WINDOW_SIZE | EVENT_TYPE_FRAMEBUFFER_SIZE => Some(Event::ints(
+  1012→            typ,
+  1013→            next_i(&mut it)? as i32,
+  1014→            next_i(&mut it)? as i32,
+  1015→            0,
+  1016→            0,
+  1017→        )),
+  1018→        _ => None,
+  1019→    }
+  1020→}
+  1021→
+  1022→// ---------------------------------------------------------------------------
+  1023→// jar 契约：CallbackBridge 四个 native（符号名严格按 Java_ 前缀）
+  1024→// ---------------------------------------------------------------------------
+  1025→
+  1026→#[no_mangle]
+  1027→pub unsafe extern "system" fn Java_org_lwjgl_glfw_CallbackBridge_nativeSendData(
+  1028→    env: *mut JNIEnv,
+  1029→    _class: jclass,
+  1030→    _focus: jboolean,
+  1031→    typ: jint,
+  1032→    data: jstring,
+  1033→) {
+  1034→    guard!({
+  1035→        if let Some(text) = (unsafe { jstring_to_rust(env, data) }) {
+  1036→            if let Some(ev) = parse_send_data(typ, &text) {
+  1037→                dispatch_event(ev);
+  1038→            }
+  1039→        }
+  1040→    });
+  1041→}
+  1042→
+  1043→#[no_mangle]
+  1044→pub unsafe extern "system" fn Java_org_lwjgl_glfw_CallbackBridge_nativeSetInputReady(
+  1045→    _env: *mut JNIEnv,
+  1046→    _class: jclass,
+  1047→    ready: jboolean,
+  1048→) -> jboolean {
+  1049→    state().input_ready.store(ready != 0, Ordering::Release);
+  1050→    1 // 队列模式恒开（新 jar 只走 Start/Pump/StopPumping）
+  1051→}
+  1052→
+  1053→/// 剪贴板：经 ART 侧 QuartzBridge.accessAndroidClipboard(I,String)String 转发。
+  1054→#[no_mangle]
+  1055→pub unsafe extern "system" fn Java_org_lwjgl_glfw_CallbackBridge_nativeClipboard(
+  1056→    env: *mut JNIEnv,
+  1057→    _class: jclass,
+  1058→    action: jint,
+  1059→    src: jbyteArray,
+  1060→) -> jstring {
+  1061→    let mut result: jstring = ptr::null_mut();
+  1062→    guard!({
+  1063→        let s = state();
+  1064→        let Some(art) = (unsafe { art_env() }) else {
+  1065→            log("剪贴板桥未初始化（ART env 缺失）");
+  1066→            return;
+  1067→        };
+  1068→        let art_cls = s.art_class.load(Ordering::Acquire) as jclass;
+  1069→        let mid = s.m_clipboard.load(Ordering::Acquire) as jmethodID;
+  1070→        if art_cls.is_null() || mid.is_null() {
+  1071→            return;
+  1072→        }
+  1073→        unsafe {
+  1074→            let tbl = env_tbl(env);
+  1075→            let atbl = env_tbl(art);
+  1076→            // 读 payload（runtime env 的 byte[]）
+  1077→            let mut payload: jstring = ptr::null_mut();
+  1078→            if !src.is_null() {
+  1079→                let len = (tbl.GetArrayLength.unwrap())(env, src);
+  1080→                let elems = (tbl.GetByteArrayElements.unwrap())(env, src, ptr::null_mut());
+  1081→                if !elems.is_null() && len > 0 {
+  1082→                    let bytes = std::slice::from_raw_parts(elems as *const u8, len as usize);
+  1083→                    if let Ok(text) = String::from_utf8(bytes.to_vec()) {
+  1084→                        if let Some(js) = rust_to_jstring(art, &text) {
+  1085→                            payload = js;
+  1086→                        }
+  1087→                    }
+  1088→                    (tbl.ReleaseByteArrayElements.unwrap())(env, src, elems, 0);
+  1089→                }
+  1090→            }
+  1091→            let args = [jvalue { l: payload as jobject }];
+  1092→            let out = (atbl.CallStaticObjectMethodA.unwrap())(art, art_cls, mid, args.as_ptr());
+  1093→            if atbl.ExceptionCheck.unwrap()(art) != 0 {
+  1094→                atbl.ExceptionClear.unwrap()(art);
+  1095→                return;
+  1096→            }
+  1097→            // ART 返回 String -> runtime env jstring
+  1098→            if let Some(text) = (unsafe { jstring_to_rust(art, out) }) {
+  1099→                if let Some(js) = (unsafe { rust_to_jstring(env, &text) }) {
+  1100→                    result = js;
+  1101→                }
+  1102→            }
+  1103→        }
+  1104→    });
+  1105→    result
+  1106→}
+  1107→
+  1108→/// 鼠标 grab 状态变化（游戏线程）→ 通知 ART 侧 UI 切换输入映射。
+  1109→#[no_mangle]
+  1110→pub unsafe extern "system" fn Java_org_lwjgl_glfw_CallbackBridge_nativeSetGrabbing(
+  1111→    _env: *mut JNIEnv,
+  1112→    _class: jclass,
+  1113→    grabbing: jboolean,
+  1114→) {
+  1115→    guard!({
+  1116→        let s = state();
+  1117→        s.grabbing.store(grabbing != 0, Ordering::Release);
+  1118→        if grabbing == 0 {
+  1119→            s.cursor_entered.store(false, Ordering::Release);
+  1120→        }
+  1121→        if let Some(art) = (unsafe { art_env() }) {
+  1122→            let art_cls = s.art_class.load(Ordering::Acquire) as jclass;
+  1123→            let mid = s.m_on_grab.load(Ordering::Acquire) as jmethodID;
+  1124→            if !art_cls.is_null() && !mid.is_null() {
+  1125→                let atbl = env_tbl(art);
+  1126→                let arg = jvalue { z: grabbing };
+  1127→                (atbl.CallStaticVoidMethodA.unwrap())(art, art_cls, mid, &arg as *const jvalue);
+  1128→                if atbl.ExceptionCheck.unwrap()(art) != 0 {
+  1129→                    atbl.ExceptionClear.unwrap()(art);
+  1130→                }
+  1131→            }
+  1132→        }
+  1133→    });
+  1134→}
+  1135→
+  1136→// ---------------------------------------------------------------------------
+  1137→// jar 契约：GLFW native 方法
+  1138→// ---------------------------------------------------------------------------
+  1139→
+  1140→macro_rules! jni_callback_setter {
+  1141→    ($symbol:ident, $slot:expr) => {
+  1142→        #[no_mangle]
+  1143→        pub unsafe extern "system" fn $symbol(
+  1144→            _env: *mut JNIEnv,
+  1145→            _class: jclass,
+  1146→            _window: jlong,
+  1147→            callback: jlong,
+  1148→        ) -> jlong {
+  1149→            $slot.swap(callback as usize, Ordering::AcqRel) as jlong
+  1150→        }
+  1151→    };
+  1152→}
+  1153→
+  1154→jni_callback_setter!(
+  1155→    Java_org_lwjgl_glfw_GLFW_nglfwSetCharCallback,
+  1156→    CB_CHAR
+  1157→);
+  1158→jni_callback_setter!(
+  1159→    Java_org_lwjgl_glfw_GLFW_nglfwSetCharModsCallback,
+  1160→    CB_CHAR_MODS
+  1161→);
+  1162→jni_callback_setter!(
+  1163→    Java_org_lwjgl_glfw_GLFW_nglfwSetCursorEnterCallback,
+  1164→    CB_CURSOR_ENTER
+  1165→);
+  1166→jni_callback_setter!(
+  1167→    Java_org_lwjgl_glfw_GLFW_nglfwSetCursorPosCallback,
+  1168→    CB_CURSOR_POS
+  1169→);
+  1170→jni_callback_setter!(Java_org_lwjgl_glfw_GLFW_nglfwSetKeyCallback, CB_KEY);
+  1171→jni_callback_setter!(
+  1172→    Java_org_lwjgl_glfw_GLFW_nglfwSetMouseButtonCallback,
+  1173→    CB_MOUSE
+  1174→);
+  1175→jni_callback_setter!(
+  1176→    Java_org_lwjgl_glfw_GLFW_nglfwSetScrollCallback,
+  1177→    CB_SCROLL
+  1178→);
+  1179→
+  1180→static CB_CHAR: AtomicUsize = AtomicUsize::new(0);
+  1181→static CB_CHAR_MODS: AtomicUsize = AtomicUsize::new(0);
+  1182→static CB_CURSOR_ENTER: AtomicUsize = AtomicUsize::new(0);
+  1183→static CB_CURSOR_POS: AtomicUsize = AtomicUsize::new(0);
+  1184→static CB_KEY: AtomicUsize = AtomicUsize::new(0);
+  1185→static CB_MOUSE: AtomicUsize = AtomicUsize::new(0);
+  1186→static CB_SCROLL: AtomicUsize = AtomicUsize::new(0);
+  1187→
+  1188→#[no_mangle]
+  1189→pub unsafe extern "system" fn Java_org_lwjgl_glfw_GLFW_nglfwSetShowingWindow(
+  1190→    _env: *mut JNIEnv,
+  1191→    _class: jclass,
+  1192→    window: jlong,
+  1193→) {
+  1194→    state().showing.store(window, Ordering::Release);
+  1195→}
+  1196→
+  1197→#[no_mangle]
+  1198→pub unsafe extern "system" fn Java_org_lwjgl_glfw_GLFW_nglfwGetCursorPos(
+  1199→    env: *mut JNIEnv,
+  1200→    _class: jclass,
+  1201→    _window: jlong,
+  1202→    xpos: jobject,
+  1203→    ypos: jobject,
+  1204→) {
+  1205→    guard!({
+  1206→        let cursor = *state().cursor.lock().unwrap();
+  1207→        let tbl = env_tbl(env);
+  1208→        if !xpos.is_null() {
+  1209→            let p = (tbl.GetDirectBufferAddress.unwrap())(env, xpos);
+  1210→            if !p.is_null() {
+  1211→                *(p as *mut f64) = cursor.0;
+  1212→            }
+  1213→        }
+  1214→        if !ypos.is_null() {
+  1215→            let p = (tbl.GetDirectBufferAddress.unwrap())(env, ypos);
+  1216→            if !p.is_null() {
+  1217→                *(p as *mut f64) = cursor.1;
+  1218→            }
+  1219→        }
+  1220→    });
+  1221→}
+  1222→
+  1223→#[no_mangle]
+  1224→pub unsafe extern "system" fn Java_org_lwjgl_glfw_GLFW_nglfwGetCursorPosA(
+  1225→    _env: *mut JNIEnv,
+  1226→    _class: jclass,
+  1227→    _window: jlong,
+  1228→    xpos: *mut jni_sys::jdouble,
+  1229→    ypos: *mut jni_sys::jdouble,
+  1230→) {
+  1231→    guard!({
+  1232→        let cursor = *state().cursor.lock().unwrap();
+  1233→        if !xpos.is_null() {
+  1234→            *xpos = cursor.0;
+  1235→        }
+  1236→        if !ypos.is_null() {
+  1237→            *ypos = cursor.1;
+  1238→        }
+  1239→    });
+  1240→}
+  1241→
+  1242→#[no_mangle]
+  1243→pub unsafe extern "system" fn Java_org_lwjgl_glfw_GLFW_glfwSetCursorPos(
+  1244→    _env: *mut JNIEnv,
+  1245→    _class: jclass,
+  1246→    _window: jlong,
+  1247→    x: jni_sys::jdouble,
+  1248→    y: jni_sys::jdouble,
+  1249→) {
+  1250→    let s = state();
+  1251→    *s.cursor.lock().unwrap() = (x, y);
+  1252→    *s.cursor_last.lock().unwrap() = (x, y);
+  1253→}
+  1254→
+  1255→/// PojavRendererInit.nativeInitGl4esInternals —— MobileGlues/ANGLE 不需要，
+  1256→/// 导出 no-op 保持 jar 兼容（仅 gl4es 路径真正使用）。
+  1257→#[no_mangle]
+  1258→pub unsafe extern "system" fn Java_org_lwjgl_opengl_PojavRendererInit_nativeInitGl4esInternals(
+  1259→    _env: *mut JNIEnv,
+  1260→    _class: jclass,
+  1261→    _provider: jobject,
+  1262→) {
+  1263→}
+  1264→
+  1265→/// VK_getVulkanDriverHandle —— Vulkan/Zink 路径待 M2，当前返回 0。
+  1266→#[no_mangle]
+  1267→pub unsafe extern "system" fn Java_org_lwjgl_vulkan_VK_getVulkanDriverHandle(
+  1268→    _env: *mut JNIEnv,
+  1269→    _class: jclass,
+  1270→) -> jlong {
+  1271→    0
+  1272→}
+  1273→
+  1274→// ---------------------------------------------------------------------------
+  1275→// JNI_OnLoad：OpenJDK 加载本库（jar 的 System.loadLibrary("pojavexec")）时调用。
+  1276→// 绝不 RegisterNatives —— 旧 C 桥在此注册 jar 不存在的 nativeSetUseInputStackQueue
+  1277→// 触发 RegisterNatives NoSuchMethodError（gladiolus 发布包 jar↔so 错位，退出码 255 根因）。
+  1278→// 仅缓存 GLFW 类与按键缓冲地址（本线程正处于 GLFW.<clinit>，FindClass 经 AppClassLoader 可达）。
+  1279→// ---------------------------------------------------------------------------
+  1280→
+  1281→#[no_mangle]
+  1282→pub unsafe extern "system" fn JNI_OnLoad(vm: *mut JavaVM, _reserved: *mut c_void) -> jint {
+  1283→    guard!({
+  1284→        let s = state();
+  1285→        s.rt_vm.store(vm, Ordering::Release);
+  1286→        if let Some(env) = (unsafe { runtime_env() }) {
+  1287→            let glfw_name = CString::new("org/lwjgl/glfw/GLFW").unwrap();
+  1288→            let m1 = CString::new("internalChangeMonitorSize").unwrap();
+  1289→            let sig1 = CString::new("(II)V").unwrap();
+  1290→            let m2 = CString::new("internalWindowSizeChanged").unwrap();
+  1291→            let sig2 = CString::new("(J)V").unwrap();
+  1292→            let f1 = CString::new("keyDownBuffer").unwrap();
+  1293→            let f2 = CString::new("mouseDownBuffer").unwrap();
+  1294→            let sig_buf = CString::new("Ljava/nio/ByteBuffer;").unwrap();
+  1295→            unsafe {
+  1296→                let tbl = env_tbl(env);
+  1297→                let cls = (tbl.FindClass.unwrap())(env, glfw_name.as_ptr());
+  1298→                if cls.is_null() {
+  1299→                    tbl.ExceptionClear.unwrap()(env);
+  1300→                } else {
+  1301→                    s.rt_glfw_class
+  1302→                        .store((tbl.NewGlobalRef.unwrap())(env, cls) as *mut c_void, Ordering::Release);
+  1303→                    s.m_monitor_size.store(
+  1304→                        (tbl.GetStaticMethodID.unwrap())(env, cls, m1.as_ptr(), sig1.as_ptr()) as *mut c_void,
+  1305→                        Ordering::Release,
+  1306→                    );
+  1307→                    s.m_window_size.store(
+  1308→                        (tbl.GetStaticMethodID.unwrap())(env, cls, m2.as_ptr(), sig2.as_ptr()) as *mut c_void,
+  1309→                        Ordering::Release,
+  1310→                    );
+  1311→                    let key_fid =
+  1312→                        (tbl.GetStaticFieldID.unwrap())(env, cls, f1.as_ptr(), sig_buf.as_ptr());
+  1313→                    if !key_fid.is_null() {
+  1314→                        let buf = (tbl.GetStaticObjectField.unwrap())(env, cls, key_fid);
+  1315→                        if !buf.is_null() {
+  1316→                            let addr = (tbl.GetDirectBufferAddress.unwrap())(env, buf);
+  1317→                            s.key_buf.store(addr as *mut u8, Ordering::Release);
+  1318→                        }
+  1319→                    }
+  1320→                    let mouse_fid =
+  1321→                        (tbl.GetStaticFieldID.unwrap())(env, cls, f2.as_ptr(), sig_buf.as_ptr());
+  1322→                    if !mouse_fid.is_null() {
+  1323→                        let buf = (tbl.GetStaticObjectField.unwrap())(env, cls, mouse_fid);
+  1324→                        if !buf.is_null() {
+  1325→                            let addr = (tbl.GetDirectBufferAddress.unwrap())(env, buf);
+  1326→                            s.mouse_buf.store(addr as *mut u8, Ordering::Release);
+  1327→                        }
+  1328→                    }
+  1329→                    log("JNI_OnLoad（OpenJDK）：GLFW 桥缓存就绪");
+  1330→                }
+  1331→            }
+  1332→        }
+  1333→    });
+  1334→    JNI_VERSION_1_4
+  1335→}
+  1336→
+  1337→// ---------------------------------------------------------------------------
+  1338→// C ABI 控制面（壳层经 dlopen+dlsym 调用）
+  1339→// ---------------------------------------------------------------------------
+  1340→
+  1341→/// 壳层注入 ART JavaVM + QuartzBridge 全局引用与两个方法 ID。
+  1342→#[no_mangle]
+  1343→pub unsafe extern "C" fn quartz_bridge_init(
+  1344→    vm: VmPtr,
+  1345→    bridge_class: jobject,
+  1346→    m_on_grab: jmethodID,
+  1347→    m_clipboard: jmethodID,
+  1348→) {
+  1349→    let s = state();
+  1350→    s.art_vm.store(vm, Ordering::Release);
+  1351→    s.art_class.store(bridge_class as *mut c_void, Ordering::Release);
+  1352→    s.m_on_grab.store(m_on_grab as *mut c_void, Ordering::Release);
+  1353→    s.m_clipboard.store(m_clipboard as *mut c_void, Ordering::Release);
+  1354→    log("quartz_bridge_init：ART 侧已注入");
+  1355→}
+  1356→
+  1357→/// Surface 交接：ANativeWindow_fromSurface + 主窗口 NEW_WINDOW 标记。
+  1358→#[no_mangle]
+  1359→pub unsafe extern "C" fn quartz_bridge_setup_surface(env: EnvPtr, surface: jobject) -> c_int {
+  1360→    let mut rc: c_int = 0;
+  1361→    guard!({
+  1362→        let window = ANativeWindow_fromSurface(env, surface);
+  1363→        if !window.is_null() {
+  1364→            let s = state();
+  1365→            let old = s.window.swap(window, Ordering::AcqRel);
+  1366→            let w = ANativeWindow_getWidth(window);
+  1367→            let h = ANativeWindow_getHeight(window);
+  1368→            s.saved_w.store(w, Ordering::Release);
+  1369→            s.saved_h.store(h, Ordering::Release);
+  1370→            s.upd_monitor.store(true, Ordering::Release);
+  1371→            s.monitor_consumed.store(false, Ordering::Release);
+  1372→            // 已有主窗口：走 NEW_WINDOW 换绑流程（Pojav gl_setup_window 语义）
+  1373→            let main_handle = *s.main_window.lock().unwrap();
+  1374→            if let Some(handle) = main_handle {
+  1375→                if let Some(bundle) = s.windows.lock().unwrap().get(&handle).cloned() {
+  1376→                    bundle.new_native_surface.set(window);
+  1377→                    bundle.state.set(egl::STATE_NEW_WINDOW);
+  1378→                }
+  1379→            }
+  1380→            if !old.is_null() && old != window {
+  1381→                ANativeWindow_release(old);
+  1382→            }
+  1383→            rc = 1;
+  1384→        }
+  1385→    });
+  1386→    rc
+  1387→}
+  1388→
+  1389→/// Surface 销毁：释放 ANativeWindow（渲染线程下一帧回退 pbuffer）。
+  1390→#[no_mangle]
+  1391→pub unsafe extern "C" fn quartz_bridge_release_surface() {
+  1392→    guard!({
+  1393→        let s = state();
+  1394→        let old = s.window.swap(ptr::null_mut(), Ordering::AcqRel);
+  1395→        if !old.is_null() {
+  1396→            ANativeWindow_release(old);
+  1397→        }
+  1398→    });
+  1399→}
+  1400→
+  1401→#[no_mangle]
+  1402→pub extern "C" fn quartz_bridge_window_ready() -> c_int {
+  1403→    if state().window.load(Ordering::Acquire).is_null() { 0 } else { 1 }
+  1404→}
+  1405→
+  1406→#[no_mangle]
+  1407→pub extern "C" fn quartz_bridge_send_cursor_pos(x: f32, y: f32) {
+  1408→    let s = state();
+  1409→    if !s.input_ready.load(Ordering::Acquire) {
+  1410→        return;
+  1411→    }
+  1412→    dispatch_event(Event { typ: EVENT_TYPE_CURSOR_POS, i1: 0, i2: 0, i3: 0, i4: 0, dx: x as f64, dy: y as f64 });
+  1413→}
+  1414→
+  1415→#[no_mangle]
+  1416→pub extern "C" fn quartz_bridge_send_mouse_button(button: c_int, action: c_int, mods: c_int) {
+  1417→    let s = state();
+  1418→    if !s.input_ready.load(Ordering::Acquire) {
+  1419→        return;
+  1420→    }
+  1421→    dispatch_event(Event::ints(EVENT_TYPE_MOUSE_BUTTON, button, action, mods, 0));
+  1422→}
+  1423→
+  1424→#[no_mangle]
+  1425→pub extern "C" fn quartz_bridge_send_key(key: c_int, scancode: c_int, action: c_int, mods: c_int) {
+  1426→    let s = state();
+  1427→    if !s.input_ready.load(Ordering::Acquire) {
+  1428→        return;
+  1429→    }
+  1430→    dispatch_event(Event::ints(EVENT_TYPE_KEY, key, scancode, action, mods));
+  1431→}
+  1432→
+  1433→#[no_mangle]
+  1434→pub extern "C" fn quartz_bridge_send_char(codepoint: c_int, mods: c_int) {
+  1435→    let s = state();
+  1436→    if !s.input_ready.load(Ordering::Acquire) {
+  1437→        return;
+  1438→    }
+  1439→    if mods != 0 && s.cb_char_mods.load(Ordering::Acquire) != 0 {
+  1440→        dispatch_event(Event::ints(EVENT_TYPE_CHAR_MODS, codepoint, mods, 0, 0));
+  1441→    } else {
+  1442→        dispatch_event(Event::ints(EVENT_TYPE_CHAR, codepoint, 0, 0, 0));
+  1443→    }
+  1444→}
+  1445→
+  1446→#[no_mangle]
+  1447→pub extern "C" fn quartz_bridge_send_scroll(dx: f64, dy: f64) {
+  1448→    let s = state();
+  1449→    if !s.input_ready.load(Ordering::Acquire) {
+  1450→        return;
+  1451→    }
+  1452→    dispatch_event(Event { typ: EVENT_TYPE_SCROLL, i1: 0, i2: 0, i3: 0, i4: 0, dx, dy });
+  1453→}
+  1454→
+  1455→#[no_mangle]
+  1456→pub extern "C" fn quartz_bridge_send_screen_size(w: c_int, h: c_int) {
+  1457→    let s = state();
+  1458→    s.saved_w.store(w, Ordering::Release);
+  1459→    s.saved_h.store(h, Ordering::Release);
+  1460→    s.upd_monitor.store(true, Ordering::Release);
+  1461→    s.monitor_consumed.store(false, Ordering::Release);
+  1462→}
+  1463→
+  1464→#[no_mangle]
+  1465→pub extern "C" fn quartz_bridge_is_grabbed() -> c_int {
+  1466→    if state().grabbing.load(Ordering::Acquire) { 1 } else { 0 }
+  1467→}
+  1468→
+  1469→#[no_mangle]
+  1470→pub extern "C" fn quartz_bridge_api_version() -> c_int {
+  1471→    1
+  1472→}
+  1473→

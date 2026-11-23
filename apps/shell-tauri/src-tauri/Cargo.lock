@@ -2675,9 +2675,10 @@ dependencies = [
 
 [[package]]
 name = "quartz-shell-tauri"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "jni",
+ "jni-sys 0.3.1",
  "libc",
  "ndk-context",
  "quartz-core",
