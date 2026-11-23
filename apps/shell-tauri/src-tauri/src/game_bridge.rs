@@ -49,6 +49,7 @@ pub struct BridgeApi {
     pub send_scroll: unsafe extern "C" fn(dx: f64, dy: f64),
     pub send_screen_size: unsafe extern "C" fn(w: c_int, h: c_int),
     pub is_grabbed: unsafe extern "C" fn() -> c_int,
+    pub notify_rt_vm: unsafe extern "C" fn(vm: VmPtr) -> c_int,
 }
 
 impl BridgeApi {
@@ -58,13 +59,31 @@ impl BridgeApi {
             return cached.as_ref();
         }
         let loaded = (|| -> Option<BridgeApi> {
-            let path = super::paths::runtime_dir().join("libpojavexec.so");
-            let cpath = CString::new(path.to_string_lossy().into_owned()).ok()?;
-            let handle = unsafe { dlopen(cpath.as_ptr(), RTLD_NOW | RTLD_GLOBAL) };
-            if handle.is_null() {
-                eprintln!("[quartz] 显示桥 dlopen 失败：{}", path.display());
-                return None;
-            }
+            // v0.1.10 双副本分裂脑修复：本函数与游戏 JVM 的
+            // System.loadLibrary("pojavexec") 必须命中**同一个文件**——
+            // bionic 按路径缓存 soinfo，两个路径 = 两份独立全局状态
+            // （Surface 挂在壳层副本、pojavInit 在 JVM 副本里等窗口到天
+            // 荒地老 —— 设备日志实证：稳定窗口检测通过 + pojavInit 8s
+            // 超时并存）。故优先 dlopen natives_dir 副本（java.library.path
+            // 首目录，JVM 必命中），runtime_dir 副本仅作兼容兜底。
+            let candidates = [
+                super::lwjgl::natives_dir().join("libpojavexec.so"),
+                super::paths::runtime_dir().join("libpojavexec.so"),
+            ];
+            let (path, handle) = candidates.iter().find_map(|path| {
+                if !path.exists() {
+                    return None;
+                }
+                let cpath = CString::new(path.to_string_lossy().into_owned()).ok()?;
+                let handle = unsafe { dlopen(cpath.as_ptr(), RTLD_NOW | RTLD_GLOBAL) };
+                if handle.is_null() {
+                    eprintln!("[quartz] 显示桥 dlopen 失败：{}", path.display());
+                    return None;
+                }
+                Some((path.clone(), handle))
+            })?;
+            eprintln!("[quartz] 显示桥已加载：{}", path.display());
+            let handle = handle;
             macro_rules! sym {
                 ($name:literal, $ty:ty) => {{
                     let cname = CString::new($name).unwrap();
@@ -88,6 +107,7 @@ impl BridgeApi {
                 send_scroll: sym!("quartz_bridge_send_scroll", unsafe extern "C" fn(f64, f64)),
                 send_screen_size: sym!("quartz_bridge_send_screen_size", unsafe extern "C" fn(c_int, c_int)),
                 is_grabbed: sym!("quartz_bridge_is_grabbed", unsafe extern "C" fn() -> c_int),
+                notify_rt_vm: sym!("quartz_bridge_notify_rt_vm", unsafe extern "C" fn(VmPtr) -> c_int),
             })
         })();
         let _ = API.set(loaded);
@@ -939,6 +959,61 @@ unsafe fn bridge_init_with(env: EnvPtr, ctx: jni_sys::jobject) -> Result<(), Str
     Ok(())
 }
 
+/// 调用 QuartzBridge.latestSurface()（静态，返回最近收到的有效 Surface 或 null）。
+unsafe fn quartz_bridge_latest_surface(env: EnvPtr, ctx: jni_sys::jobject) -> Option<jni_sys::jobject> {
+    let tbl = &**env;
+    if (tbl.ExceptionCheck.unwrap())(env) != 0 {
+        (tbl.ExceptionClear.unwrap())(env);
+    }
+    let ctx_cls = (tbl.GetObjectClass.unwrap())(env, ctx);
+    let get_loader_mid = (tbl.GetMethodID.unwrap())(
+        env,
+        ctx_cls,
+        c"getClassLoader".as_ptr(),
+        c"()Ljava/lang/ClassLoader;".as_ptr(),
+    );
+    let loader = (tbl.CallObjectMethodA.unwrap())(env, ctx, get_loader_mid, ptr::null());
+    if loader.is_null() {
+        (tbl.ExceptionClear.unwrap())(env);
+        return None;
+    }
+    let str_cls = (tbl.FindClass.unwrap())(env, c"java/lang/String".as_ptr());
+    if str_cls.is_null() {
+        (tbl.ExceptionClear.unwrap())(env);
+        return None;
+    }
+    let name = (tbl.NewStringUTF.unwrap())(env, c"com.quartz.launcher.QuartzBridge".as_ptr());
+    let cls_cls = (tbl.GetObjectClass.unwrap())(env, loader);
+    let load_mid = (tbl.GetMethodID.unwrap())(
+        env,
+        cls_cls,
+        c"loadClass".as_ptr(),
+        c"(Ljava/lang/String;)Ljava/lang/Class;".as_ptr(),
+    );
+    let jargs = jni_sys::jvalue { l: name };
+    let cls_obj = (tbl.CallObjectMethodA.unwrap())(env, loader, load_mid, &jargs);
+    if cls_obj.is_null() {
+        (tbl.ExceptionClear.unwrap())(env);
+        return None;
+    }
+    let mid = (tbl.GetStaticMethodID.unwrap())(
+        env,
+        cls_obj,
+        c"latestSurface".as_ptr(),
+        c"()Landroid/view/Surface;".as_ptr(),
+    );
+    if mid.is_null() {
+        (tbl.ExceptionClear.unwrap())(env);
+        return None;
+    }
+    let out = (tbl.CallStaticObjectMethodA.unwrap())(env, cls_obj, mid, ptr::null());
+    if (tbl.ExceptionCheck.unwrap())(env) != 0 {
+        (tbl.ExceptionClear.unwrap())(env);
+        return None;
+    }
+    if out.is_null() { None } else { Some(out) }
+}
+
 /// JNI 返回码符号化（设备日志直读，不再对着 252 猜）。
 fn jvm_rc_name(rc: jint) -> &'static str {
     match rc {
@@ -1050,8 +1125,48 @@ unsafe fn run_game_from_spec(
         std::env::set_var(k, v);
     }
 
+    // 1.5) 渲染层依赖预载（链接器命名空间按名解析 DT_NEEDED 时不搜索应用
+    //      数据目录：zink 的 libcutils/libglapi/libgallium_dri 必须由壳层按
+    //      绝对路径先行 dlopen，之后 Mesa EGL 内部的按名 dlopen 才能命中已载
+    //      soinfo —— 否则 libEGL_mesa.so 本体都装不起来）。
+    for lib in crate::renderers::preload_libs(&active_renderer) {
+        let p = crate::renderers::install_dir(&active_renderer).join(lib);
+        if !p.exists() {
+            eprintln!("[quartz] 渲染层预载文件缺失：{}", p.display());
+            continue;
+        }
+        let c = CString::new(p.to_string_lossy().into_owned()).unwrap();
+        if dlopen(c.as_ptr(), RTLD_NOW | RTLD_GLOBAL).is_null() {
+            eprintln!("[quartz] 渲染层预载失败：{lib}（渲染层 EGL 可能初始化失败）");
+        } else {
+            eprintln!("[quartz] 渲染层预载完成：{lib}");
+        }
+    }
+    if active_renderer == "zink" {
+        // Mesa 着色器磁盘缓存（可写内部目录；不设则 mesa 退回内存缓存）
+        let mesa_cache = crate::paths::game_root().join(".cache").join("mesa");
+        let _ = std::fs::create_dir_all(&mesa_cache);
+        std::env::set_var("MESA_GLSL_CACHE_DIR", &mesa_cache);
+    }
+
     // 2) 显示桥注入 ART（grab/剪贴板回调注册；ctx = GameService 实例）
     bridge_init_with(env, ctx)?;
+
+    // 2.5) Surface 重挂载兜底：MSG_SURFACE 可能先于本线程的路径重注入到达
+    //      （主线程 handler 那时显示桥尚未就绪/路径回退，挂载失败被静默吞掉）。
+    //      QuartzBridge.latestSurface() 保存了最近一条有效 Surface —— 这里在
+    //      显示桥就绪后重试一次，再进入稳定窗口等待。
+    if let Some(api) = BridgeApi::load() {
+        if (api.window_ready)() != 1 {
+            match quartz_bridge_latest_surface(env, ctx) {
+                Some(surface) => {
+                    let rc = (api.setup_surface)(env, surface);
+                    eprintln!("[quartz] Surface 重挂载兜底完成（rc={rc}）");
+                }
+                None => eprintln!("[quartz] 无待挂载 Surface（主进程尚未发送）"),
+            }
+        }
+    }
 
     // 3) tagged-pointer 兼容层（Android 12+ GC SIGABRT 修复）—— 最先于 JVM dlopen
     let tagfix = crate::paths::runtime_dir().join("libqztagfix.so");
@@ -1283,6 +1398,14 @@ unsafe fn run_game_from_spec(
     // JVM 初始化会覆盖 SIGABRT 处理器（HotSpot 崩溃报告用）：重装拦截 ——
     // HotSpot 写完 hs_err 后调用 abort()，仍落入本拦截（干净退出，不惊动系统）。
     install_fatal_signal_handlers();
+
+    // 7.5) 显式注入 runtime VM：统一桥路径后，壳层先 dlopen 了桥库，libart
+    //      的 System.loadLibrary 发现库已载会跳过 JNI_OnLoad —— rt_vm/GLFW
+    //      缓存必须由这里补齐（quartz_bridge_notify_rt_vm，幂等）。
+    if let Some(api) = BridgeApi::load() {
+        let rc = (api.notify_rt_vm)(vm);
+        eprintln!("[quartz] runtime VM 注入显示桥（rc={rc}）");
+    }
 
     // 之后所有 JNI（hook 安装 / 主类定位 / main 调用）都必须在**游戏 JVM 侧**
     // 执行（用 CreateJavaVM 返回的 jenv）。v0.1.7 重构曾误用 ART env ——

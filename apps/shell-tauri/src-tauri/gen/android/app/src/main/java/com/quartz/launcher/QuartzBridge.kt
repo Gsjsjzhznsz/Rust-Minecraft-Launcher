@@ -27,6 +27,19 @@ class QuartzBridge private constructor() {
         const val CLIPBOARD_COPY = 1000
         const val CLIPBOARD_PASTE = 1001
 
+        /** 最近一条有效 Surface（MSG_SURFACE 先于 :game 侧显示桥就绪时的兜底缓存）。 */
+        private var latest: Surface? = null
+
+        /** 显示桥就绪前收到的 Surface 由 GameService 存入；Rust 侧经 latestSurface() 取回重挂。 */
+        @JvmStatic
+        fun rememberSurface(s: Surface?) {
+            latest = s
+        }
+
+        /** 最近一条有效 Surface（Rust 显示桥就绪后调用重挂）。 */
+        @JvmStatic
+        fun latestSurface(): Surface? = latest
+
         /** 显示桥回调：游戏进入/退出鼠标 grab（MC 捕获鼠标）。 */
         @JvmStatic
         fun onGrabStateChanged(grabbed: Boolean) {

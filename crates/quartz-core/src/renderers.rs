@@ -11,8 +11,9 @@
 //! - MobileGlues MobileGL-Dev/MobileGlues-release V2.0.0 官方 APK（提取 arm64 so）
 //! - ANGLE       FCL-Team/FoldCraftLauncher@main jniLibs（libEGL_angle / libGLESv2_angle）
 //! - VGPU        FCL-Team/FoldCraftLauncher@main jniLibs（libvgpu.so）
-//! - Zink / NG-GL4ES（Krypton Wrapper）登记占位：mesa GL 侧尚无稳定的单包直链，
-//!   待 M2 接入（FCL 通过其插件市场分发，无公开固定 URL）。
+//! - Zink       GoyDevv/IronizedZink v1.1.0 官方插件 APK（Mesa GL4.6→Vulkan，
+//!   与 FCL/Zalith2 系同源的 libEGL_mesa + libglxshim + libgallium(zink)）
+//! - NG-GL4ES（Krypton Wrapper）登记占位：尚无稳定的单包直链，待后续接入。
 
 use crate::error::{Error, Result};
 use crate::instance::DownloadProgress;
@@ -26,7 +27,10 @@ pub enum PackSource {
     /// 直接下载若干文件落到安装目录。
     Raw(&'static [(&'static str, &'static str)]),
     /// 下载 APK 后提取 lib/arm64-v8a/*.so。
-    ApkExtract(&'static str),
+    /// 列表为空 = 提取全部；非空 = 白名单 (APK 内文件名, 落盘文件名)
+    /// —— 支持改名（zink_dri 的 SONAME 是 libgallium_dri.so，Mesa EGL
+    /// 按该名 dlopen，文件名必须对齐）。
+    ApkExtract(&'static str, &'static [(&'static str, &'static str)]),
 }
 
 /// 渲染器 pack 元数据。
@@ -40,12 +44,31 @@ pub struct RendererSpec {
     pub gl_lib: &'static str,
     pub note: &'static str,
     pub source: Option<PackSource>,
+    /// EGL 库加载前须先 dlopen 的同目录依赖（链接器命名空间按名解析
+    /// DT_NEEDED 时不搜索应用数据目录，必须由壳层按绝对路径预载）。
+    pub preload: &'static [&'static str],
     /// 粗略体积提示（UI 展示用）。
     pub size_hint: &'static str,
 }
 
 const MOBILEGLUES_APK: &str =
     "https://github.com/MobileGL-Dev/MobileGlues-release/releases/download/V2.0.0/MobileGlues_2.0.0.apk";
+
+/// Zink（Mesa GL4.6→Vulkan + Kopper）：IronizedZink 官方发布插件 APK。
+/// 单一来源包含 Mesa 全套 bionic 构建（libEGL_mesa / libglapi / libglxshim /
+/// libgallium(zink) / libcutils 兼容层），面向 FCL/Zalith2 系（即 Pojav 约定）。
+/// 设备侧要求：Vulkan 1.1+ 驱动可用（zink 经系统 libvulkan.so 拿设备）。
+const IRONIZED_ZINK_APK: &str =
+    "https://github.com/GoyDevv/IronizedZink/releases/download/v1.1.0/Ironized-Zink-v1.1.0.apk";
+
+/// Zink pack 提取白名单（跳过插件 App 自身的支持库；libzink_dri 改名对齐 SONAME）。
+const ZINK_APK_LIBS: &[(&str, &str)] = &[
+    ("libEGL_mesa.so", "libEGL_mesa.so"),
+    ("libglapi.so", "libglapi.so"),
+    ("libglxshim.so", "libglxshim.so"),
+    ("libzink_dri.so", "libgallium_dri.so"),
+    ("libcutils.so", "libcutils.so"),
+];
 
 const URL_GL4ES: &str = "https://raw.githubusercontent.com/PojavLauncherTeam/PojavLauncher/v3_openjdk/app_pojavlauncher/src/main/jniLibs/arm64-v8a/libgl4es_114.so";
 const URL_ANGLE_EGL: &str = "https://raw.githubusercontent.com/FCL-Team/FoldCraftLauncher/main/FCL/src/main/jniLibs/arm64-v8a/libEGL_angle.so";
@@ -62,6 +85,7 @@ pub fn catalog() -> &'static [RendererSpec] {
             gl_lib: "libgl4es_114.so",
             note: "GL2.1→GLES2，老版本/低配兜底（Pojav 系默认）",
             source: Some(PackSource::Raw(&[(URL_GL4ES, "libgl4es_114.so")])),
+            preload: &[],
             size_hint: "约 1.5 MB",
         },
         RendererSpec {
@@ -70,7 +94,8 @@ pub fn catalog() -> &'static [RendererSpec] {
             egl_lib: "libmobileglues.so",
             gl_lib: "libmobileglues.so",
             note: "GLES3.2 直转，1.20.x 兼容好（官方 Release APK 提取）",
-            source: Some(PackSource::ApkExtract(MOBILEGLUES_APK)),
+            source: Some(PackSource::ApkExtract(MOBILEGLUES_APK, &[])),
+            preload: &[],
             size_hint: "约 30 MB",
         },
         RendererSpec {
@@ -83,6 +108,7 @@ pub fn catalog() -> &'static [RendererSpec] {
                 (URL_ANGLE_EGL, "libEGL_angle.so"),
                 (URL_ANGLE_GLES, "libGLESv2_angle.so"),
             ])),
+            preload: &[],
             size_hint: "约 8 MB",
         },
         RendererSpec {
@@ -92,6 +118,7 @@ pub fn catalog() -> &'static [RendererSpec] {
             gl_lib: "libvgpu.so",
             note: "轻量 GL2.1→GLES 兜底（FCL 同款）",
             source: Some(PackSource::Raw(&[(URL_VGPU, "libvgpu.so")])),
+            preload: &[],
             size_hint: "约 0.6 MB",
         },
         RendererSpec {
@@ -99,17 +126,19 @@ pub fn catalog() -> &'static [RendererSpec] {
             name: "Zink",
             egl_lib: "libEGL_mesa.so",
             gl_lib: "libglxshim.so",
-            note: "GL4.6→Vulkan（Sodium/光影推荐档）；Mesa GL 侧单包直链待 M2 接入",
-            source: None,
-            size_hint: "约 60 MB",
+            note: "GL4.6→Vulkan 桌面 GL（Mesa Zink+Kopper，Sodium/光影推荐档；需设备 Vulkan 1.1+）",
+            source: Some(PackSource::ApkExtract(IRONIZED_ZINK_APK, ZINK_APK_LIBS)),
+            preload: &["libcutils.so", "libglapi.so", "libgallium_dri.so"],
+            size_hint: "约 13 MB",
         },
         RendererSpec {
             id: "nggl4es",
             name: "Krypton Wrapper",
             egl_lib: "libng_gl4es.so",
             gl_lib: "libng_gl4es.so",
-            note: "NG-GL4ES 高性能转译；公开单包直链待 M2 接入",
+            note: "NG-GL4ES 高性能转译；公开单包直链待后续接入",
             source: None,
+            preload: &[],
             size_hint: "约 5 MB",
         },
     ]
@@ -187,9 +216,15 @@ pub fn launch_env(id: &str) -> Vec<(String, String)> {
             ("LIBGL_ES".into(), "3".into()),
         ],
         "vgpu" => vec![("VGPU_NOERROR".into(), "1".into())],
+        // Zink/Kopper（与 FCL/Zalith2 的注入配方一致）：
+        // - MESA_LOADER_DRIVER_OVERRIDE=zink 强制 gallium zink 驱动
+        // - 版本覆盖：向 MC 呈现桌面 GL4.6/GLSL460（桥会走真桌面 GL 上下文）
+        // - LIBGL_ES=3 保持与上游插件一致（桥桌面分支不读它，亏位无害）
         "zink" => vec![
             ("MESA_LOADER_DRIVER_OVERRIDE".into(), "zink".into()),
-            ("GALLIUM_DRIVER".into(), "llvmpipe".into()),
+            ("MESA_GL_VERSION_OVERRIDE".into(), "4.6".into()),
+            ("MESA_GLSL_VERSION_OVERRIDE".into(), "460".into()),
+            ("LIBGL_ES".into(), "3".into()),
         ],
         _ => vec![],
     }
@@ -276,7 +311,7 @@ pub async fn download_and_install(
                 buf.flush().await?;
             }
         }
-        PackSource::ApkExtract(url) => {
+        PackSource::ApkExtract(url, whitelist) => {
             let resp = crate::mirror::get_stream(client, url).await?;
             let total = resp.content_length().unwrap_or(0);
             let part = staging.parent().unwrap().join(format!(".{id}.apk.part"));
@@ -298,16 +333,16 @@ pub async fn download_and_install(
                         "renderer-download",
                         cur,
                         total,
-                        "MobileGlues APK".into(),
+                        format!("{id} APK"),
                         false,
                     );
                 }
                 file.flush().await?;
             }
-            // 提取 arm64 原生库（阻塞线程池）
+            // 提取 arm64 原生库（阻塞线程池；白名单/改名随包定义）
             let part2 = part.clone();
             let staging2 = staging.clone();
-            tokio::task::spawn_blocking(move || extract_apk_libs(&part2, &staging2))
+            tokio::task::spawn_blocking(move || extract_apk_libs(&part2, &staging2, whitelist))
                 .await
                 .map_err(|e| Error::Other(format!("提取线程崩溃：{e}")))??;
             let _ = std::fs::remove_file(&part);
@@ -344,8 +379,14 @@ async fn head_len_async(client: &reqwest::Client, url: &str) -> u64 {
     0
 }
 
-/// 从 APK 提取 lib/arm64-v8a/*.so。
-fn extract_apk_libs(apk: &Path, dest: &Path) -> Result<usize> {
+/// EGL 库加载前须预载的同目录依赖（空表 = 无）。
+pub fn preload_libs(id: &str) -> &'static [&'static str] {
+    spec_for(id).map(|s| s.preload).unwrap_or(&[])
+}
+
+/// 从 APK 提取 lib/arm64-v8a/*.so。whitelist 为空 = 全部提取；
+/// 非空 = 仅提取 (APK 内文件名, 落盘文件名) 列出的条目（支持改名）。
+fn extract_apk_libs(apk: &Path, dest: &Path, whitelist: &[(&str, &str)]) -> Result<usize> {
     let file = std::fs::File::open(apk)?;
     let mut archive = zip::ZipArchive::new(std::io::BufReader::new(file))?;
     let mut count = 0usize;
@@ -358,7 +399,16 @@ fn extract_apk_libs(apk: &Path, dest: &Path) -> Result<usize> {
         if !name.starts_with("lib/arm64-v8a/") || !name.ends_with(".so") {
             continue;
         }
-        let out = dest.join(name.rsplit('/').next().unwrap_or(&name));
+        let src_name = name.rsplit('/').next().unwrap_or(&name);
+        let out_name = if whitelist.is_empty() {
+            src_name
+        } else {
+            match whitelist.iter().find(|(apk_name, _)| *apk_name == src_name) {
+                Some((_, disk_name)) => *disk_name,
+                None => continue,
+            }
+        };
+        let out = dest.join(out_name);
         let mut out_file = std::fs::File::create(&out)?;
         std::io::copy(&mut entry, &mut out_file)?;
         count += 1;
@@ -410,6 +460,35 @@ mod tests {
         assert!(launch_env("gl4es").iter().any(|(k, _)| k == "LIBGL_ES"));
         assert!(launch_env("mobileglues").is_empty() == false);
         assert!(launch_env("angle").is_empty());
+        // zink 注入配方与 FCL/Zalith2 一致
+        let zink = launch_env("zink");
+        assert!(zink
+            .iter()
+            .any(|(k, v)| k == "MESA_LOADER_DRIVER_OVERRIDE" && v == "zink"));
+        assert!(zink
+            .iter()
+            .any(|(k, v)| k == "MESA_GL_VERSION_OVERRIDE" && v == "4.6"));
+        assert!(zink.iter().any(|(k, _)| k == "LIBGL_ES"));
+    }
+
+    #[test]
+    fn zink_pack_has_source_and_preload() {
+        let spec = spec_for("zink").unwrap();
+        match &spec.source {
+            Some(PackSource::ApkExtract(_, whitelist)) => {
+                // SONAME 对齐：libzink_dri.so 落盘为 libgallium_dri.so
+                assert!(whitelist
+                    .iter()
+                    .any(|(a, b)| *a == "libzink_dri.so" && *b == "libgallium_dri.so"));
+                assert!(whitelist.iter().any(|(a, _)| *a == "libEGL_mesa.so"));
+                assert!(whitelist.iter().any(|(a, _)| *a == "libcutils.so"));
+            }
+            _ => panic!("zink 应使用 ApkExtract 白名单提取"),
+        }
+        // 预载清单：cutils -> glapi -> gallium（链接器命名空间按名解析 NEEDED）
+        assert_eq!(spec.preload, ["libcutils.so", "libglapi.so", "libgallium_dri.so"]);
+        assert!(preload_libs("gl4es").is_empty());
+        assert_eq!(preload_libs("zink").len(), 3);
     }
 
     #[test]

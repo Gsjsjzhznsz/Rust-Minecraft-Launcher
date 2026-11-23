@@ -210,3 +210,43 @@ GitHub 直连极易握手超时/传输重置。v6 新增 `crates/quartz-core/src
   桥 so（411KB，strip 后）以 include_bytes 内嵌于壳层 lib。
 - 工具链：quartz-bridge 经 cargo release 构建（NDK r27 linker），脚本
   scripts/build-android.sh 已并入两阶段构建。
+
+## v0.1.10 —— 双副本分裂脑修复 + Zink（Mesa GL4.6→Vulkan）接入（2026-11-24）
+
+### 双副本分裂脑（设备日志实证，本次崩溃根因）
+- 症状：`[quartz] Surface 就绪（稳定窗口检测通过）` 与
+  `[quartz-bridge] pojavInit：ANativeWindow 尚未就绪（8s 超时）` 同时出现，
+  且日志里没有任何 setupSurface 桥日志。
+- 根因：壳层 dlopen `runtime_dir/libpojavexec.so`（副本 A），游戏 JVM 经
+  `System.loadLibrary` 命中 `lwjgl3/natives/libpojavexec.so`（副本 B）——
+  bionic 按路径缓存 soinfo，两个路径 = 两份独立全局状态。Surface 挂在 A，
+  pojavInit 在 B 里等窗口到天荒地老 → 无窗口 → eglChooseConfig 失败 →
+  MobileGlues 空指针 SIGSEGV。
+- 修复：BridgeApi::load() 优先 dlopen natives_dir 副本（java.library.path
+  首目录，JVM 必命中同一文件）；统一路径后 libart 会跳过 JNI_OnLoad，
+  新增 `quartz_bridge_notify_rt_vm` 由壳层在 CreateJavaVM 成功后显式补齐
+  rt_vm/GLFW 缓存（与 JNI_OnLoad 共用实现，幂等）。
+- 配套：GameService 收到的最新 Surface 存入 QuartzBridge.rememberSurface，
+  Rust 侧显示桥就绪后经 `latestSurface()` 重挂（消除「MSG_SURFACE 先于
+  路径重注入到达」的挂载竞态）；MSG_SURFACE/RELEASE/SIZE 落游戏日志。
+
+### 构建流水线陷阱（v0.1.9-c 实际未进包的直接原因）
+- v0.1.9-c 提交的 quartz-bridge 源码存在 `[i32; 15]` vs 16 元素数组不匹配
+  的编译错误 —— 桥构建失败，但壳层照常构建，APK 内嵌的是旧桥 so。
+- 教训：**每次交付必须完整跑 `scripts/build-android.sh` 到 EXIT=0**，并
+  grep 桥 so 的新增诊断字符串（如「已挂载」「quartz_bridge_notify_rt_vm」）
+  确认时效；只跑 `tauri android build` 会沿用陈旧的 bridge/libpojavexec.so。
+
+### Zink 渲染器接入（用户需求：GL4.6→Vulkan 桌面 GL）
+- 来源：GoyDevv/IronizedZink v1.1.0 官方插件 APK（FCL/Zalith2 系同源
+  Mesa 构建），白名单提取 5 个 arm64 so，`libzink_dri.so` 落盘改名
+  `libgallium_dri.so`（SONAME 对齐，Mesa EGL 按该名 dlopen）。
+- 预载链：`libcutils.so → libglapi.so → libgallium_dri.so`（链接器命名
+  空间按名解析 DT_NEEDED 时不搜索应用数据目录，必须按绝对路径先行 dlopen）。
+- 启动 env（与 FCL/Zalith2 注入配方一致）：`MESA_LOADER_DRIVER_OVERRIDE=zink`、
+  `MESA_GL_VERSION_OVERRIDE=4.6`、`MESA_GLSL_VERSION_OVERRIDE=460`、
+  `LIBGL_ES=3`、`MESA_GLSL_CACHE_DIR=<game_root>/.cache/mesa`。
+- 桥桌面 GL 分支：POJAV_RENDERER 含 "desktopgl" 时 eglBindAPI(EGL_OPENGL_API)
+  + EGL_KHR_create_context 阶梯（4.6 core → 3.3 core → 3.2 core）；GL 分发
+  经 `libglxshim.so` 的 glXGetProcAddress（LWJGL Linux 函数提供者语义）。
+  设备要求：Vulkan 1.1+ 驱动（zink 经系统 libvulkan.so 拿设备）。

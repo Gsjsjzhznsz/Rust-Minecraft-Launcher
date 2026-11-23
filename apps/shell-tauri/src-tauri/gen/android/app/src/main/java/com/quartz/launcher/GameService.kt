@@ -75,19 +75,25 @@ class GameService : Service() {
                 MSG_SURFACE -> {
                     @Suppress("DEPRECATION")
                     val s = msg.data?.getParcelable<Surface>("surface")
-                    android.util.Log.i("QuartzGame", "MSG_SURFACE: valid=${s?.isValid}")
+                    // 无论显示桥是否就绪都先存入兜底缓存（v0.1.10）——
+                    // MSG_SURFACE 可能先于 nativeRunGame 的路径重注入到达，
+                    // 此时挂载必败；Rust 侧显示桥就绪后经 latestSurface() 重挂。
+                    QuartzBridge.rememberSurface(s)
+                    println("[quartz-game] MSG_SURFACE: valid=${s?.isValid}")
                     if (s != null && s.isValid) {
                         try {
                             // :game 进程内直调桥 native（ANativeWindow_fromSurface）
                             val rc = QuartzBridge.instance.setupSurface(s)
-                            android.util.Log.i("QuartzGame", "setupSurface rc=$rc")
+                            println("[quartz-game] setupSurface rc=$rc")
                         } catch (t: Throwable) {
+                            println("[quartz-game] setupSurface 异常：${t.message}")
                             android.util.Log.w("QuartzGame", "setupSurface 异常", t)
                         }
                     }
                 }
                 MSG_RELEASE_SURFACE -> {
-                    android.util.Log.i("QuartzGame", "MSG_RELEASE_SURFACE（主进程 surfaceDestroyed）")
+                    println("[quartz-game] MSG_RELEASE_SURFACE（主进程 surfaceDestroyed）")
+                    QuartzBridge.rememberSurface(null)
                     try {
                         QuartzBridge.instance.releaseSurface()
                     } catch (_: Throwable) {
@@ -96,7 +102,10 @@ class GameService : Service() {
                 MSG_SIZE -> {
                     val b = msg.data
                     try {
-                        QuartzBridge.instance.sendScreenSize(b?.getInt("w") ?: 0, b?.getInt("h") ?: 0)
+                        val w = b?.getInt("w") ?: 0
+                        val h = b?.getInt("h") ?: 0
+                        println("[quartz-game] MSG_SIZE: ${w}x${h}")
+                        QuartzBridge.instance.sendScreenSize(w, h)
                     } catch (_: Throwable) {
                     }
                 }

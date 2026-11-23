@@ -326,6 +326,11 @@ pub mod egl {
     pub const EGL_OPENGL_ES3_BIT: i32 = 0x0040;
     pub const EGL_NONE: i32 = 0x3038;
     pub const EGL_CONTEXT_CLIENT_VERSION: i32 = 0x3098;
+    // EGL_KHR_create_context（桌面 GL 上下文：Zink/Mesa 真桌面 GL 路径）
+    pub const EGL_CONTEXT_MAJOR_VERSION_KHR: i32 = 0x30FB;
+    pub const EGL_CONTEXT_MINOR_VERSION_KHR: i32 = 0x30FC;
+    pub const EGL_CONTEXT_OPENGL_PROFILE_MASK_KHR: i32 = 0x30FD;
+    pub const EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT: i32 = 0x0001;
     pub const EGL_NATIVE_VISUAL_ID: i32 = 0x302E;
     pub const EGL_BAD_SURFACE: i32 = 0x300D;
     pub const EGL_WIDTH: i32 = 0x3057;
@@ -554,9 +559,11 @@ pub extern "C" fn pojav_init() -> c_int {
         }
         let renderer_env = std::env::var("POJAV_RENDERER").unwrap_or_default();
         if renderer_env.starts_with("vulkan_zink") {
-            s.renderer.store(RENDERER_VK_ZINK, Ordering::Release);
-            log("渲染桥：Zink 路径待 M2（Mesa pack 未接入）");
-            return;
+            // Pojav 的 vulkan_zink 走 Vulkan WSI 直连（VkSurface/VkSwapchain），
+            // 本桥未实现该路径；Mesa 系渲染器（FCL/Zalith 的 Zink/Kopper pack）
+            // 自带完整 EGL 实现（libEGL_mesa.so），经 POJAVEXEC_EGL 走本桥
+            // 标准 EGL 窗口路径即可 —— 不再中断，继续 EGL 初始化。
+            log("渲染桥：vulkan_zink（Vulkan WSI 直连）未启用，回退 EGL 路径");
         }
         s.renderer.store(RENDERER_GL4ES, Ordering::Release);
         if let Some(api) = egl::load_api() {
@@ -601,7 +608,7 @@ pub extern "C" fn pojav_create_context(share: *mut c_void) -> *mut c_void {
         const A_ES2: i32 = egl::EGL_OPENGL_ES2_BIT;
         const A_ES3: i32 = egl::EGL_OPENGL_ES3_BIT;
         struct Ladder {
-            attrs: [i32; 15],
+            attrs: [i32; 16],
             es_bit: i32,
         }
         let ladders = [
@@ -752,7 +759,8 @@ pub extern "C" fn pojav_create_context(share: *mut c_void) -> *mut c_void {
         }
 
         let renderer_env = std::env::var("POJAV_RENDERER").unwrap_or_default();
-        let bind = if renderer_env.contains("desktopgl") {
+        let desktop_gl = renderer_env.contains("desktopgl");
+        let bind = if desktop_gl {
             (api.bind_api.unwrap())(egl::EGL_OPENGL_API)
         } else {
             (api.bind_api.unwrap())(egl::EGL_OPENGL_ES_API)
@@ -761,15 +769,7 @@ pub extern "C" fn pojav_create_context(share: *mut c_void) -> *mut c_void {
             log("eglBindAPI 失败");
         }
 
-        // GLES 主版本：LIBGL_ES 显式指定优先；否则按匹配 config 的
-        // RENDERABLE_TYPE 位自适应（ES3 config 用 3，否则 2）—— MobileGlues
-        // 等仅暴露 ES3 config 的渲染层由此自动落对，不再硬编码 renderer 名。
-        let es = std::env::var("LIBGL_ES")
-            .ok()
-            .and_then(|v| v.trim().parse::<i32>().ok())
-            .filter(|v| (1..=3).contains(v))
-            .unwrap_or(if matched_es_bit & egl::EGL_OPENGL_ES3_BIT != 0 { 3 } else { 2 });
-        let ctx_attrs = [egl::EGL_CONTEXT_CLIENT_VERSION, es, egl::EGL_NONE];
+        // 共享上下文（share 句柄查表；两分支共用）
         let share_ctx = if share.is_null() {
             egl::EGL_NO_CONTEXT
         } else {
@@ -779,12 +779,55 @@ pub extern "C" fn pojav_create_context(share: *mut c_void) -> *mut c_void {
                 None => egl::EGL_NO_CONTEXT,
             }
         };
-        let context = (api.create_context.unwrap())(display, config, share_ctx, ctx_attrs.as_ptr());
-        if context == egl::EGL_NO_CONTEXT {
-            let err = (api.get_error.unwrap())();
-            log(&format!("eglCreateContext 失败：{err:#06x}（client_version={es}）"));
-            return;
-        }
+        // GLES 主版本：LIBGL_ES 显式指定优先；否则按匹配 config 的
+        // RENDERABLE_TYPE 位自适应（ES3 config 用 3，否则 2）—— MobileGlues
+        // 等仅暴露 ES3 config 的渲染层由此自动落对，不再硬编码 renderer 名。
+        // 桌面 GL（Zink/Kopper）：走 EGL_KHR_create_context 主/次版本阶梯，
+        // MC 1.17+ 需要核心 3.2+，从 4.6 逐级降档尝试。
+        let (context, es_label): (egl::EGLContext, String) = if desktop_gl {
+            const PROFILES: [(i32, i32); 3] = [(4, 6), (3, 3), (3, 2)];
+            let mut got = egl::EGL_NO_CONTEXT;
+            let mut label = String::new();
+            for (major, minor) in PROFILES {
+                let attrs = [
+                    egl::EGL_CONTEXT_MAJOR_VERSION_KHR,
+                    major,
+                    egl::EGL_CONTEXT_MINOR_VERSION_KHR,
+                    minor,
+                    egl::EGL_CONTEXT_OPENGL_PROFILE_MASK_KHR,
+                    egl::EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT,
+                    egl::EGL_NONE,
+                    0,
+                ];
+                let ctx = (api.create_context.unwrap())(display, config, share_ctx, attrs.as_ptr());
+                if ctx != egl::EGL_NO_CONTEXT {
+                    got = ctx;
+                    label = format!("GL{major}.{minor} core");
+                    break;
+                }
+                let err = (api.get_error.unwrap())();
+                log(&format!("桌面 GL {major}.{minor} 上下文创建失败：{err:#06x}，降档重试"));
+            }
+            if got == egl::EGL_NO_CONTEXT {
+                log("桌面 GL 全阶梯未命中（设备 Vulkan 驱动或 Mesa pack 异常）");
+                return;
+            }
+            (got, label)
+        } else {
+            let es = std::env::var("LIBGL_ES")
+                .ok()
+                .and_then(|v| v.trim().parse::<i32>().ok())
+                .filter(|v| (1..=3).contains(v))
+                .unwrap_or(if matched_es_bit & egl::EGL_OPENGL_ES3_BIT != 0 { 3 } else { 2 });
+            let ctx_attrs = [egl::EGL_CONTEXT_CLIENT_VERSION, es, egl::EGL_NONE];
+            let context = (api.create_context.unwrap())(display, config, share_ctx, ctx_attrs.as_ptr());
+            if context == egl::EGL_NO_CONTEXT {
+                let err = (api.get_error.unwrap())();
+                log(&format!("eglCreateContext 失败：{err:#06x}（client_version={es}）"));
+                return;
+            }
+            (context, format!("GLES{es}"))
+        };
         let bundle = Arc::new(RenderWindow {
             state: std::cell::Cell::new(egl::STATE_ALIVE),
             config: std::cell::Cell::new(config),
@@ -797,7 +840,7 @@ pub extern "C" fn pojav_create_context(share: *mut c_void) -> *mut c_void {
         let handle = Arc::as_ptr(&bundle) as usize;
         s.windows.lock().unwrap().insert(handle, bundle);
         log(&format!(
-            "pojavCreateContext：窗口 {handle:#x}（GLES{es}，阶梯#{matched_tier}，renderable={matched_es_bit:#06x}）"
+            "pojavCreateContext：窗口 {handle:#x}（{es_label}，阶梯#{matched_tier}，renderable={matched_es_bit:#06x}）"
         ));
         result = handle as *mut c_void;
     });
@@ -1445,62 +1488,91 @@ pub unsafe extern "system" fn Java_org_lwjgl_vulkan_VK_getVulkanDriverHandle(
 // 绝不 RegisterNatives —— 旧 C 桥在此注册 jar 不存在的 nativeSetUseInputStackQueue
 // 触发 RegisterNatives NoSuchMethodError（gladiolus 发布包 jar↔so 错位，退出码 255 根因）。
 // 仅缓存 GLFW 类与按键缓冲地址（本线程正处于 GLFW.<clinit>，FindClass 经 AppClassLoader 可达）。
+//
+// v0.1.10 修复（双副本分裂脑）：壳层与游戏 JVM 曾各加载一份本库（runtime_dir
+// 与 natives_dir 两个路径 = bionic 两份独立全局状态），Surface 挂在壳层副本、
+// pojavInit 在 JVM 副本里等窗口到天荒地老。统一路径后（壳层先 dlopen 同一文件），
+// libart 的 System.loadLibrary 发现库已加载会**跳过 JNI_OnLoad** —— rt_vm/GLFW
+// 缓存永远不会被设置。故提供 quartz_bridge_notify_rt_vm 由壳层在 CreateJavaVM
+// 成功后显式调用；JNI_OnLoad（旧路径时序）与本函数共用同一实现且幂等。
 // ---------------------------------------------------------------------------
+
+static RT_VM_NOTIFIED: AtomicBool = AtomicBool::new(false);
+
+/// 缓存 OpenJDK（runtime）侧 GLFW 类 / 回调方法 ID / 直读缓冲地址。幂等。
+unsafe fn notify_runtime_vm(vm: VmPtr) {
+    if RT_VM_NOTIFIED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let s = state();
+    s.rt_vm.store(vm, Ordering::Release);
+    if let Some(env) = (unsafe { runtime_env() }) {
+        let glfw_name = CString::new("org/lwjgl/glfw/GLFW").unwrap();
+        let m1 = CString::new("internalChangeMonitorSize").unwrap();
+        let sig1 = CString::new("(II)V").unwrap();
+        let m2 = CString::new("internalWindowSizeChanged").unwrap();
+        let sig2 = CString::new("(J)V").unwrap();
+        let f1 = CString::new("keyDownBuffer").unwrap();
+        let f2 = CString::new("mouseDownBuffer").unwrap();
+        let sig_buf = CString::new("Ljava/nio/ByteBuffer;").unwrap();
+        unsafe {
+            let tbl = env_tbl(env);
+            let cls = (tbl.FindClass.unwrap())(env, glfw_name.as_ptr());
+            if cls.is_null() {
+                tbl.ExceptionClear.unwrap()(env);
+            } else {
+                s.rt_glfw_class
+                    .store((tbl.NewGlobalRef.unwrap())(env, cls) as *mut c_void, Ordering::Release);
+                s.m_monitor_size.store(
+                    (tbl.GetStaticMethodID.unwrap())(env, cls, m1.as_ptr(), sig1.as_ptr()) as *mut c_void,
+                    Ordering::Release,
+                );
+                s.m_window_size.store(
+                    (tbl.GetStaticMethodID.unwrap())(env, cls, m2.as_ptr(), sig2.as_ptr()) as *mut c_void,
+                    Ordering::Release,
+                );
+                let key_fid =
+                    (tbl.GetStaticFieldID.unwrap())(env, cls, f1.as_ptr(), sig_buf.as_ptr());
+                if !key_fid.is_null() {
+                    let buf = (tbl.GetStaticObjectField.unwrap())(env, cls, key_fid);
+                    if !buf.is_null() {
+                        let addr = (tbl.GetDirectBufferAddress.unwrap())(env, buf);
+                        s.key_buf.store(addr as *mut u8, Ordering::Release);
+                    }
+                }
+                let mouse_fid =
+                    (tbl.GetStaticFieldID.unwrap())(env, cls, f2.as_ptr(), sig_buf.as_ptr());
+                if !mouse_fid.is_null() {
+                    let buf = (tbl.GetStaticObjectField.unwrap())(env, cls, mouse_fid);
+                    if !buf.is_null() {
+                        let addr = (tbl.GetDirectBufferAddress.unwrap())(env, buf);
+                        s.mouse_buf.store(addr as *mut u8, Ordering::Release);
+                    }
+                }
+                log("JNI_OnLoad（OpenJDK）：GLFW 桥缓存就绪");
+            }
+        }
+    }
+}
 
 #[no_mangle]
 pub unsafe extern "system" fn JNI_OnLoad(vm: *mut JavaVM, _reserved: *mut c_void) -> jint {
     guard!({
-        let s = state();
-        s.rt_vm.store(vm, Ordering::Release);
-        if let Some(env) = (unsafe { runtime_env() }) {
-            let glfw_name = CString::new("org/lwjgl/glfw/GLFW").unwrap();
-            let m1 = CString::new("internalChangeMonitorSize").unwrap();
-            let sig1 = CString::new("(II)V").unwrap();
-            let m2 = CString::new("internalWindowSizeChanged").unwrap();
-            let sig2 = CString::new("(J)V").unwrap();
-            let f1 = CString::new("keyDownBuffer").unwrap();
-            let f2 = CString::new("mouseDownBuffer").unwrap();
-            let sig_buf = CString::new("Ljava/nio/ByteBuffer;").unwrap();
-            unsafe {
-                let tbl = env_tbl(env);
-                let cls = (tbl.FindClass.unwrap())(env, glfw_name.as_ptr());
-                if cls.is_null() {
-                    tbl.ExceptionClear.unwrap()(env);
-                } else {
-                    s.rt_glfw_class
-                        .store((tbl.NewGlobalRef.unwrap())(env, cls) as *mut c_void, Ordering::Release);
-                    s.m_monitor_size.store(
-                        (tbl.GetStaticMethodID.unwrap())(env, cls, m1.as_ptr(), sig1.as_ptr()) as *mut c_void,
-                        Ordering::Release,
-                    );
-                    s.m_window_size.store(
-                        (tbl.GetStaticMethodID.unwrap())(env, cls, m2.as_ptr(), sig2.as_ptr()) as *mut c_void,
-                        Ordering::Release,
-                    );
-                    let key_fid =
-                        (tbl.GetStaticFieldID.unwrap())(env, cls, f1.as_ptr(), sig_buf.as_ptr());
-                    if !key_fid.is_null() {
-                        let buf = (tbl.GetStaticObjectField.unwrap())(env, cls, key_fid);
-                        if !buf.is_null() {
-                            let addr = (tbl.GetDirectBufferAddress.unwrap())(env, buf);
-                            s.key_buf.store(addr as *mut u8, Ordering::Release);
-                        }
-                    }
-                    let mouse_fid =
-                        (tbl.GetStaticFieldID.unwrap())(env, cls, f2.as_ptr(), sig_buf.as_ptr());
-                    if !mouse_fid.is_null() {
-                        let buf = (tbl.GetStaticObjectField.unwrap())(env, cls, mouse_fid);
-                        if !buf.is_null() {
-                            let addr = (tbl.GetDirectBufferAddress.unwrap())(env, buf);
-                            s.mouse_buf.store(addr as *mut u8, Ordering::Release);
-                        }
-                    }
-                    log("JNI_OnLoad（OpenJDK）：GLFW 桥缓存就绪");
-                }
-            }
-        }
+        notify_runtime_vm(vm);
     });
     JNI_VERSION_1_4
+}
+
+/// 壳层在 CreateJavaVM 成功后显式注入 runtime VM（JNI_OnLoad 被 libart 抑制时
+/// 的兜底；见上方说明）。返回 1 表示已通知。
+#[no_mangle]
+pub unsafe extern "C" fn quartz_bridge_notify_rt_vm(vm: VmPtr) -> c_int {
+    let mut ok = 0;
+    guard!({
+        notify_runtime_vm(vm);
+        ok = 1;
+    });
+    ok
 }
 
 // ---------------------------------------------------------------------------
