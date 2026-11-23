@@ -1258,6 +1258,12 @@ unsafe fn run_game_from_spec(
     // HotSpot 写完 hs_err 后调用 abort()，仍落入本拦截（干净退出，不惊动系统）。
     install_fatal_signal_handlers();
 
+    // 之后所有 JNI（hook 安装 / 主类定位 / main 调用）都必须在**游戏 JVM 侧**
+    // 执行（用 CreateJavaVM 返回的 jenv）。v0.1.7 重构曾误用 ART env ——
+    // ART 的类加载器找不到 hook jar 与游戏主类（此前设备从未走到此处，
+    // CreateJavaVM 先失败了；不修则修好 JVM 后必然报「主类未找到」）。
+    let env = jenv;
+
     // 8) 安装退出捕获 SecurityManager（自研 hook jar）：System.exit/halt 被
     //    否决并转为 ExitSignal，崩溃码沿调用栈返回本函数而非 os::exit。
     let tbl = &**env;
