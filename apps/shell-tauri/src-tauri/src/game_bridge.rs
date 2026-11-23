@@ -1066,21 +1066,47 @@ unsafe fn run_game_from_spec(
 
     // 4) 等 Surface（主进程 MSG_SURFACE 先于/伴随 MSG_INIT 到达；横屏旋转需时间）
     if let Some(api) = BridgeApi::load() {
+        // v0.1.9-c 稳定窗口检测：主进程切横屏会销毁重建 Surface（surfaceDestroyed
+        // -> surfaceCreated），首条 Surface 常在方向切换完成前送达 —— 实机日志
+        // 显示「Surface 就绪」后窗口被释放、MC 的 pojavInit 又等了 8s 全程 NULL，
+        // 最终无窗口跑崩。改为：窗口就绪后保持 2.5s 未被释放才算就绪；中途被
+        // 释放（方向切换空档）则重新计时等待。
+        let step = std::time::Duration::from_millis(50);
+        let stable_need = 50; // 2.5s 稳定期（50ms × 50）
+        let mut stable: u32 = 0;
+        let mut waited: u32 = 0;
+        let mut ever_ready = false;
         let mut ready = false;
-        for i in 0..240 {
+        while waited < 16_000 / 50 {
+            std::thread::sleep(step);
+            waited += 1;
             if (api.window_ready)() == 1 {
-                ready = true;
-                break;
+                ever_ready = true;
+                stable += 1;
+                if stable >= stable_need {
+                    ready = true;
+                    break;
+                }
+            } else {
+                if ever_ready && stable > 0 {
+                    eprintln!(
+                        "[quartz] Surface 被主进程释放（方向切换销毁重建），重新等待…（已稳定 {}/2.5s）",
+                        stable as f32 * 0.05
+                    );
+                }
+                ever_ready = false;
+                stable = 0;
             }
-            if i % 20 == 19 {
+            if waited % 80 == 0 && !ever_ready {
                 eprintln!("[quartz] 等待 Surface 创建…");
             }
-            std::thread::sleep(std::time::Duration::from_millis(50));
         }
         if !ready {
-            return Err("游戏 Surface 创建超时（12s）：显示桥未收到 Surface".into());
+            return Err(
+                "游戏 Surface 创建超时（16s 含 2.5s 稳定期）：显示桥未收到稳定 Surface".into(),
+            );
         }
-        eprintln!("[quartz] Surface 就绪");
+        eprintln!("[quartz] Surface 就绪（稳定窗口检测通过）");
     }
 
     // 5) JVM 参数装配：-cp 对转 -Djava.class.path + 追加退出捕获 hook jar；

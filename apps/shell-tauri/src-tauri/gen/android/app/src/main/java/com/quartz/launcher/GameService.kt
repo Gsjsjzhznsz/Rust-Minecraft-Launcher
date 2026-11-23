@@ -75,15 +75,19 @@ class GameService : Service() {
                 MSG_SURFACE -> {
                     @Suppress("DEPRECATION")
                     val s = msg.data?.getParcelable<Surface>("surface")
+                    android.util.Log.i("QuartzGame", "MSG_SURFACE: valid=${s?.isValid}")
                     if (s != null && s.isValid) {
                         try {
                             // :game 进程内直调桥 native（ANativeWindow_fromSurface）
-                            QuartzBridge.instance.setupSurface(s)
-                        } catch (_: Throwable) {
+                            val rc = QuartzBridge.instance.setupSurface(s)
+                            android.util.Log.i("QuartzGame", "setupSurface rc=$rc")
+                        } catch (t: Throwable) {
+                            android.util.Log.w("QuartzGame", "setupSurface 异常", t)
                         }
                     }
                 }
                 MSG_RELEASE_SURFACE -> {
+                    android.util.Log.i("QuartzGame", "MSG_RELEASE_SURFACE（主进程 surfaceDestroyed）")
                     try {
                         QuartzBridge.instance.releaseSurface()
                     } catch (_: Throwable) {

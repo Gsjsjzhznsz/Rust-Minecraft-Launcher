@@ -43,6 +43,7 @@ object GameIpc {
 
     /** Surface 创建（GameView.surfaceCreated）。 */
     fun sendSurface(s: Surface) {
+        android.util.Log.i("QuartzGame", "sendSurface: valid=${s.isValid} messenger=${GameService.serviceMessenger != null}")
         if (GameService.serviceMessenger == null) {
             pendingSurface = s
             return
@@ -56,6 +57,7 @@ object GameIpc {
 
     /** Surface 销毁（GameView.surfaceDestroyed）。 */
     fun releaseSurface() {
+        android.util.Log.i("QuartzGame", "releaseSurface（主进程 surfaceDestroyed）")
         pendingSurface = null
         trySend(Message.obtain(null, GameService.MSG_RELEASE_SURFACE))
     }

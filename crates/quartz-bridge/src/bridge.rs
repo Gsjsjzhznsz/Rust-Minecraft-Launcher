@@ -323,6 +323,7 @@ pub mod egl {
     pub const EGL_DEPTH_SIZE: i32 = 0x1225;
     pub const EGL_RENDERABLE_TYPE: i32 = 0x1240;
     pub const EGL_OPENGL_ES2_BIT: i32 = 0x0004;
+    pub const EGL_OPENGL_ES3_BIT: i32 = 0x0040;
     pub const EGL_NONE: i32 = 0x3038;
     pub const EGL_CONTEXT_CLIENT_VERSION: i32 = 0x3098;
     pub const EGL_NATIVE_VISUAL_ID: i32 = 0x302E;
@@ -336,6 +337,8 @@ pub mod egl {
     type EglInitializeFn = unsafe extern "system" fn(EGLDisplay, *mut i32, *mut i32) -> u32;
     type EglChooseConfigFn =
         unsafe extern "system" fn(EGLDisplay, *const i32, *mut EGLConfig, i32, *mut i32) -> u32;
+    type EglGetConfigsFn =
+        unsafe extern "system" fn(EGLDisplay, *mut EGLConfig, i32, *mut i32) -> u32;
     type EglConfigAttribFn = unsafe extern "system" fn(EGLDisplay, EGLConfig, i32, *mut i32) -> u32;
     type EglBindApiFn = unsafe extern "system" fn(u32) -> u32;
     type EglCreateContextFn =
@@ -360,6 +363,7 @@ pub mod egl {
         pub get_display: Option<EglDisplayFn>,
         pub initialize: Option<EglInitializeFn>,
         pub choose_config: Option<EglChooseConfigFn>,
+        pub get_configs: Option<EglGetConfigsFn>,
         pub get_config_attrib: Option<EglConfigAttribFn>,
         pub bind_api: Option<EglBindApiFn>,
         pub create_context: Option<EglCreateContextFn>,
@@ -396,6 +400,7 @@ pub mod egl {
             get_display: None,
             initialize: None,
             choose_config: None,
+            get_configs: None,
             get_config_attrib: None,
             bind_api: None,
             create_context: None,
@@ -424,6 +429,7 @@ pub mod egl {
         get!(get_display, "eglGetDisplay", EglDisplayFn);
         get!(initialize, "eglInitialize", EglInitializeFn);
         get!(choose_config, "eglChooseConfig", EglChooseConfigFn);
+        get!(get_configs, "eglGetConfigs", EglGetConfigsFn);
         get!(get_config_attrib, "eglGetConfigAttrib", EglConfigAttribFn);
         get!(bind_api, "eglBindAPI", EglBindApiFn);
         get!(create_context, "eglCreateContext", EglCreateContextFn);
@@ -522,11 +528,14 @@ pub extern "C" fn pojav_init() -> c_int {
         // 继续，后续 eglCreateWindowSurface 必败 —— 这里最多等 8s 再初始化。
         if window.is_null() {
             log("pojavInit：ANativeWindow 尚未就绪（等待壳层 Surface）");
-            for _ in 0..160 {
+            for i in 0..160 {
                 std::thread::sleep(std::time::Duration::from_millis(50));
                 window = s.window.load(Ordering::Acquire);
                 if !window.is_null() {
                     break;
+                }
+                if i % 40 == 39 {
+                    log("pojavInit：仍在等待 Surface…（8s 窗口期已过 2s）");
                 }
             }
         }
@@ -583,73 +592,162 @@ pub extern "C" fn pojav_create_context(share: *mut c_void) -> *mut c_void {
         // v0.1.7 崩溃修复 ②：部分渲染层 EGL（gl4es 等）不支持 WINDOW|PBUFFER
         // 组合属性（eglChooseConfig 返回 EGL_FALSE/BAD_CONFIG，configs=0），
         // 之前直接失败导致 MC 拿不到上下文退出 —— 改为逐级放宽的回退阶梯。
+        //
+        // v0.1.9-c 实机日志修复：MobileGlues 的 EGL 实现只暴露 ES3 位 config，
+        // 全 ES2 阶梯全部 EGL_BAD_MATCH(0x3004)/configs=0，MC 拿不到 context 后
+        // Render thread 空指针 SIGSEGV —— 阶梯扩展为 ES2×4 + ES3×3 + 无约束，
+        // 最后 eglGetConfigs 兜底取第一个 config；匹配后读 config 的
+        // RENDERABLE_TYPE 位自适应决定 GLES 主版本。
         const A_ES2: i32 = egl::EGL_OPENGL_ES2_BIT;
-        let ladders: [[i32; 15]; 4] = [
-            // #0 完整需求：RGBA8888 + 深度 24 + WINDOW|PBUFFER + ES2
-            [
-                egl::EGL_BLUE_SIZE, 8,
-                egl::EGL_GREEN_SIZE, 8,
-                egl::EGL_RED_SIZE, 8,
-                egl::EGL_ALPHA_SIZE, 8,
-                egl::EGL_DEPTH_SIZE, 24,
-                egl::EGL_SURFACE_TYPE, egl::EGL_WINDOW_BIT | egl::EGL_PBUFFER_BIT,
-                egl::EGL_RENDERABLE_TYPE, A_ES2,
-                egl::EGL_NONE,
-            ],
-            // #1 去掉 PBUFFER 位（窗口渲染主路径）
-            [
-                egl::EGL_BLUE_SIZE, 8,
-                egl::EGL_GREEN_SIZE, 8,
-                egl::EGL_RED_SIZE, 8,
-                egl::EGL_ALPHA_SIZE, 8,
-                egl::EGL_DEPTH_SIZE, 24,
-                egl::EGL_SURFACE_TYPE, egl::EGL_WINDOW_BIT,
-                egl::EGL_RENDERABLE_TYPE, A_ES2,
-                egl::EGL_NONE,
-            ],
-            // #2 深度降为 16
-            [
-                egl::EGL_BLUE_SIZE, 8,
-                egl::EGL_GREEN_SIZE, 8,
-                egl::EGL_RED_SIZE, 8,
-                egl::EGL_ALPHA_SIZE, 8,
-                egl::EGL_DEPTH_SIZE, 16,
-                egl::EGL_SURFACE_TYPE, egl::EGL_WINDOW_BIT,
-                egl::EGL_RENDERABLE_TYPE, A_ES2,
-                egl::EGL_NONE,
-            ],
-            // #3 仅要求 ES2 可渲染（颜色/深度交给 EGL 默认值）
-            [
-                egl::EGL_RENDERABLE_TYPE, A_ES2,
-                egl::EGL_SURFACE_TYPE, egl::EGL_WINDOW_BIT,
-                egl::EGL_NONE, 0,
-                egl::EGL_NONE, 0,
-                egl::EGL_NONE, 0,
-                egl::EGL_NONE, 0,
-                egl::EGL_NONE, 0,
-                egl::EGL_NONE,
-            ],
+        const A_ES3: i32 = egl::EGL_OPENGL_ES3_BIT;
+        struct Ladder {
+            attrs: [i32; 15],
+            es_bit: i32,
+        }
+        let ladders = [
+            // #0 ES2 完整需求：RGBA8888 + 深度 24 + WINDOW|PBUFFER
+            Ladder {
+                attrs: [
+                    egl::EGL_BLUE_SIZE, 8,
+                    egl::EGL_GREEN_SIZE, 8,
+                    egl::EGL_RED_SIZE, 8,
+                    egl::EGL_ALPHA_SIZE, 8,
+                    egl::EGL_DEPTH_SIZE, 24,
+                    egl::EGL_SURFACE_TYPE, egl::EGL_WINDOW_BIT | egl::EGL_PBUFFER_BIT,
+                    egl::EGL_RENDERABLE_TYPE, A_ES2,
+                    egl::EGL_NONE, 0,
+                ],
+                es_bit: A_ES2,
+            },
+            // #1 ES2 去 PBUFFER 位（窗口渲染主路径）
+            Ladder {
+                attrs: [
+                    egl::EGL_BLUE_SIZE, 8,
+                    egl::EGL_GREEN_SIZE, 8,
+                    egl::EGL_RED_SIZE, 8,
+                    egl::EGL_ALPHA_SIZE, 8,
+                    egl::EGL_DEPTH_SIZE, 24,
+                    egl::EGL_SURFACE_TYPE, egl::EGL_WINDOW_BIT,
+                    egl::EGL_RENDERABLE_TYPE, A_ES2,
+                    egl::EGL_NONE, 0,
+                ],
+                es_bit: A_ES2,
+            },
+            // #2 ES2 深度降为 16
+            Ladder {
+                attrs: [
+                    egl::EGL_BLUE_SIZE, 8,
+                    egl::EGL_GREEN_SIZE, 8,
+                    egl::EGL_RED_SIZE, 8,
+                    egl::EGL_ALPHA_SIZE, 8,
+                    egl::EGL_DEPTH_SIZE, 16,
+                    egl::EGL_SURFACE_TYPE, egl::EGL_WINDOW_BIT,
+                    egl::EGL_RENDERABLE_TYPE, A_ES2,
+                    egl::EGL_NONE, 0,
+                ],
+                es_bit: A_ES2,
+            },
+            // #3 ES2 仅要求可渲染 + 窗口位（颜色/深度交给 EGL 默认值）
+            Ladder {
+                attrs: [
+                    egl::EGL_SURFACE_TYPE, egl::EGL_WINDOW_BIT,
+                    egl::EGL_RENDERABLE_TYPE, A_ES2,
+                    egl::EGL_NONE, 0,
+                    egl::EGL_NONE, 0,
+                    egl::EGL_NONE, 0,
+                    egl::EGL_NONE, 0,
+                    egl::EGL_NONE, 0,
+                    egl::EGL_NONE, 0,
+                ],
+                es_bit: A_ES2,
+            },
+            // #4 ES3 完整需求（MobileGlues 主路径）
+            Ladder {
+                attrs: [
+                    egl::EGL_BLUE_SIZE, 8,
+                    egl::EGL_GREEN_SIZE, 8,
+                    egl::EGL_RED_SIZE, 8,
+                    egl::EGL_ALPHA_SIZE, 8,
+                    egl::EGL_DEPTH_SIZE, 24,
+                    egl::EGL_SURFACE_TYPE, egl::EGL_WINDOW_BIT | egl::EGL_PBUFFER_BIT,
+                    egl::EGL_RENDERABLE_TYPE, A_ES3,
+                    egl::EGL_NONE, 0,
+                ],
+                es_bit: A_ES3,
+            },
+            // #5 ES3 去 PBUFFER 位
+            Ladder {
+                attrs: [
+                    egl::EGL_BLUE_SIZE, 8,
+                    egl::EGL_GREEN_SIZE, 8,
+                    egl::EGL_RED_SIZE, 8,
+                    egl::EGL_ALPHA_SIZE, 8,
+                    egl::EGL_DEPTH_SIZE, 24,
+                    egl::EGL_SURFACE_TYPE, egl::EGL_WINDOW_BIT,
+                    egl::EGL_RENDERABLE_TYPE, A_ES3,
+                    egl::EGL_NONE, 0,
+                ],
+                es_bit: A_ES3,
+            },
+            // #6 ES3 仅可渲染 + 窗口位
+            Ladder {
+                attrs: [
+                    egl::EGL_SURFACE_TYPE, egl::EGL_WINDOW_BIT,
+                    egl::EGL_RENDERABLE_TYPE, A_ES3,
+                    egl::EGL_NONE, 0,
+                    egl::EGL_NONE, 0,
+                    egl::EGL_NONE, 0,
+                    egl::EGL_NONE, 0,
+                    egl::EGL_NONE, 0,
+                    egl::EGL_NONE, 0,
+                ],
+                es_bit: A_ES3,
+            },
         ];
         let mut config: egl::EGLConfig = ptr::null_mut();
         let mut format: i32 = 0;
-        let mut matched = false;
-        for (tier, attrs) in ladders.iter().enumerate() {
+        let mut matched_es_bit: i32 = 0;
+        let mut matched_tier: i32 = -1;
+        for (tier, lad) in ladders.iter().enumerate() {
             let mut num_configs: i32 = 0;
-            let rc = (api.choose_config.unwrap())(display, attrs.as_ptr(), ptr::null_mut(), 0, &mut num_configs);
+            let rc = (api.choose_config.unwrap())(display, lad.attrs.as_ptr(), ptr::null_mut(), 0, &mut num_configs);
             if rc == egl::EGL_TRUE && num_configs > 0 {
                 let mut got: i32 = 0;
-                (api.choose_config.unwrap())(display, attrs.as_ptr(), &mut config, 1, &mut got);
+                (api.choose_config.unwrap())(display, lad.attrs.as_ptr(), &mut config, 1, &mut got);
                 (api.get_config_attrib.unwrap())(display, config, egl::EGL_NATIVE_VISUAL_ID, &mut format);
-                matched = true;
+                matched_es_bit = lad.es_bit;
+                matched_tier = tier as i32;
                 if tier > 0 {
                     log(&format!("eglChooseConfig：使用回退阶梯 #{tier}（configs={num_configs}）"));
                 }
                 break;
             }
+            log(&format!(
+                "eglChooseConfig 阶梯 #{tier} 未命中：rc={rc} configs={num_configs} err={:#06x}",
+                (api.get_error.unwrap())()
+            ));
         }
-        if !matched {
+        if config.is_null() {
+            // v0.1.9-c 兜底：全阶梯未命中时 eglGetConfigs 取第一个 config，
+            // RENDERABLE_TYPE 由 config 自身能力决定（不再按需求筛选）。
+            log("eglChooseConfig 全阶梯未命中，eglGetConfigs 兜底");
+            let mut num_configs: i32 = 0;
+            if (api.get_configs.unwrap())(display, ptr::null_mut(), 0, &mut num_configs) == egl::EGL_TRUE
+                && num_configs > 0
+            {
+                let mut got: i32 = 0;
+                (api.get_configs.unwrap())(display, &mut config, 1, &mut got);
+                (api.get_config_attrib.unwrap())(display, config, egl::EGL_NATIVE_VISUAL_ID, &mut format);
+                (api.get_config_attrib.unwrap())(display, config, egl::EGL_RENDERABLE_TYPE, &mut matched_es_bit);
+                matched_tier = -2;
+                log(&format!(
+                    "eglGetConfigs 兜底成功：configs={num_configs} renderable={matched_es_bit:#06x}"
+                ));
+            }
+        }
+        if config.is_null() {
             let err = (api.get_error.unwrap())();
-            log(&format!("eglChooseConfig 失败：{err:#06x}（全阶梯 configs=0）"));
+            log(&format!("eglChooseConfig 失败：{err:#06x}（含 eglGetConfigs 兜底仍无 config）"));
             return;
         }
 
@@ -663,12 +761,14 @@ pub extern "C" fn pojav_create_context(share: *mut c_void) -> *mut c_void {
             log("eglBindAPI 失败");
         }
 
-        // GLES 主版本：LIBGL_ES 显式指定（mobileglues 默认 3，gl4es 默认 2）
+        // GLES 主版本：LIBGL_ES 显式指定优先；否则按匹配 config 的
+        // RENDERABLE_TYPE 位自适应（ES3 config 用 3，否则 2）—— MobileGlues
+        // 等仅暴露 ES3 config 的渲染层由此自动落对，不再硬编码 renderer 名。
         let es = std::env::var("LIBGL_ES")
             .ok()
             .and_then(|v| v.trim().parse::<i32>().ok())
             .filter(|v| (1..=3).contains(v))
-            .unwrap_or(if renderer_env.contains("mobileglues") { 3 } else { 2 });
+            .unwrap_or(if matched_es_bit & egl::EGL_OPENGL_ES3_BIT != 0 { 3 } else { 2 });
         let ctx_attrs = [egl::EGL_CONTEXT_CLIENT_VERSION, es, egl::EGL_NONE];
         let share_ctx = if share.is_null() {
             egl::EGL_NO_CONTEXT
@@ -696,7 +796,9 @@ pub extern "C" fn pojav_create_context(share: *mut c_void) -> *mut c_void {
         });
         let handle = Arc::as_ptr(&bundle) as usize;
         s.windows.lock().unwrap().insert(handle, bundle);
-        log(&format!("pojavCreateContext：窗口 {handle:#x}（GLES{es}）"));
+        log(&format!(
+            "pojavCreateContext：窗口 {handle:#x}（GLES{es}，阶梯#{matched_tier}，renderable={matched_es_bit:#06x}）"
+        ));
         result = handle as *mut c_void;
     });
     result
@@ -1442,12 +1544,21 @@ pub unsafe extern "C" fn quartz_bridge_setup_surface(env: EnvPtr, surface: jobje
                 if let Some(bundle) = s.windows.lock().unwrap().get(&handle).cloned() {
                     bundle.new_native_surface.set(window);
                     bundle.state.set(egl::STATE_NEW_WINDOW);
+                    log(&format!(
+                        "setupSurface：主窗口 {handle:#x} 标记 NEW_WINDOW（{w}x{h}）"
+                    ));
                 }
             }
             if !old.is_null() && old != window {
                 ANativeWindow_release(old);
             }
+            log(&format!(
+                "setupSurface：窗口 {w}x{h} 已挂载（主窗口={})",
+                main_handle.map(|h| format!("{h:#x}")).unwrap_or_else(|| "无".into())
+            ));
             rc = 1;
+        } else {
+            log("setupSurface：ANativeWindow_fromSurface 返回 NULL（Surface 无效或已销毁）");
         }
     });
     rc
@@ -1461,6 +1572,7 @@ pub unsafe extern "C" fn quartz_bridge_release_surface() {
         let old = s.window.swap(ptr::null_mut(), Ordering::AcqRel);
         if !old.is_null() {
             ANativeWindow_release(old);
+            log("releaseSurface：窗口已释放（主进程 surfaceDestroyed）");
         }
     });
 }
