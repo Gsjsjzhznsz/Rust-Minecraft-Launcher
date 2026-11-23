@@ -406,6 +406,7 @@ function onProgress(p: DownloadProgress) {
     busy = false;
     refreshInstalled();
     toast("下载完成", "ok");
+    refreshAssetsStatus(); // 资产下载/修复完成后刷新维护页状态
   } else if (p.stage === "error") {
     busy = false;
     toast("下载失败", "err");
@@ -1005,6 +1006,151 @@ function onLwjglProgress(p: DownloadProgress) {
   }
 }
 
+/* ---------- 设置页扩展（v9）：内存 / 资产维护 / 日志查看 ---------- */
+async function refreshMemorySetting() {
+  try {
+    const mb = await invoke<number>("get_memory_mb");
+    el<HTMLInputElement>("memory-slider").value = String(mb);
+    setText("memory-value", `${mb} MB`);
+  } catch {
+    /* 桌面/异常时静默 */
+  }
+}
+
+function currentVersionId(): string {
+  const sel = el<HTMLSelectElement>("version-select");
+  return sel?.value || storage.selected || "";
+}
+
+async function refreshAssetsStatus() {
+  const badge = el<HTMLSpanElement>("assets-badge");
+  const vid = currentVersionId();
+  if (!vid) {
+    badge.className = "badge badge-dim";
+    badge.textContent = "未选版本";
+    setText("assets-index", "-");
+    setText("assets-objects", "-");
+    return;
+  }
+  try {
+    const s = await invoke<{
+      indexPresent: boolean;
+      indexId: string;
+      total: number;
+      missing: number;
+      missingBytes: number;
+    }>("assets_status", { versionId: vid });
+    if (!s.indexPresent) {
+      badge.className = "badge badge-warn";
+      badge.textContent = "无索引";
+      setText("assets-index", "未安装（重新下载该版本可修复）");
+      setText("assets-objects", "-");
+      return;
+    }
+    setText("assets-index", `${s.indexId}（${s.total} 个对象）`);
+    if (s.missing === 0) {
+      badge.className = "badge badge-ok";
+      badge.textContent = "完整";
+      setText("assets-objects", "全部就绪");
+    } else {
+      badge.className = "badge badge-err";
+      badge.textContent = `缺 ${s.missing}`;
+      setText("assets-objects", `缺失 ${s.missing} 个（约 ${bytes(s.missingBytes)}）`);
+    }
+  } catch (e) {
+    badge.className = "badge badge-dim";
+    badge.textContent = "检测失败";
+    setText("assets-index", String(e));
+  }
+}
+
+async function saveMemorySetting() {
+  const mb = Number(el<HTMLInputElement>("memory-slider").value);
+  try {
+    await invoke("set_memory_mb", { mb });
+    setText("memory-value", `${mb} MB`);
+    toast(`内存分配已保存为 ${mb} MB（下次启动生效）`, "ok");
+  } catch (e) {
+    toast(String(e), "err");
+  }
+}
+
+async function repairAssetsManual() {
+  const vid = currentVersionId();
+  if (!vid) {
+    toast("请先在主页选择版本", "err");
+    return;
+  }
+  const btn = el<HTMLButtonElement>("assets-repair-btn");
+  btn.disabled = true;
+  show("home-progress");
+  show("dl-progress");
+  try {
+    await ensureProgressListener();
+    await invoke("repair_assets", { versionId: vid });
+    toast("资产修复已开始，进度见主页/下载页", "");
+  } catch (e) {
+    btn.disabled = false;
+    toast(String(e), "err");
+  }
+}
+
+let logsCache: { name: string; size: number; modifiedMs: number }[] = [];
+async function refreshLogList() {
+  try {
+    logsCache = await invoke<{ name: string; size: number; modifiedMs: number }[]>("list_logs");
+  } catch {
+    logsCache = [];
+  }
+  const sel = el<HTMLSelectElement>("log-select");
+  sel.innerHTML = "";
+  if (logsCache.length === 0) {
+    const o = document.createElement("option");
+    o.value = "";
+    o.textContent = "暂无日志（先启动一次游戏）";
+    sel.appendChild(o);
+    return;
+  }
+  for (const l of logsCache) {
+    const o = document.createElement("option");
+    o.value = l.name;
+    const d = new Date(l.modifiedMs);
+    o.textContent = `${l.name}（${bytes(l.size)}，${d.toLocaleString()}）`;
+    sel.appendChild(o);
+  }
+}
+
+async function viewLogTail() {
+  const name = el<HTMLSelectElement>("log-select").value;
+  if (!name) {
+    toast("暂无日志", "err");
+    return;
+  }
+  try {
+    const text = await invoke<string>("read_log_tail", { name });
+    const pre = el<HTMLPreElement>("log-view");
+    pre.textContent = text || "（空）";
+    pre.classList.remove("hidden");
+  } catch (e) {
+    toast(String(e), "err");
+  }
+}
+
+async function copyLogTail() {
+  const name = el<HTMLSelectElement>("log-select").value;
+  if (!name) {
+    toast("暂无日志", "err");
+    return;
+  }
+  try {
+    const text = await invoke<string>("read_log_tail", { name });
+    await navigator.clipboard.writeText(text);
+    toast("已复制日志尾部", "ok");
+  } catch (_) {
+    toast("复制失败，请长按选择文本", "err");
+  }
+}
+
 /* ---------- 启动游戏（M0 真实启动链路） ---------- */
 async function doLaunch(versionId: string) {
   try {
@@ -1101,6 +1247,9 @@ function enterApp() {
   refreshPermission();
   refreshRenderers();
   refreshLwjglState();
+  refreshMemorySetting();
+  refreshAssetsStatus();
+  refreshLogList();
 }
 
 /* ---------- 事件绑定 ---------- */
@@ -1210,6 +1359,18 @@ function bindEvents() {
     if (document.visibilityState === "visible") refreshPermission();
   });
   window.addEventListener("focus", refreshPermission);
+
+  // 设置页扩展（v9）：内存滑条 / 资产维护 / 日志查看
+  el<HTMLInputElement>("memory-slider").addEventListener("input", (e) => {
+    setText("memory-value", `${(e.target as HTMLInputElement).value} MB`);
+  });
+  el<HTMLButtonElement>("memory-save-btn").addEventListener("click", saveMemorySetting);
+  el<HTMLButtonElement>("assets-repair-btn").addEventListener("click", repairAssetsManual);
+  el<HTMLButtonElement>("log-view-btn").addEventListener("click", viewLogTail);
+  el<HTMLButtonElement>("log-copy-btn").addEventListener("click", copyLogTail);
+  el<HTMLSelectElement>("version-select").addEventListener("change", () => {
+    refreshAssetsStatus();
+  });
 }
 
 /* ---------- 启动 ---------- */

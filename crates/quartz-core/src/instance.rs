@@ -485,6 +485,134 @@ pub async fn install_standard(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// 资产完整性检查与修复（v9「资源自动化」）
+//
+// 实机反馈：游戏内满屏 NoSuchFileException（assets/objects/**）—— 用户从旧
+// 版本升级后 assets 只剩索引、对象文件从未落全；且下载中断可重试，但没有
+// 主动触发入口。此模块提供：
+// 1. count_missing_assets：stat-only 扫描（不读文件内容、不校验哈希），
+//    一次扫描 <1s，供启动前自动检查与设置页展示；
+// 2. repair_assets：只下载缺失对象（幂等，可反复调用），进度经 mpsc 上报。
+// ---------------------------------------------------------------------------
+
+/// 资产完整性状态（UI 展示）。
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AssetStatus {
+    pub index_id: String,
+    pub total: u64,
+    pub missing: u64,
+    pub missing_bytes: u64,
+}
+
+/// 读版本的资产索引（未安装/无资产索引返回 None）。
+pub fn asset_index_for_version(version_id: &str) -> Option<(String, String)> {
+    let text = std::fs::read_to_string(crate::paths::version_json(version_id)).ok()?;
+    let version: crate::model::VersionJson = serde_json::from_str(&text).ok()?;
+    let idx = version.asset_index.as_ref()?;
+    let id = idx.id.clone();
+    let index_text = std::fs::read_to_string(crate::paths::asset_index_file(&id)).ok()?;
+    Some((id, index_text))
+}
+
+/// 资产完整性扫描（stat-only；无索引文件 = 尚未安装资产，missing=0 视为「无」，
+/// 由调用方用 indexPresent 区分）。损坏的索引 JSON 返回错误（提示重下版本）。
+pub fn count_missing_assets(version_id: &str) -> Result<AssetStatus> {
+    let Some((id, index_text)) = asset_index_for_version(version_id) else {
+        return Ok(AssetStatus {
+            index_id: String::new(),
+            total: 0,
+            missing: 0,
+            missing_bytes: 0,
+        });
+    };
+    let tasks = crate::meta::expand_asset_index(&index_text, &crate::paths::assets_dir())?;
+    let mut missing: u64 = 0;
+    let mut missing_bytes: u64 = 0;
+    for t in &tasks {
+        if !t.dest.exists() {
+            missing += 1;
+            missing_bytes += t.size.unwrap_or(0);
+        }
+    }
+    Ok(AssetStatus {
+        index_id: id,
+        total: tasks.len() as u64,
+        missing,
+        missing_bytes,
+    })
+}
+
+/// 修复资产：只下载缺失对象（已存在的文件不动；stat 过滤保证秒级重入）。
+/// 返回本次实际下载的文件数。进度经 mpsc 上报（stage=assets，与 install_standard 同构）。
+pub async fn repair_assets(
+    client: &reqwest::Client,
+    version_id: &str,
+    progress: tokio::sync::mpsc::Sender<DownloadProgress>,
+) -> Result<usize> {
+    let Some((_id, index_text)) = asset_index_for_version(version_id) else {
+        return Err(crate::error::Error::Other(format!(
+            "版本 {version_id} 缺少资产索引，请先重新下载该版本"
+        )));
+    };
+    let all = crate::meta::expand_asset_index(&index_text, &crate::paths::assets_dir())?;
+    let tasks: Vec<crate::download::DownloadTask> =
+        all.into_iter().filter(|t| !t.dest.exists()).collect();
+    let missing = tasks.len();
+    if missing == 0 {
+        send_progress(
+            &progress,
+            download_progress("done", "", 1, 1, true, None),
+        )
+        .await;
+        return Ok(0);
+    }
+    let total: u64 = tasks.iter().filter_map(|t| t.size).sum();
+    crate::space::ensure_free(
+        &crate::paths::assets_dir(),
+        total + 32 * 1024 * 1024,
+        &format!("修复资产（{} 个文件）", missing),
+    )
+    .map_err(crate::error::Error::Other)?;
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<crate::download::ProgressEvent>(64);
+    let plan = crate::download::DownloadPlan::new(tasks);
+    let exec_client = client.clone();
+    let exec = tokio::spawn(async move {
+        crate::download::execute(&plan, &exec_client, DOWNLOAD_CONCURRENCY, tx).await
+    });
+    let mut done_bytes: u64 = 0;
+    while let Some(ev) = rx.recv().await {
+        match ev {
+            crate::download::ProgressEvent::TaskDone { bytes, .. } => done_bytes += bytes,
+            crate::download::ProgressEvent::TaskSkipped { .. } => done_bytes += 0,
+            crate::download::ProgressEvent::TaskFailed { label, error } => {
+                let _ = label;
+                return Err(crate::error::Error::Other(format!(
+                    "资产修复失败（已自动重试 3 次）：{error}"
+                )));
+            }
+            crate::download::ProgressEvent::TaskStart { .. } => {}
+        }
+        send_progress(
+            &progress,
+            download_progress("assets", "", done_bytes, total, false, None),
+        )
+        .await;
+    }
+    let summary = exec
+        .await
+        .map_err(|e| crate::error::Error::Other(format!("下载执行器崩溃：{e}")))??;
+    if summary.failed > 0 {
+        return Err(crate::error::Error::Other(
+            "部分资产修复失败（已自动重试 3 次），可再次执行".into(),
+        ));
+    }
+    send_progress(&progress, download_progress("done", "", 1, 1, true, None)).await;
+    Ok(missing)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

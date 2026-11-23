@@ -62,12 +62,18 @@ const IRONIZED_ZINK_APK: &str =
     "https://github.com/GoyDevv/IronizedZink/releases/download/v1.1.0/Ironized-Zink-v1.1.0.apk";
 
 /// Zink pack 提取白名单（跳过插件 App 自身的支持库；libzink_dri 改名对齐 SONAME）。
+///
+/// 实机诊断（2026-11 v9）：pack 的 libcutils.so 是依赖 libc++_shared.so 的
+/// bionic shim（DT_NEEDED 实测确认）—— 白名单缺 libc++_shared.so 时
+/// dlopen(libcutils.so) 必败，连带 libEGL_mesa / libgallium_dri 全链失败，
+/// EGL 未初始化 → LWJGL 函数指针 NULL → pc=0 SIGSEGV。
 const ZINK_APK_LIBS: &[(&str, &str)] = &[
     ("libEGL_mesa.so", "libEGL_mesa.so"),
     ("libglapi.so", "libglapi.so"),
     ("libglxshim.so", "libglxshim.so"),
     ("libzink_dri.so", "libgallium_dri.so"),
     ("libcutils.so", "libcutils.so"),
+    ("libc++_shared.so", "libc++_shared.so"),
 ];
 
 const URL_GL4ES: &str = "https://raw.githubusercontent.com/PojavLauncherTeam/PojavLauncher/v3_openjdk/app_pojavlauncher/src/main/jniLibs/arm64-v8a/libgl4es_114.so";
@@ -128,8 +134,17 @@ pub fn catalog() -> &'static [RendererSpec] {
             gl_lib: "libglxshim.so",
             note: "GL4.6→Vulkan 桌面 GL（Mesa Zink+Kopper，Sodium/光影推荐档；需设备 Vulkan 1.1+）",
             source: Some(PackSource::ApkExtract(IRONIZED_ZINK_APK, ZINK_APK_LIBS)),
-            preload: &["libcutils.so", "libglapi.so", "libgallium_dri.so"],
-            size_hint: "约 13 MB",
+            // 预载顺序 = 依赖拓扑：libc++_shared（cutils 的 NEEDED）-> cutils ->
+            // glapi -> glxshim（桌面 GL 符号表）-> gallium(zink) DRI 驱动。
+            // 链路任一缺失都会让 libEGL_mesa dlopen 失败（v9 实机根因）。
+            preload: &[
+                "libc++_shared.so",
+                "libcutils.so",
+                "libglapi.so",
+                "libglxshim.so",
+                "libgallium_dri.so",
+            ],
+            size_hint: "约 14 MB",
         },
         RendererSpec {
             id: "nggl4es",
@@ -217,13 +232,16 @@ pub fn launch_env(id: &str) -> Vec<(String, String)> {
         ],
         "vgpu" => vec![("VGPU_NOERROR".into(), "1".into())],
         // Zink/Kopper（与 FCL/Zalith2 的注入配方一致）：
-        // - MESA_LOADER_DRIVER_OVERRIDE=zink 强制 gallium zink 驱动
+        // - GALLIUM_DRIVER + MESA_LOADER_DRIVER_OVERRIDE=zink 强制 gallium zink 驱动
         // - 版本覆盖：向 MC 呈现桌面 GL4.6/GLSL460（桥会走真桌面 GL 上下文）
-        // - LIBGL_ES=3 保持与上游插件一致（桥桌面分支不读它，亏位无害）
+        // - LIBGL_ES=3 作为桥 GLES 兑底的语义开关（桌面分支失败时使用）
+        // - 路径类变量（LIBGL_DRIVERS_PATH）由壳层注入（需渲染器目录）
         "zink" => vec![
+            ("GALLIUM_DRIVER".into(), "zink".into()),
             ("MESA_LOADER_DRIVER_OVERRIDE".into(), "zink".into()),
             ("MESA_GL_VERSION_OVERRIDE".into(), "4.6".into()),
             ("MESA_GLSL_VERSION_OVERRIDE".into(), "460".into()),
+            ("MESA_VK_IGNORE_CONFORMANCE_WARNING".into(), "1".into()),
             ("LIBGL_ES".into(), "3".into()),
         ],
         _ => vec![],
@@ -465,6 +483,7 @@ mod tests {
         assert!(zink
             .iter()
             .any(|(k, v)| k == "MESA_LOADER_DRIVER_OVERRIDE" && v == "zink"));
+        assert!(zink.iter().any(|(k, v)| k == "GALLIUM_DRIVER" && v == "zink"));
         assert!(zink
             .iter()
             .any(|(k, v)| k == "MESA_GL_VERSION_OVERRIDE" && v == "4.6"));
@@ -485,10 +504,28 @@ mod tests {
             }
             _ => panic!("zink 应使用 ApkExtract 白名单提取"),
         }
-        // 预载清单：cutils -> glapi -> gallium（链接器命名空间按名解析 NEEDED）
-        assert_eq!(spec.preload, ["libcutils.so", "libglapi.so", "libgallium_dri.so"]);
+        // 预载清单（v9 依赖拓扑）：libc++_shared -> cutils -> glapi ->
+        // glxshim -> gallium（链接器命名空间按名解析 NEEDED）
+        assert_eq!(
+            spec.preload,
+            [
+                "libc++_shared.so",
+                "libcutils.so",
+                "libglapi.so",
+                "libglxshim.so",
+                "libgallium_dri.so"
+            ]
+        );
+        // 白名单必须包含 libc++_shared.so —— pack 的 libcutils.so 依赖它
+        //（v9 实机根因：缺它则 libEGL_mesa 全链 dlopen 失败）
+        match &spec.source {
+            Some(PackSource::ApkExtract(_, whitelist)) => {
+                assert!(whitelist.iter().any(|(a, _)| *a == "libc++_shared.so"));
+            }
+            _ => unreachable!(),
+        }
         assert!(preload_libs("gl4es").is_empty());
-        assert_eq!(preload_libs("zink").len(), 3);
+        assert_eq!(preload_libs("zink").len(), 5);
     }
 
     #[test]

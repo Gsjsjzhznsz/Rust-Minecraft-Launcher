@@ -385,6 +385,7 @@ pub mod egl {
         extern "C" {
             fn dlopen(filename: *const c_char, flag: c_int) -> *mut c_void;
             fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+            fn dlerror() -> *const c_char;
         }
         const RTLD_LAZY: c_int = 1;
         const RTLD_LOCAL: c_int = 0;
@@ -394,7 +395,16 @@ pub mod egl {
         let cpath = CString::new(path.clone()).ok()?;
         let handle = unsafe { dlopen(cpath.as_ptr(), RTLD_LAZY | RTLD_LOCAL) };
         if handle.is_null() {
-            log(&format!("EGL 库加载失败：{path}"));
+            // v9：带 dlerror 详情（缺哪个 NEEDED 一眼可见，不再对着路径猜）
+            let detail = unsafe {
+                let p = dlerror();
+                if p.is_null() {
+                    "（无 dlerror 详情）".to_string()
+                } else {
+                    CStr::from_ptr(p).to_string_lossy().into_owned()
+                }
+            };
+            log(&format!("EGL 库加载失败：{path} —— {detail}"));
             return None;
         }
         let mut api = EglApi {
@@ -735,21 +745,61 @@ pub extern "C" fn pojav_create_context(share: *mut c_void) -> *mut c_void {
             ));
         }
         if config.is_null() {
-            // v0.1.9-c 兜底：全阶梯未命中时 eglGetConfigs 取第一个 config，
-            // RENDERABLE_TYPE 由 config 自身能力决定（不再按需求筛选）。
+            // v0.1.9-c 兜底：全阶梯未命中时 eglGetConfigs 取第一个 config。
+            // v9 增强：先扫描全部 config，选第一个「可渲染 ES2/ES3 且支持窗口
+            // 表面」的 —— 首个 config 常是 renderable=0 的无语义项
+            //（实机日志：MobileGlues 兜底拿到 renderable=0x0000，后续渲染
+            // 线程空指针 SIGSEGV），盲目取第一个就是踩雷。
             log("eglChooseConfig 全阶梯未命中，eglGetConfigs 兜底");
             let mut num_configs: i32 = 0;
-            if (api.get_configs.unwrap())(display, ptr::null_mut(), 0, &mut num_configs) == egl::EGL_TRUE
+            if (api.get_configs.unwrap())(display, ptr::null_mut(), 0, &mut num_configs)
+                == egl::EGL_TRUE
                 && num_configs > 0
             {
+                let n = num_configs.min(64) as usize;
+                let mut buf: Vec<egl::EGLConfig> = vec![ptr::null_mut(); n];
                 let mut got: i32 = 0;
-                (api.get_configs.unwrap())(display, &mut config, 1, &mut got);
+                (api.get_configs.unwrap())(display, buf.as_mut_ptr(), n as i32, &mut got);
+                let mut picked: Option<(egl::EGLConfig, i32)> = None;
+                let mut scanned: Vec<String> = Vec::new();
+                for cfg in buf.iter().take(got.max(0) as usize) {
+                    if cfg.is_null() {
+                        continue;
+                    }
+                    let mut renderable: i32 = 0;
+                    let mut surface_bits: i32 = 0;
+                    (api.get_config_attrib.unwrap())(display, *cfg, egl::EGL_RENDERABLE_TYPE, &mut renderable);
+                    (api.get_config_attrib.unwrap())(display, *cfg, egl::EGL_SURFACE_TYPE, &mut surface_bits);
+                    scanned.push(format!("{:#x}/{:#x}", renderable, surface_bits));
+                    if renderable & (egl::EGL_OPENGL_ES3_BIT | egl::EGL_OPENGL_ES2_BIT) != 0
+                        && surface_bits & egl::EGL_WINDOW_BIT != 0
+                        && picked.is_none()
+                    {
+                        picked = Some((*cfg, renderable));
+                    }
+                }
+                match picked {
+                    Some((cfg, renderable)) => {
+                        config = cfg;
+                        matched_es_bit = renderable;
+                        log(&format!(
+                            "eglGetConfigs 兜底选中可渲染 config（共 {} 个：{}）",
+                            scanned.len(),
+                            scanned.join(",")
+                        ));
+                    }
+                    None => {
+                        config = buf[0];
+                        (api.get_config_attrib.unwrap())(display, config, egl::EGL_RENDERABLE_TYPE, &mut matched_es_bit);
+                        log(&format!(
+                            "eglGetConfigs 兜底无可渲染 config，取第一个（共 {} 个：{}）",
+                            scanned.len(),
+                            scanned.join(",")
+                        ));
+                    }
+                }
                 (api.get_config_attrib.unwrap())(display, config, egl::EGL_NATIVE_VISUAL_ID, &mut format);
-                (api.get_config_attrib.unwrap())(display, config, egl::EGL_RENDERABLE_TYPE, &mut matched_es_bit);
                 matched_tier = -2;
-                log(&format!(
-                    "eglGetConfigs 兜底成功：configs={num_configs} renderable={matched_es_bit:#06x}"
-                ));
             }
         }
         if config.is_null() {
@@ -784,49 +834,56 @@ pub extern "C" fn pojav_create_context(share: *mut c_void) -> *mut c_void {
         // 等仅暴露 ES3 config 的渲染层由此自动落对，不再硬编码 renderer 名。
         // 桌面 GL（Zink/Kopper）：走 EGL_KHR_create_context 主/次版本阶梯，
         // MC 1.17+ 需要核心 3.2+，从 4.6 逐级降档尝试。
-        let (context, es_label): (egl::EGLContext, String) = if desktop_gl {
-            const PROFILES: [(i32, i32); 3] = [(4, 6), (3, 3), (3, 2)];
+        // v9 兜底：桌面 GL 全阶梯未命中时不再直接放弃（返回空句柄会让 LWJGL
+        // 拿 NULL 函数指针，Render thread pc=0 SIGSEGV）—— 回退 GLES 上下文
+        //（zink 也支持 ES3.1），至少拿到可渲染路径并留下完整日志。
+        let (context, es_label): (egl::EGLContext, String) = {
             let mut got = egl::EGL_NO_CONTEXT;
             let mut label = String::new();
-            for (major, minor) in PROFILES {
-                let attrs = [
-                    egl::EGL_CONTEXT_MAJOR_VERSION_KHR,
-                    major,
-                    egl::EGL_CONTEXT_MINOR_VERSION_KHR,
-                    minor,
-                    egl::EGL_CONTEXT_OPENGL_PROFILE_MASK_KHR,
-                    egl::EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT,
-                    egl::EGL_NONE,
-                    0,
-                ];
-                let ctx = (api.create_context.unwrap())(display, config, share_ctx, attrs.as_ptr());
-                if ctx != egl::EGL_NO_CONTEXT {
-                    got = ctx;
-                    label = format!("GL{major}.{minor} core");
-                    break;
+            if desktop_gl {
+                const PROFILES: [(i32, i32); 3] = [(4, 6), (3, 3), (3, 2)];
+                for (major, minor) in PROFILES {
+                    let attrs = [
+                        egl::EGL_CONTEXT_MAJOR_VERSION_KHR,
+                        major,
+                        egl::EGL_CONTEXT_MINOR_VERSION_KHR,
+                        minor,
+                        egl::EGL_CONTEXT_OPENGL_PROFILE_MASK_KHR,
+                        egl::EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT,
+                        egl::EGL_NONE,
+                        0,
+                    ];
+                    let ctx = (api.create_context.unwrap())(display, config, share_ctx, attrs.as_ptr());
+                    if ctx != egl::EGL_NO_CONTEXT {
+                        got = ctx;
+                        label = format!("GL{major}.{minor} core");
+                        break;
+                    }
+                    let err = (api.get_error.unwrap())();
+                    log(&format!("桌面 GL {major}.{minor} 上下文创建失败：{err:#06x}，降档重试"));
                 }
-                let err = (api.get_error.unwrap())();
-                log(&format!("桌面 GL {major}.{minor} 上下文创建失败：{err:#06x}，降档重试"));
             }
             if got == egl::EGL_NO_CONTEXT {
-                log("桌面 GL 全阶梯未命中（设备 Vulkan 驱动或 Mesa pack 异常）");
-                return;
+                if desktop_gl {
+                    log("桌面 GL 全阶梯未命中（设备 Vulkan 驱动或 Mesa pack 异常），回退 GLES 上下文");
+                }
+                let es = std::env::var("LIBGL_ES")
+                    .ok()
+                    .and_then(|v| v.trim().parse::<i32>().ok())
+                    .filter(|v| (1..=3).contains(v))
+                    .unwrap_or(if matched_es_bit & egl::EGL_OPENGL_ES3_BIT != 0 { 3 } else { 2 });
+                let ctx_attrs = [egl::EGL_CONTEXT_CLIENT_VERSION, es, egl::EGL_NONE];
+                let context =
+                    (api.create_context.unwrap())(display, config, share_ctx, ctx_attrs.as_ptr());
+                if context == egl::EGL_NO_CONTEXT {
+                    let err = (api.get_error.unwrap())();
+                    log(&format!("eglCreateContext 失败：{err:#06x}（client_version={es}）"));
+                    return;
+                }
+                (context, format!("GLES{es}"))
+            } else {
+                (got, label)
             }
-            (got, label)
-        } else {
-            let es = std::env::var("LIBGL_ES")
-                .ok()
-                .and_then(|v| v.trim().parse::<i32>().ok())
-                .filter(|v| (1..=3).contains(v))
-                .unwrap_or(if matched_es_bit & egl::EGL_OPENGL_ES3_BIT != 0 { 3 } else { 2 });
-            let ctx_attrs = [egl::EGL_CONTEXT_CLIENT_VERSION, es, egl::EGL_NONE];
-            let context = (api.create_context.unwrap())(display, config, share_ctx, ctx_attrs.as_ptr());
-            if context == egl::EGL_NO_CONTEXT {
-                let err = (api.get_error.unwrap())();
-                log(&format!("eglCreateContext 失败：{err:#06x}（client_version={es}）"));
-                return;
-            }
-            (context, format!("GLES{es}"))
         };
         let bundle = Arc::new(RenderWindow {
             state: std::cell::Cell::new(egl::STATE_ALIVE),

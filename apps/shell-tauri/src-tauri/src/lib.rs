@@ -758,6 +758,253 @@ fn reinit_storage(app: AppHandle, state: State<'_, AppState>) -> Result<serde_js
 }
 
 // ---------------------------------------------------------------------------
+// 启动器设置（内存分配等；game_root/quartz-settings.json）
+// ---------------------------------------------------------------------------
+
+/// 设置文件路径（游戏根目录，不与 .minecraft 冲突）。
+fn settings_file() -> PathBuf {
+    paths::game_root().join("quartz-settings.json")
+}
+
+/// 读取内存分配（默认 1024MB；越界值回退默认）。
+fn get_memory_mb_inner() -> u32 {
+    let Ok(text) = std::fs::read_to_string(settings_file()) else {
+        return 1024;
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return 1024;
+    };
+    let mb = v["memoryMb"].as_u64().unwrap_or(1024) as u32;
+    if (512..=8192).contains(&mb) {
+        mb
+    } else {
+        1024
+    }
+}
+
+/// 读取内存分配（UI 设置页）。
+#[tauri::command]
+fn get_memory_mb() -> u32 {
+    get_memory_mb_inner()
+}
+
+/// 保存内存分配（512–8192MB，256MB 步进由 UI 控制；越界拒绝）。
+#[tauri::command]
+fn set_memory_mb(mb: u32) -> Result<(), String> {
+    if !(512..=8192).contains(&mb) {
+        return Err("内存范围应为 512–8192 MB".into());
+    }
+    let path = settings_file();
+    let mut v = serde_json::from_str::<serde_json::Value>(
+        &std::fs::read_to_string(&path).unwrap_or_else(|_| "{}".into()),
+    )
+    .unwrap_or_else(|_| serde_json::json!({}));
+    v["memoryMb"] = serde_json::json!(mb);
+    std::fs::write(&path, serde_json::to_string_pretty(&v).map_err(|e| e.to_string())?)
+        .map_err(|e| e.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// 资产完整性（v9「资源自动化」）：状态查询 + 一键修复 + 启动前自动补全
+// ---------------------------------------------------------------------------
+
+/// 资产完整性状态（stat-only 秒级扫描；设置页展示）。
+#[tauri::command]
+fn assets_status(version_id: String) -> Result<serde_json::Value, String> {
+    match instance::count_missing_assets(&version_id) {
+        Ok(s) => Ok(json!({
+            "indexPresent": !s.index_id.is_empty(),
+            "indexId": s.index_id,
+            "total": s.total,
+            "missing": s.missing,
+            "missingBytes": s.missing_bytes,
+        })),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// 一键修复资产（只补缺失对象；进度走 download://progress 事件，与游戏下载同通道）。
+#[tauri::command]
+async fn repair_assets(
+    version_id: String,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<usize, String> {
+    {
+        let mut busy = state.downloading.lock().map_err(|_| "内部状态锁异常")?;
+        if *busy {
+            return Err("已有下载任务正在进行，请等待完成后再试".to_string());
+        }
+        *busy = true;
+    }
+    check_download_floor(&paths::game_root())?;
+    let busy = state.downloading.clone();
+    let app2 = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<instance::DownloadProgress>(128);
+        let forwarder_app = app2.clone();
+        let forwarder = tokio::spawn(async move {
+            while let Some(ev) = rx.recv().await {
+                let _ = forwarder_app.emit("download://progress", &ev);
+            }
+        });
+        let client = meta::http_client();
+        let result = instance::repair_assets(&client, &version_id, tx).await;
+        if let Err(e) = &result {
+            let _ = app2.emit(
+                "download://progress",
+                &instance::DownloadProgress {
+                    stage: "error".to_string(),
+                    current: 0,
+                    total: 0,
+                    percent: 0.0,
+                    file: String::new(),
+                    done: false,
+                    error: Some(e.to_string()),
+                },
+            );
+        }
+        drop(result);
+        if let Ok(mut busy) = busy.lock() {
+            *busy = false;
+        }
+        let _ = forwarder.await;
+    });
+    Ok(0)
+}
+
+/// 启动前自动补全缺失资产（阻塞，进度写启动控制台；缺失为 0 时瞬时返回）。
+fn ensure_assets_ready(version_id: &str, app: &AppHandle) -> Result<(), String> {
+    let status = instance::count_missing_assets(version_id).map_err(|e| e.to_string())?;
+    if status.index_id.is_empty() {
+        return Err(format!(
+            "版本 {version_id} 缺少资产索引（{version_id}.json 无 assetIndex 或索引文件未落盘），请重新下载该版本"
+        ));
+    }
+    if status.missing == 0 {
+        return Ok(());
+    }
+    app.emit(
+        "launch://log",
+        &LaunchLog {
+            source: "quartz".into(),
+            line: format!(
+                "[quartz] 检测到 {} 个缺失资产文件（约 {}），启动前自动补全…",
+                status.missing,
+                quartz_core::space::human_bytes(status.missing_bytes)
+            ),
+        },
+    )
+    .ok();
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<instance::DownloadProgress>(128);
+    let app2 = app.clone();
+    tauri::async_runtime::spawn(async move {
+        while let Some(ev) = rx.recv().await {
+            let line = if ev.stage == "error" {
+                format!("[quartz] 资产修复错误：{}", ev.error.unwrap_or_default())
+            } else if ev.stage == "done" {
+                "[quartz] 资产补全完成".to_string()
+            } else {
+                format!(
+                    "[quartz] 资产修复 {}%（{}/{}）",
+                    ev.percent as u32,
+                    quartz_core::space::human_bytes(ev.current),
+                    quartz_core::space::human_bytes(ev.total)
+                )
+            };
+            let _ = app2.emit("launch://log", &LaunchLog { source: "quartz".into(), line });
+        }
+    });
+    let client = meta::http_client();
+    let vid = version_id.to_string();
+    tauri::async_runtime::block_on(async move { instance::repair_assets(&client, &vid, tx).await })
+        .map(|n| {
+            let _ = n;
+        })
+        .map_err(|e| format!("资产自动补全失败（可在设置页手动重试）：{e}"))?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// 启动日志查看（设置页：最近日志列表 + 尾部读取）
+// ---------------------------------------------------------------------------
+
+/// 日志文件条目。
+#[derive(Serialize)]
+pub struct LogEntry {
+    pub name: String,
+    pub size: u64,
+    pub modified_ms: u64,
+}
+
+/// 列出启动日志（launch-*.log / game-*.log / quartz-crash.log，按修改时间倒序，最多 12 条）。
+#[tauri::command]
+fn list_logs() -> Vec<LogEntry> {
+    let mut out: Vec<LogEntry> = Vec::new();
+    let dirs = [paths::game_root().join("logs")];
+    for dir in dirs {
+        if let Ok(rd) = std::fs::read_dir(&dir) {
+            for e in rd.flatten() {
+                let name = e.file_name().to_string_lossy().into_owned();
+                if !(name.starts_with("launch-") && name.ends_with(".log"))
+                    && !(name.starts_with("game-") && name.ends_with(".log"))
+                    && name != "quartz-crash.log"
+                {
+                    continue;
+                }
+                let meta = e.metadata().ok();
+                let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+                let modified_ms = meta
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                out.push(LogEntry { name, size, modified_ms });
+            }
+        }
+    }
+    // 崩溃日志（内部目录）也纳入展示
+    if let Some(p) = CRASH_LOG.get() {
+        if let Ok(meta) = std::fs::metadata(p) {
+            out.push(LogEntry {
+                name: "quartz-crash.log".into(),
+                size: meta.len(),
+                modified_ms: meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0),
+            });
+        }
+    }
+    out.sort_by_key(|e| std::cmp::Reverse(e.modified_ms));
+    out.truncate(12);
+    out
+}
+
+/// 读取日志尾部（最多 300 行，单行截断 500 字符；读 quartz-crash.log 时取内部目录）。
+#[tauri::command]
+fn read_log_tail(name: String) -> Result<String, String> {
+    if name.contains("..") || name.contains('/') || name.contains('\\') {
+        return Err("非法日志名".into());
+    }
+    let path = if name == "quartz-crash.log" {
+        CRASH_LOG.get().cloned().ok_or("崩溃日志不可用")?
+    } else {
+        paths::game_root().join("logs").join(&name)
+    };
+    let text = std::fs::read_to_string(&path).map_err(|e| format!("读取失败：{e}"))?;
+    let lines: Vec<String> = text
+        .lines()
+        .rev()
+        .take(300)
+        .map(|l| clamp_chars(l, 500))
+        .collect();
+    Ok(lines.into_iter().rev().collect::<Vec<_>>().join("\n"))
+}
+
+// ---------------------------------------------------------------------------
 // 应用信息
 // ---------------------------------------------------------------------------
 
@@ -1327,7 +1574,7 @@ fn build_plan_for(version_id: &str) -> Result<(model::VersionJson, jvmops::Launc
         account: &auth::active_account()
             .map_err(|e| e.to_string())?
             .ok_or("尚未登录，请先在「账户」页添加账号")?,
-        memory_mb: 1024,
+        memory_mb: get_memory_mb_inner(),
         java_major: major,
         java_path: None,
         window: None,
@@ -2017,6 +2264,8 @@ fn launch_game(version_id: String, app: AppHandle, state: State<'_, AppState>) -
     if !runtime::is_installed(major) {
         return Err(format!("RUNTIME_MISSING:{major}"));
     }
+    // 资源自动化（v9）：启动前 stat 扫描资产完整性，缺失则阻塞补全（进度写启动控制台）。
+    ensure_assets_ready(&version_id, &app)?;
     #[cfg(target_os = "android")]
     {
         ensure_lwjgl_pack(&app)?;
@@ -2167,6 +2416,12 @@ pub fn run() {
             set_active_renderer,
             get_lwjgl_status,
             download_lwjgl,
+            get_memory_mb,
+            set_memory_mb,
+            assets_status,
+            repair_assets,
+            list_logs,
+            read_log_tail,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

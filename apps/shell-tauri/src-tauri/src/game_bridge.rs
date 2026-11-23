@@ -118,9 +118,19 @@ impl BridgeApi {
 unsafe extern "C" {
     fn dlopen(filename: *const c_char, flag: c_int) -> *mut c_void;
     fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+    fn dlerror() -> *const c_char;
 }
 const RTLD_NOW: c_int = 2;
 const RTLD_GLOBAL: c_int = 0x100;
+
+/// dlopen 失败时取 dlerror 文本（安全封装，空串兑底）。
+unsafe fn last_dlerror() -> String {
+    let p = dlerror();
+    if p.is_null() {
+        return "（无 dlerror 详情）".into();
+    }
+    CStr::from_ptr(p).to_string_lossy().into_owned()
+}
 
 /// 显示桥 .so 落位：runtime_dir()/libpojavexec.so + lwjgl3/natives/libpojavexec.so
 /// （后者是 OpenJDK System.loadLibrary("pojavexec") 的 java.library.path 首目录，
@@ -1120,26 +1130,77 @@ unsafe fn run_game_from_spec(
         "POJAVEXEC_EGL",
         crate::renderers::install_dir(&active_renderer).join(egl_lib),
     );
-    std::env::set_var("POJAV_RENDERER", format!("opengles_{active_renderer}"));
+    // Zink（Mesa GL4.6→Vulkan）走真桌面 GL 上下文（EGL_KHR_create_context）；
+    // 其余渲染层维持 GLES 语义。桥按 POJAV_RENDERER 是否含 "desktopgl" 分流。
+    if active_renderer == "zink" {
+        std::env::set_var("POJAV_RENDERER", format!("desktopgl_{active_renderer}"));
+        // Mesa DRI 驱动（libgallium_dri.so）搜索路径：Android 构建不从系统
+        // dri 目录找驱动，必须指向渲染层目录本身。
+        std::env::set_var(
+            "LIBGL_DRIVERS_PATH",
+            crate::renderers::install_dir(&active_renderer),
+        );
+    } else {
+        std::env::set_var("POJAV_RENDERER", format!("opengles_{active_renderer}"));
+    }
     for (k, v) in crate::renderers::launch_env(&active_renderer) {
         std::env::set_var(k, v);
     }
 
     // 1.5) 渲染层依赖预载（链接器命名空间按名解析 DT_NEEDED 时不搜索应用
-    //      数据目录：zink 的 libcutils/libglapi/libgallium_dri 必须由壳层按
-    //      绝对路径先行 dlopen，之后 Mesa EGL 内部的按名 dlopen 才能命中已载
-    //      soinfo —— 否则 libEGL_mesa.so 本体都装不起来）。
-    for lib in crate::renderers::preload_libs(&active_renderer) {
-        let p = crate::renderers::install_dir(&active_renderer).join(lib);
-        if !p.exists() {
-            eprintln!("[quartz] 渲染层预载文件缺失：{}", p.display());
-            continue;
+    //      数据目录：zink 的 libc++_shared/libcutils/libglapi/libglxshim/
+    //      libgallium_dri 必须由壳层按绝对路径先行 dlopen，之后 Mesa EGL
+    //      内部的按名 dlopen 才能命中已载 soinfo —— 否则 libEGL_mesa.so
+    //      本体都装不起来）。两遍执行：第一遍失败的多为依赖未就绪，第二遍
+    //      补刀；仍失败则记录 dlerror 详情（设备日志可直读根因）。
+    {
+        let rdir = crate::renderers::install_dir(&active_renderer);
+        let mut list: Vec<String> = crate::renderers::preload_libs(&active_renderer)
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        // 兑底：预载清单外，把目录里全部 .so 也扫一遍（pack 更新新增依赖时
+        // 不改代码也能命中；顺序无关——第二遍会补齐先后依赖）。
+        if let Ok(rd) = std::fs::read_dir(&rdir) {
+            for e in rd.flatten() {
+                let name = e.file_name().to_string_lossy().into_owned();
+                if name.ends_with(".so") && !list.contains(&name) {
+                    list.push(name);
+                }
+            }
         }
-        let c = CString::new(p.to_string_lossy().into_owned()).unwrap();
-        if dlopen(c.as_ptr(), RTLD_NOW | RTLD_GLOBAL).is_null() {
-            eprintln!("[quartz] 渲染层预载失败：{lib}（渲染层 EGL 可能初始化失败）");
-        } else {
-            eprintln!("[quartz] 渲染层预载完成：{lib}");
+        let mut failed: Vec<String> = Vec::new();
+        for pass in 1..=2 {
+            let try_list = if pass == 1 {
+                list.clone()
+            } else {
+                failed.clone()
+            };
+            failed.clear();
+            for lib in &try_list {
+                let p = rdir.join(lib);
+                if !p.exists() {
+                    eprintln!("[quartz] 渲染层预载文件缺失：{}（pass{pass}）", p.display());
+                    continue;
+                }
+                let c = CString::new(p.to_string_lossy().into_owned()).unwrap();
+                if dlopen(c.as_ptr(), RTLD_NOW | RTLD_GLOBAL).is_null() {
+                    let err = unsafe { last_dlerror() };
+                    eprintln!("[quartz] 渲染层预载失败：{lib}（pass{pass}）：{err}");
+                    failed.push(lib.clone());
+                } else {
+                    eprintln!("[quartz] 渲染层预载完成：{lib}（pass{pass}）");
+                }
+            }
+            if failed.is_empty() {
+                break;
+            }
+        }
+        if !failed.is_empty() {
+            eprintln!(
+                "[quartz] 渲染层预载最终未就绪：{}（渲染层 EGL 可能初始化失败）",
+                failed.join(", ")
+            );
         }
     }
     if active_renderer == "zink" {
@@ -1268,10 +1329,25 @@ unsafe fn run_game_from_spec(
     options.push(format!("-Dorg.lwjgl.opengl.libname={gl_lib}"));
     options.push(format!("-Djava.io.tmpdir={}", tmp_dir.display()));
     options.push(format!("-Djna.tmpdir={}", tmp_dir.display()));
+    // JNA 引导库修复（v9）：jna.jar 自带的 linux-aarch64 libjnidispatch 是
+    // glibc 构建，bionic 拒载 → com.sun.jna.Native 类初始化失败 →
+    // oshi/text2speech 全线 NoClassDefFoundError。jna.boot.library.path
+    // 优先级高于 jar 解包，指向 LWJGL natives 的 bionic 构建即命中。
+    options.push(format!(
+        "-Djna.boot.library.path={}",
+        crate::lwjgl::natives_dir().display()
+    ));
+    options.push("-Djna.nounpack=true".into());
     options.push(format!(
         "-Dorg.lwjgl.system.SharedLibraryExtractPath={}",
         tmp_dir.display()
     ));
+    // G1 调优（Pojav 系移动端默认配方）：降低长停顿，改善低端机体验。
+    options.push("-XX:+UseG1GC".into());
+    options.push("-XX:G1NewSizePercent=20".into());
+    options.push("-XX:G1ReservePercent=20".into());
+    options.push("-XX:MaxGCPauseMillis=50".into());
+    options.push("-XX:G1HeapRegionSize=16M".into());
     options.push("-XX:-UsePerfData".into());
     options.push(format!(
         "-XX:ErrorFile={}",
