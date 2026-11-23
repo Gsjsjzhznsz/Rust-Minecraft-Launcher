@@ -22,3 +22,5 @@ apps/shell-tauri/src-tauri/gen/android/buildSrc/build
 .qz-gradle-home/
 .qz-tmp/
 tool-results/
+.qz-gradle-build/
+tool-results/
