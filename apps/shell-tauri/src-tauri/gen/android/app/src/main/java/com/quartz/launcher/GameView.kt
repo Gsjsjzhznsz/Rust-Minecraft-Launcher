@@ -9,8 +9,9 @@ import android.view.SurfaceView
 import kotlin.math.abs
 
 /**
- * 游戏 Surface 视图（v0.1.5 游戏显示接入）：
- * - Surface 生命周期交接给 Rust 显示桥（ANativeWindow_fromSurface / release）；
+ * 游戏 Surface 视图（v0.1.5 游戏显示接入，v0.1.7 改走 :game 进程 IPC）：
+ * - Surface/尺寸事件经 GameIpc（Messenger）转发给 ：game 进程的 GameService，
+ *   由游戏进程内 QuartzBridge（ANativeWindow_fromSurface）接管；
  * - 触摸 -> 鼠标映射（与 Pojav 同语义）：
  *   · 未 grab（菜单/UI）：触摸即指针，按下=左键，抬起=左键释放；
  *   · grab（游戏内）：拖动=视角（LookDelta 经虚拟光标绝对位置上报），
@@ -19,8 +20,6 @@ import kotlin.math.abs
  */
 @SuppressLint("ViewConstructor")
 class GameView(context: Context) : SurfaceView(context, null, 0), SurfaceHolder.Callback {
-
-    private val bridge = QuartzBridge.instance
 
     // 虚拟光标（grab 模式下的绝对位置；游戏经光标回调取增量）
     private var virtualX = 0.0
@@ -45,15 +44,15 @@ class GameView(context: Context) : SurfaceView(context, null, 0), SurfaceHolder.
 
     override fun surfaceCreated(holder: SurfaceHolder) {
         val surface: Surface = holder.surface
-        bridge.setupSurface(surface)
+        GameIpc.sendSurface(surface)
     }
 
     override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
-        bridge.sendScreenSize(width, height)
+        GameIpc.size(width, height)
     }
 
     override fun surfaceDestroyed(holder: SurfaceHolder) {
-        bridge.releaseSurface()
+        GameIpc.releaseSurface()
     }
 
     /** 重置虚拟光标（窗口尺寸变化后由 Activity 调用）。 */
@@ -64,7 +63,7 @@ class GameView(context: Context) : SurfaceView(context, null, 0), SurfaceHolder.
 
     @SuppressLint("ClickableViewAccessibility")
     override fun onTouchEvent(event: MotionEvent): Boolean {
-        val grabbed = bridge.isGrabbed()
+        val grabbed = GameHost.grabbed
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
                 downX = event.x
@@ -76,10 +75,10 @@ class GameView(context: Context) : SurfaceView(context, null, 0), SurfaceHolder.
                     leftClickArmed = true
                     // 虚拟光标跨触摸持续累加（MC 取相邻回调增量作为视角旋转，
                     // 重置会引入跳变）
-                    bridge.sendCursorPos(virtualX.toFloat(), virtualY.toFloat())
+                    GameIpc.cursor(virtualX.toFloat(), virtualY.toFloat())
                 } else {
-                    bridge.sendCursorPos(event.x, event.y)
-                    bridge.sendMouseButton(0, 1, 0)
+                    GameIpc.cursor(event.x, event.y)
+                    GameIpc.mouse(0, 1, 0)
                 }
             }
             MotionEvent.ACTION_POINTER_DOWN -> {
@@ -88,7 +87,7 @@ class GameView(context: Context) : SurfaceView(context, null, 0), SurfaceHolder.
                     if (event.pointerCount >= 2 && !rightHeld) {
                         rightHeld = true
                         leftClickArmed = false
-                        bridge.sendMouseButton(1, 1, 0)
+                        GameIpc.mouse(1, 1, 0)
                     }
                 }
             }
@@ -100,35 +99,35 @@ class GameView(context: Context) : SurfaceView(context, null, 0), SurfaceHolder.
                     anchorY = event.y
                     virtualX += (dx * lookSensitivity).toDouble()
                     virtualY += (dy * lookSensitivity).toDouble()
-                    bridge.sendCursorPos(virtualX.toFloat(), virtualY.toFloat())
+                    GameIpc.cursor(virtualX.toFloat(), virtualY.toFloat())
                     if (abs(event.x - downX) > 24 || abs(event.y - downY) > 24) {
                         moved = true
                     }
                 } else {
-                    bridge.sendCursorPos(event.x, event.y)
+                    GameIpc.cursor(event.x, event.y)
                 }
             }
             MotionEvent.ACTION_POINTER_UP -> {
                 if (grabbed && rightHeld && event.pointerCount <= 2) {
                     rightHeld = false
-                    bridge.sendMouseButton(1, 0, 0)
+                    GameIpc.mouse(1, 0, 0)
                 }
             }
             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
                 if (grabbed) {
                     if (rightHeld) {
                         rightHeld = false
-                        bridge.sendMouseButton(1, 0, 0)
+                        GameIpc.mouse(1, 0, 0)
                     }
                     // 轻点 = 左键单击（攻击/交互）
                     if (leftClickArmed && !moved && event.actionMasked == MotionEvent.ACTION_UP) {
-                        bridge.sendMouseButton(0, 1, 0)
-                        bridge.sendMouseButton(0, 0, 0)
+                        GameIpc.mouse(0, 1, 0)
+                        GameIpc.mouse(0, 0, 0)
                     }
                     leftClickArmed = false
                 } else {
-                    bridge.sendCursorPos(event.x, event.y)
-                    bridge.sendMouseButton(0, 0, 0)
+                    GameIpc.cursor(event.x, event.y)
+                    GameIpc.mouse(0, 0, 0)
                 }
             }
         }

@@ -1,13 +1,19 @@
 package com.quartz.launcher
 
 import android.Manifest
+import android.content.ComponentName
+import android.content.Context
 import android.content.Intent
+import android.content.ServiceConnection
 import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
+import android.os.IBinder
+import android.os.Message
+import android.os.Messenger
 import android.provider.Settings
 import android.view.KeyEvent
 import android.view.View
@@ -99,6 +105,26 @@ class MainActivity : TauriActivity() {
         // 新任务已入栈，结束本进程（不经 crash 通道）
         android.os.Process.killProcess(android.os.Process.myPid())
       }
+    }
+
+    /**
+     * Rust 侧经 JNI 调用：启动 :game 游戏进程服务（传入启动规格路径）。
+     * 服务连接后由 GameIpc.connected 补发 MSG_INIT（规格 + 回信通道）。
+     */
+    @JvmStatic
+    fun startGameServiceStatic(specPath: String) {
+      val act = instance ?: return
+      act.runOnUiThread {
+        GameHost.pendingSpec = specPath
+        act.startGameService()
+      }
+    }
+
+    /** Rust 侧经 JNI 调用：停止游戏（向 :game 服务发 MSG_STOP，进程自杀）。 */
+    @JvmStatic
+    fun stopGameServiceStatic() {
+      val act = instance ?: return
+      act.runOnUiThread { act.stopGameService() }
     }
 
     /** QuartzBridge 回调入口（游戏鼠标 grab 状态变化）。 */
@@ -228,7 +254,6 @@ class MainActivity : TauriActivity() {
 
   override fun dispatchKeyEvent(event: KeyEvent): Boolean {
     if (gameView != null) {
-      val bridge = QuartzBridge.instance
       val glfw = GlfwKeys.toGlfwKey(event.keyCode)
       val action = when (event.action) {
         KeyEvent.ACTION_DOWN -> 1
@@ -239,19 +264,82 @@ class MainActivity : TauriActivity() {
         val mods = GlfwKeys.mods(event.metaState)
         val repeats = if (event.action == KeyEvent.ACTION_DOWN) event.repeatCount else 0
         if (action == 1 && repeats == 0) {
-          bridge.sendKey(glfw, 0, 1, mods)
+          GameIpc.key(glfw, 0, 1, mods)
           // 可打印字符同步发 char 事件（聊天输入）
           if (event.isPrintingKey) {
             val ch = event.unicodeChar
-            if (ch > 0) bridge.sendChar(ch, mods)
+            if (ch > 0) GameIpc.char(ch, mods)
           }
         } else if (action == 0) {
-          bridge.sendKey(glfw, 0, 0, mods)
+          GameIpc.key(glfw, 0, 0, mods)
         }
         return true
       }
     }
     return super.dispatchKeyEvent(event)
+  }
+
+  // ------------------------------------------------------------------
+  // :game 游戏进程服务（v0.1.7 崩溃隔离）
+  // ------------------------------------------------------------------
+
+  private val gameServiceConnection = object : ServiceConnection {
+    override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
+      if (binder != null) {
+        GameIpc.connected(Messenger(binder))
+      }
+    }
+
+    override fun onServiceDisconnected(name: ComponentName?) {
+      // :game 进程死亡（崩溃 / 自杀）：binder death 通知 -> Rust 恢复 UI
+      GameIpc.disconnected()
+      try {
+        GameHost.gameProcessGone()
+      } catch (_: Throwable) {
+      }
+    }
+
+    override fun onBindingDied(name: ComponentName?) {
+      GameIpc.disconnected()
+      try {
+        GameHost.gameProcessGone()
+      } catch (_: Throwable) {
+      }
+    }
+
+    override fun onNullBinding(name: ComponentName?) {
+      GameIpc.disconnected()
+    }
+  }
+
+  private fun startGameService() {
+    try {
+      val intent = Intent(this, GameService::class.java)
+      // startService：保证主进程临时 unbind 后 :game 不被销毁
+      startService(intent)
+      bindService(
+        intent,
+        gameServiceConnection,
+        Context.BIND_AUTO_CREATE or Context.BIND_IMPORTANT
+      )
+    } catch (_: Throwable) {
+    }
+  }
+
+  private fun stopGameService() {
+    try {
+      GameService.serviceMessenger?.send(Message.obtain(null, GameService.MSG_STOP))
+    } catch (_: Throwable) {
+    }
+    try {
+      unbindService(gameServiceConnection)
+    } catch (_: Throwable) {
+    }
+    try {
+      stopService(Intent(this, GameService::class.java))
+    } catch (_: Throwable) {
+    }
+    GameIpc.disconnected()
   }
 
   // ------------------------------------------------------------------

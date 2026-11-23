@@ -45,5 +45,14 @@ SDKM="$SDK/cmdline-tools/latest/bin/sdkmanager"
 yes | "$SDKM" --licenses >/dev/null 2>&1 || true
 "$SDKM" "platform-tools" "platforms;android-36" "build-tools;36.0.0" "ndk;27.0.12077973" >/tmp/sdk-install.log 2>&1
 
+echo "=== [4/4] 全量 JDK 21（gradle/javac 需要；JRE 不够） ==="
+if [ ! -x "$TC/jdk-21.0.13.1+2/bin/javac" ]; then
+  curl -sSf -o /tmp/jdk21.tar.gz "https://api.adoptium.net/v3/binary/latest/21/ga/linux/x64/jdk/hotspot/normal/eclipse?project=jdk"
+  mkdir -p "$TC/jdk-21.0.13.1+2"
+  tar xzf /tmp/jdk21.tar.gz -C "$TC/jdk-21.0.13.1+2" --strip-components=1
+  rm -f /tmp/jdk21.tar.gz
+fi
+"$TC/jdk-21.0.13.1+2/bin/javac" -version
+
 ls "$SDK/ndk" "$SDK/platforms" "$SDK/build-tools"
 echo "BOOTSTRAP_DONE"

@@ -1,7 +1,10 @@
 //! Quartz 游戏显示桥核心（Rust 重构 Pojav C 桥 libpojavexec.so）。
 //!
 //! 契约来源：gladiolus 官方 `lwjgl-glfw-classes.jar` 字节码（javap 反编译核对）。
-//! 所有 JNI 导出符号严格使用 `Java_<类路径>_<方法>` 命名（JVM 按名绑定）。
+//! 所有 JNI 导出符号严格使用 `Java_<类路径>_<方法>` 命名（JVM 按名绑定）；
+//! pojav* 函数表符号为 camelCase（Functions.<clinit> 逐名 dlsym），经
+//! `#[export_name]` 导出 —— snake_case 原名会导致 dlsym 落空、GLFW 类初始化
+//! 直接 ExceptionInInitializerError（v0.1.6 实机崩溃根因）。
 //!
 //! 与 Pojav C 版的关键差异（v0.1.5 修复 gladiolus 发布包 jar↔so 版本错位崩溃）：
 //! - 不做任何 RegisterNatives（旧 so 的 JNI_OnLoad 注册 jar 不存在的
@@ -505,12 +508,28 @@ fn update_window_size_call(window: usize) {
 // ---------------------------------------------------------------------------
 
 /// `int pojavInit(void)` —— glfwInit。
-#[no_mangle]
+/// 注意：jar 的 Functions 表经 dlsym 解析 camelCase 符号，必须用
+/// #[export_name] 导出（Rust 默认 #[no_mangle] 只保留 snake_case 原名，
+/// v0.1.6 修复「A required function is missing: pojavInit」崩溃根因）。
+#[export_name = "pojavInit"]
 pub extern "C" fn pojav_init() -> c_int {
     let mut ok = false;
     guard!({
         let s = state();
-        let window = s.window.load(Ordering::Acquire);
+        let mut window = s.window.load(Ordering::Acquire);
+        // v0.1.7 崩溃修复 ①：横屏旋转会先销毁再重建 Surface（surfaceDestroyed ->
+        // surfaceCreated），glfwInit 若恰好在窗口空档被调用，之前直接以 0x0 窗口
+        // 继续，后续 eglCreateWindowSurface 必败 —— 这里最多等 8s 再初始化。
+        if window.is_null() {
+            log("pojavInit：ANativeWindow 尚未就绪（等待壳层 Surface）");
+            for _ in 0..160 {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                window = s.window.load(Ordering::Acquire);
+                if !window.is_null() {
+                    break;
+                }
+            }
+        }
         let (mut w, mut h) = (0, 0);
         if !window.is_null() {
             ANativeWindow_acquire(window);
@@ -522,7 +541,7 @@ pub extern "C" fn pojav_init() -> c_int {
             s.upd_monitor.store(true, Ordering::Release);
             s.monitor_consumed.store(false, Ordering::Release);
         } else {
-            log("pojavInit：ANativeWindow 尚未就绪（等待壳层 Surface）");
+            log("pojavInit：等待 Surface 超时（8s），以无窗口模式继续");
         }
         let renderer_env = std::env::var("POJAV_RENDERER").unwrap_or_default();
         if renderer_env.starts_with("vulkan_zink") {
@@ -550,7 +569,7 @@ pub extern "C" fn pojav_init() -> c_int {
 }
 
 /// `void* pojavCreateContext(void* share)` —— nglfwCreateContext。
-#[no_mangle]
+#[export_name = "pojavCreateContext"]
 pub extern "C" fn pojav_create_context(share: *mut c_void) -> *mut c_void {
     let mut result: *mut c_void = ptr::null_mut();
     guard!({
@@ -561,30 +580,78 @@ pub extern "C" fn pojav_create_context(share: *mut c_void) -> *mut c_void {
             return;
         };
         let display = *display as egl::EGLDisplay;
-        let attributes: [i32; 15] = [
-            egl::EGL_BLUE_SIZE, 8,
-            egl::EGL_GREEN_SIZE, 8,
-            egl::EGL_RED_SIZE, 8,
-            egl::EGL_ALPHA_SIZE, 8,
-            egl::EGL_DEPTH_SIZE, 24,
-            egl::EGL_SURFACE_TYPE, egl::EGL_WINDOW_BIT | egl::EGL_PBUFFER_BIT,
-            egl::EGL_RENDERABLE_TYPE, egl::EGL_OPENGL_ES2_BIT,
-            egl::EGL_NONE,
+        // v0.1.7 崩溃修复 ②：部分渲染层 EGL（gl4es 等）不支持 WINDOW|PBUFFER
+        // 组合属性（eglChooseConfig 返回 EGL_FALSE/BAD_CONFIG，configs=0），
+        // 之前直接失败导致 MC 拿不到上下文退出 —— 改为逐级放宽的回退阶梯。
+        const A_ES2: i32 = egl::EGL_OPENGL_ES2_BIT;
+        let ladders: [[i32; 15]; 4] = [
+            // #0 完整需求：RGBA8888 + 深度 24 + WINDOW|PBUFFER + ES2
+            [
+                egl::EGL_BLUE_SIZE, 8,
+                egl::EGL_GREEN_SIZE, 8,
+                egl::EGL_RED_SIZE, 8,
+                egl::EGL_ALPHA_SIZE, 8,
+                egl::EGL_DEPTH_SIZE, 24,
+                egl::EGL_SURFACE_TYPE, egl::EGL_WINDOW_BIT | egl::EGL_PBUFFER_BIT,
+                egl::EGL_RENDERABLE_TYPE, A_ES2,
+                egl::EGL_NONE,
+            ],
+            // #1 去掉 PBUFFER 位（窗口渲染主路径）
+            [
+                egl::EGL_BLUE_SIZE, 8,
+                egl::EGL_GREEN_SIZE, 8,
+                egl::EGL_RED_SIZE, 8,
+                egl::EGL_ALPHA_SIZE, 8,
+                egl::EGL_DEPTH_SIZE, 24,
+                egl::EGL_SURFACE_TYPE, egl::EGL_WINDOW_BIT,
+                egl::EGL_RENDERABLE_TYPE, A_ES2,
+                egl::EGL_NONE,
+            ],
+            // #2 深度降为 16
+            [
+                egl::EGL_BLUE_SIZE, 8,
+                egl::EGL_GREEN_SIZE, 8,
+                egl::EGL_RED_SIZE, 8,
+                egl::EGL_ALPHA_SIZE, 8,
+                egl::EGL_DEPTH_SIZE, 16,
+                egl::EGL_SURFACE_TYPE, egl::EGL_WINDOW_BIT,
+                egl::EGL_RENDERABLE_TYPE, A_ES2,
+                egl::EGL_NONE,
+            ],
+            // #3 仅要求 ES2 可渲染（颜色/深度交给 EGL 默认值）
+            [
+                egl::EGL_RENDERABLE_TYPE, A_ES2,
+                egl::EGL_SURFACE_TYPE, egl::EGL_WINDOW_BIT,
+                egl::EGL_NONE, 0,
+                egl::EGL_NONE, 0,
+                egl::EGL_NONE, 0,
+                egl::EGL_NONE, 0,
+                egl::EGL_NONE, 0,
+                egl::EGL_NONE,
+            ],
         ];
-        let mut num_configs: i32 = 0;
-        if (api.choose_config.unwrap())(display, attributes.as_ptr(), ptr::null_mut(), 0, &mut num_configs)
-            != egl::EGL_TRUE
-            || num_configs == 0
-        {
+        let mut config: egl::EGLConfig = ptr::null_mut();
+        let mut format: i32 = 0;
+        let mut matched = false;
+        for (tier, attrs) in ladders.iter().enumerate() {
+            let mut num_configs: i32 = 0;
+            let rc = (api.choose_config.unwrap())(display, attrs.as_ptr(), ptr::null_mut(), 0, &mut num_configs);
+            if rc == egl::EGL_TRUE && num_configs > 0 {
+                let mut got: i32 = 0;
+                (api.choose_config.unwrap())(display, attrs.as_ptr(), &mut config, 1, &mut got);
+                (api.get_config_attrib.unwrap())(display, config, egl::EGL_NATIVE_VISUAL_ID, &mut format);
+                matched = true;
+                if tier > 0 {
+                    log(&format!("eglChooseConfig：使用回退阶梯 #{tier}（configs={num_configs}）"));
+                }
+                break;
+            }
+        }
+        if !matched {
             let err = (api.get_error.unwrap())();
-            log(&format!("eglChooseConfig 失败：{err:#06x}（configs={num_configs}）"));
+            log(&format!("eglChooseConfig 失败：{err:#06x}（全阶梯 configs=0）"));
             return;
         }
-        let mut config: egl::EGLConfig = ptr::null_mut();
-        let mut got: i32 = 0;
-        (api.choose_config.unwrap())(display, attributes.as_ptr(), &mut config, 1, &mut got);
-        let mut format: i32 = 0;
-        (api.get_config_attrib.unwrap())(display, config, egl::EGL_NATIVE_VISUAL_ID, &mut format);
 
         let renderer_env = std::env::var("POJAV_RENDERER").unwrap_or_default();
         let bind = if renderer_env.contains("desktopgl") {
@@ -640,7 +707,7 @@ thread_local! {
 }
 
 /// `void* pojavGetCurrentContext(void)`。
-#[no_mangle]
+#[export_name = "pojavGetCurrentContext"]
 pub extern "C" fn pojav_get_current_context() -> *mut c_void {
     let cur = CURRENT_WINDOW.with(|c| c.get());
     if cur == 0 { ptr::null_mut() } else { cur as *mut c_void }
@@ -680,7 +747,7 @@ unsafe fn gl_swap_surface(bundle: &Arc<RenderWindow>, display: egl::EGLDisplay, 
 }
 
 /// `void pojavMakeCurrent(void* window)`。
-#[no_mangle]
+#[export_name = "pojavMakeCurrent"]
 pub extern "C" fn pojav_make_current(window: *mut c_void) {
     guard!({
         let s = state();
@@ -728,7 +795,7 @@ pub extern "C" fn pojav_make_current(window: *mut c_void) {
 }
 
 /// `void pojavSwapBuffers(void* window)`。
-#[no_mangle]
+#[export_name = "pojavSwapBuffers"]
 pub extern "C" fn pojav_swap_buffers(_window: *mut c_void) {
     guard!({
         let guard = EGL_STATE.lock().unwrap();
@@ -759,7 +826,7 @@ pub extern "C" fn pojav_swap_buffers(_window: *mut c_void) {
 }
 
 /// `void pojavSwapInterval(int)`。
-#[no_mangle]
+#[export_name = "pojavSwapInterval"]
 pub extern "C" fn pojav_swap_interval(interval: c_int) {
     guard!({
         let mut interval = interval;
@@ -775,11 +842,11 @@ pub extern "C" fn pojav_swap_interval(interval: c_int) {
 }
 
 /// `void pojavSetWindowHint(int, int)` —— hint 全部 Java 侧消化，无需动作。
-#[no_mangle]
+#[export_name = "pojavSetWindowHint"]
 pub extern "C" fn pojav_set_window_hint(_hint: c_int, _value: c_int) {}
 
 /// `void pojavTerminate(void)`。
-#[no_mangle]
+#[export_name = "pojavTerminate"]
 pub extern "C" fn pojav_terminate() {
     guard!({
         let s = state();
@@ -810,7 +877,7 @@ pub extern "C" fn pojav_terminate() {
 }
 
 /// `void pojavStartPumping(void)`。
-#[no_mangle]
+#[export_name = "pojavStartPumping"]
 pub extern "C" fn pojav_start_pumping() {
     let s = state();
     {
@@ -832,7 +899,7 @@ pub extern "C" fn pojav_start_pumping() {
 }
 
 /// `void pojavPumpEvents(void* window)` —— 对每个窗口派发本帧事件。
-#[no_mangle]
+#[export_name = "pojavPumpEvents"]
 pub extern "C" fn pojav_pump_events(window: *mut c_void) {
     guard!({
         let s = state();
@@ -902,7 +969,7 @@ pub extern "C" fn pojav_pump_events(window: *mut c_void) {
 }
 
 /// `void pojavStopPumping(void)`。
-#[no_mangle]
+#[export_name = "pojavStopPumping"]
 pub extern "C" fn pojav_stop_pumping() {
     let s = state();
     s.pump_buf.lock().unwrap().clear();

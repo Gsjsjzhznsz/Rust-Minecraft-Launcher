@@ -16,3 +16,9 @@ apps/shell-tauri/src-tauri/gen/android/app/build
 apps/shell-tauri/src-tauri/gen/android/local.properties
 apps/shell-tauri/src-tauri/gen/android/.cxx
 apps/shell-tauri/src-tauri/gen/android/buildSrc/build
+# v0.1.7 补充：沙箱构建产物与临时工具输出（不入库）
+.qz-cargo-target/
+.qz-gradle-build/
+.qz-gradle-home/
+.qz-tmp/
+tool-results/

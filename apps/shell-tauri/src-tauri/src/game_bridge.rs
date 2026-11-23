@@ -1,19 +1,25 @@
-//! Android 进程内游戏启动 + 显示桥接线（v0.1.5「游戏显示接入」主战场）。
+//! Android 游戏启动 + 显示桥接线（v0.1.7「崩溃隔离」重构：游戏 JVM 进程化）。
 //!
-//! 架构（对标 PojavLauncher 的进程内 JVM 方案，但全部用 Rust 实现）：
-//! 1. 壳层把 SurfaceView 的 Surface 交给 quartz-bridge（ANativeWindow_fromSurface）；
-//! 2. 壳层 dlopen JVM pack 的 libjvm.so -> JNI_CreateJavaVM（同进程，与 ART 并存）；
+//! 架构（对标 PojavLauncher 的进程内 JVM 方案，但全部用 Rust 实现，且游戏
+//! 运行在独立 ：game 进程中）：
+//! 1. 主进程（WebView 启动器 UI）把 SurfaceView 的 Surface 经 Binder 传给
+//!    :game 进程的 GameService（Surface 是 Parcelable，跨进程共享同一
+//!    BufferQueue，ANativeWindow_fromSurface 在 :game 侧照常工作）；
+//! 2. :game 进程 dlopen JVM pack 的 libjvm.so -> JNI_CreateJavaVM（与 ART
+//!    并存），跑 net.minecraft.client.main.Main；
 //! 3. 游戏 LWJGL 类（gladiolus 官方 jar）System.loadLibrary("pojavexec") 时
-//!    加载的是我们 Rust 重构的桥（crates/quartz-bridge，以 libpojavexec.so 落位）；
-//! 4. 输入：Kotlin SurfaceView/虚拟按键 -> QuartzBridge(ART native) -> 桥 C ABI
-//!    -> 事件队列 -> 渲染线程 PumpEvents -> LWJGL 回调 -> Minecraft；
-//! 5. 渲染：pojavCreateContext 经渲染层自带 EGL（MobileGlues）在 ANativeWindow
-//!    上建 GLES3 上下文，MobileGlues 桌面 GL 语义由 LWJGL 函数指针绑定。
+//!    加载的是我们 Rust 重构的桥（crates/quartz-bridge，以 libpojavexec.so
+//!    落位）；
+//! 4. 输入：主进程 SurfaceView/虚拟按键 -> Messenger IPC -> GameService ->
+//!    QuartzBridge(ART native) -> 桥 C ABI -> 事件队列 -> LWJGL 回调；
+//! 5. 渲染：pojavCreateContext 经渲染层自带 EGL 在 ANativeWindow 上建 GLES
+//!    上下文，桌面 GL 语义由渲染层转译。
 //!
-//! 退出语义：Main.main 正常返回 -> 恢复竖屏/UI、上报退出码 0；MC 崩溃路径
-//! System.exit -> OpenJDK os::exit 直接终止进程（本 JRE 无 exit 补丁），
-//! 启动日志已实时落盘，崩溃后重启应用即可取证；再次启动时检测 JVM 已消费，
-//! 自动重启应用进程以重置 JVM（同进程内 JVM 无法二次创建）。
+//! 崩溃语义（v0.1.7 核心）：游戏 JVM 运行在独立进程，SIGSEGV/SIGABRT/
+//! System.exit 只终止 :game 进程；主进程经 ServiceConnection binder death
+//! 回调感知，恢复竖屏启动器 UI 并上报退出码（finish_game_exit）——崩溃
+//! 不再陪葬整个 app。退出码走 MSG_EXIT（干净退出）或 binder death（崩溃）。
+//! 退出捕获 SecurityManager（quartz-game-hook.jar）保留：拿到 MC 崩溃码。
 
 #![cfg(target_os = "android")]
 
@@ -21,11 +27,11 @@ use crate::LaunchExit;
 use crate::LaunchLog;
 use tauri::Emitter;
 use jni_sys::{jboolean, jint, JNI_OK, JNI_VERSION_1_8};
-use std::ffi::{c_char, c_int, c_void, CString};
+use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::path::Path;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 type EnvPtr = *mut jni_sys::JNIEnv;
 type VmPtr = *mut jni_sys::JavaVM;
@@ -117,6 +123,21 @@ pub fn ensure_bridge_lib() -> Result<(), String> {
     Ok(())
 }
 
+/// 游戏退出捕获 hook jar 落位（自研 SecurityManager：checkExit 否决
+/// System.exit/halt 并抛 ExitSignal，让崩溃/退出回到启动器而非杀死进程）。
+/// jar 由 scripts/build-android.sh 在构建期用 javac --release 17 编译。
+pub fn ensure_hook_jar() -> Result<(), String> {
+    const HOOK_JAR: &[u8] = include_bytes!("../bridge/quartz-game-hook.jar");
+    let dst = super::paths::runtime_dir().join("quartz-game-hook.jar");
+    let stale = std::fs::metadata(&dst)
+        .map(|m| m.len() != HOOK_JAR.len() as u64)
+        .unwrap_or(true);
+    if stale {
+        std::fs::write(&dst, HOOK_JAR).map_err(|e| format!("写入退出捕获 hook 失败：{e}"))?;
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // ART 侧桥接初始化（QuartzBridge 类注入）
 // ---------------------------------------------------------------------------
@@ -186,7 +207,7 @@ pub fn ensure_bridge_loaded() -> Result<(), String> {
 }
 
 // ---------------------------------------------------------------------------
-// Kotlin 壳层静态方法（Surface 视图显隐 / 方向 / 应用重启）
+// Kotlin 壳层静态方法（Surface 视图显隐 / 方向 / 服务绑定）
 // ---------------------------------------------------------------------------
 
 fn call_activity_static(method: &str, sig: &str, args: &[JValueOwned]) -> bool {
@@ -248,9 +269,34 @@ pub fn hide_game_surface() {
     }
 }
 
-/// 重启应用进程（JVM 无法在进程内二次创建时的重置手段）。
-pub fn restart_app() {
-    let _ = call_activity_static("restartAppStatic", "()V", &[]);
+/// 带一个 String 参数的 MainActivity 静态方法调用（startGameServiceStatic）。
+fn call_activity_string(method: &str, sig: &str, arg: &str) -> bool {
+    use jni::objects::{JClass, JValue};
+    crate::with_jni(|env, ctx| {
+        unsafe {
+            let loader = env
+                .call_method(ctx, "getClassLoader", "()Ljava/lang/ClassLoader;", &[])
+                .ok()?
+                .l()
+                .ok()?;
+            let name = env.new_string("com.quartz.launcher.MainActivity").ok()?;
+            let cls_obj = env
+                .call_method(
+                    &loader,
+                    "loadClass",
+                    "(Ljava/lang/String;)Ljava/lang/Class;",
+                    &[JValue::Object(&name.into())],
+                )
+                .ok()?
+                .l()
+                .ok()?;
+            let cls = JClass::from(cls_obj);
+            let jarg = env.new_string(arg).ok()?;
+            env.call_static_method(&cls, method, sig, &[JValue::Object(&jarg)]).ok()?;
+            Some(())
+        }
+    })
+    .is_some()
 }
 
 // ---------------------------------------------------------------------------
@@ -366,76 +412,105 @@ pub unsafe extern "C" fn Java_com_quartz_launcher_QuartzBridge_isGrabbed(
 }
 
 // ---------------------------------------------------------------------------
-// 进程内 JVM 启动
+// :game 独立进程启动（v0.1.7 崩溃隔离）
 // ---------------------------------------------------------------------------
 
-/// JVM 已消费标记：OpenJDK 在一个进程内只能 JNI_CreateJavaVM 一次。
-static JVM_SPENT: AtomicBool = AtomicBool::new(false);
-/// 游戏运行中标记（含 pid 占位语义；进程内模式 pid = 本进程）。
+/// 游戏运行中标记（launch 发起 -> 退出回调确认）。
 static GAME_RUNNING: AtomicBool = AtomicBool::new(false);
+/// 本次启动是否已上报退出（MSG_EXIT 与 binder death 双路径幂等）。
+static EXIT_EMITTED: AtomicBool = AtomicBool::new(false);
+/// 用户主动停止标记（区分崩溃 134 与停止 137）。
+static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
+/// 日志 tail 线程活跃标记。
+static TAIL_ACTIVE: AtomicBool = AtomicBool::new(false);
+/// 主进程 AppHandle（GameHost 回调 emit 事件用；launch 时注入）。
+static APP_HANDLE: OnceLock<tauri::AppHandle> = OnceLock::new();
+/// 当前启动版本号（退出事件负载）。
+static STATE_VERSION: Mutex<String> = Mutex::new(String::new());
+/// 当前启动日志文件句柄（qlog_emit 写入目标）。
+static STATE_LOG_FILE: Mutex<Option<Arc<Mutex<Option<std::fs::File>>>>> = Mutex::new(None);
 
 pub fn game_running() -> bool {
     GAME_RUNNING.load(Ordering::SeqCst)
 }
 
-pub fn jvm_spent() -> bool {
-    JVM_SPENT.load(Ordering::SeqCst)
+/// 统一退出上报：隐藏游戏层 + 恢复竖屏 + emit launch://exit。幂等。
+/// 调用方：GameHost.gameExited（:game 正常结束）/ gameProcessGone（崩溃/停止）。
+pub fn finish_game_exit(code: i32) {
+    if EXIT_EMITTED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    GAME_RUNNING.store(false, Ordering::SeqCst);
+    TAIL_ACTIVE.store(false, Ordering::SeqCst);
+    hide_game_surface();
+    if let Some(app) = APP_HANDLE.get() {
+        let version = STATE_VERSION.lock().ok().map(|g| g.clone()).unwrap_or_default();
+        let _ = app.emit(
+            "launch://exit",
+            &LaunchExit {
+                code,
+                version,
+                log_file: None,
+            },
+        );
+    }
 }
 
-/// 进程内停止：MC 无干净终止通道，System.exit 将结束应用进程（日志已落盘）。
-pub fn stop_in_process(app: &tauri::AppHandle) {
-    let _ = app.emit(
-        "launch://log",
-        &LaunchLog {
-            source: "quartz".into(),
-            line: "[quartz] 停止游戏：进程内 JVM 将强制结束（应用自动重启，启动日志已保存）".into(),
-        },
-    );
-    let _ = app.emit("launch://exit", &LaunchExit {
-        code: 137,
-        version: String::new(),
-        log_file: None,
-    });
-    if let Some(vm) = JVM.vm() {
-        unsafe {
-            let iface = &**vm;
-            let mut env: EnvPtr = ptr::null_mut();
-            if (iface.GetEnv.unwrap())(vm, &mut env as *mut EnvPtr as *mut *mut c_void, JNI_VERSION_1_8) == JNI_OK
-                && !env.is_null()
-            {
-                let tbl = &**env;
-                let sys = (tbl.FindClass.unwrap())(env, c"java/lang/System".as_ptr());
-                if !sys.is_null() {
-                    let exit_mid = (tbl.GetStaticMethodID.unwrap())(
-                        env,
-                        sys,
-                        c"exit".as_ptr(),
-                        c"(I)V".as_ptr(),
-                    );
-                    if !exit_mid.is_null() {
-                        let arg = jni_sys::jvalue { i: 0 };
-                        (tbl.CallStaticVoidMethodA.unwrap())(env, sys, exit_mid, &arg);
-                    }
-                }
-                if (tbl.ExceptionCheck.unwrap())(env) != 0 {
-                    (tbl.ExceptionClear.unwrap())(env);
-                }
+fn append_state_log(line: &str) {
+    if let Some(app) = APP_HANDLE.get() {
+        if let Ok(g) = STATE_LOG_FILE.lock() {
+            if let Some(lf) = g.as_ref() {
+                qlog_emit(app, lf, "quartz", line);
             }
         }
     }
-    // JVM 不可用时兜底：直接结束本进程
-    std::process::exit(0);
 }
 
-/// JVM 句柄缓存（CreateVM 成功后存入；stop 用）。
-/// raw 指针存 usize（raw 指针非 Send，无法进 static Mutex）。
-struct JvmSlot(Mutex<Option<usize>>);
-static JVM: JvmSlot = JvmSlot(Mutex::new(None));
+/// 停止游戏：向 :game 进程服务发 MSG_STOP（服务自杀进程），
+/// UI 恢复由 binder death 回调（gameProcessGone）完成。
+pub fn stop_game_process() {
+    STOP_REQUESTED.store(true, Ordering::SeqCst);
+    let _ = call_activity_static("stopGameServiceStatic", "()V", &[]);
+}
 
-impl JvmSlot {
-    fn vm(&self) -> Option<VmPtr> {
-        self.0.lock().ok().and_then(|g| g.map(|p| p as VmPtr))
+/// 主进程回调：:game 进程正常结束（GameService 发 MSG_EXIT 后自杀）。
+#[no_mangle]
+pub unsafe extern "C" fn Java_com_quartz_launcher_GameHost_gameExited(
+    _env: *mut jni_sys::JNIEnv,
+    _obj: jni_sys::jobject,
+    code: jint,
+) {
+    append_state_log(&format!("[quartz] 游戏进程退出，代码 {code}"));
+    finish_game_exit(code as i32);
+}
+
+/// 主进程回调：:game 进程死亡（binder death：原生崩溃 / killProcess）。
+#[no_mangle]
+pub unsafe extern "C" fn Java_com_quartz_launcher_GameHost_gameProcessGone(
+    _env: *mut jni_sys::JNIEnv,
+    _obj: jni_sys::jobject,
+) {
+    let stopped = STOP_REQUESTED.load(Ordering::SeqCst);
+    if !EXIT_EMITTED.load(Ordering::SeqCst) {
+        append_state_log(if stopped {
+            "[quartz] 游戏进程已停止"
+        } else {
+            "[quartz] 游戏进程异常终止（原生崩溃），已自动恢复启动器界面"
+        });
     }
+    finish_game_exit(if stopped { 137 } else { 134 });
+}
+
+/// 主进程回调：:game 进程上报鼠标 grab 状态（GameService 转发桥回调）。
+#[no_mangle]
+pub unsafe extern "C" fn Java_com_quartz_launcher_GameHost_grabChanged(
+    _env: *mut jni_sys::JNIEnv,
+    _obj: jni_sys::jobject,
+    grabbed: jboolean,
+) {
+    // grab 状态的 UI 反馈由 Kotlin 侧 GameHost Handler 直接处理，
+    // 这里仅留 JNI 挂点（未来 Rust 侧需要感知时使用）。
+    let _ = grabbed;
 }
 
 fn qlog_emit(app: &tauri::AppHandle, log_file: &Arc<Mutex<Option<std::fs::File>>>, source: &str, line: &str) {
@@ -449,45 +524,327 @@ fn qlog_emit(app: &tauri::AppHandle, log_file: &Arc<Mutex<Option<std::fs::File>>
     }
 }
 
-/// 进程内启动主流程。前置：JVM pack / LWJGL pack / 渲染层 / 显示桥文件均已就位。
-pub fn launch_in_process(
+/// 启动规格（主进程装配 -> spec 文件 -> :game 进程读取执行）。
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct GameSpec {
+    pub version_id: String,
+    pub main_class: String,
+    pub workdir: String,
+    pub jre_home: String,
+    /// 原始 JVM 参数（-cp 对；tmp/library.path 相关项在 :game 侧重新注入）
+    pub jvm_args: Vec<String>,
+    pub game_args: Vec<String>,
+    /// Mojang 版本 natives 目录（含在 java.library.path 尾部）
+    pub natives_dir: String,
+    pub log_path: String,
+}
+
+/// :game 独立进程启动主流程（v0.1.7 崩溃隔离重构）。
+/// 主进程侧只做：装配 spec -> 落盘 -> 显示游戏视图 -> 绑定 :game 服务；
+/// JVM 的创建与运行全部在 :game 进程（GameService.nativeRunGame）。
+/// 前置：JVM pack / LWJGL pack / 渲染层 / 显示桥文件均已就位。
+pub fn launch_via_game_process(
     version_id: String,
     plan: crate::jvmops::LaunchPlan,
     major: u32,
     app: tauri::AppHandle,
     log_file: Arc<Mutex<Option<std::fs::File>>>,
+    log_path: &Path,
 ) -> Result<(), String> {
-    use std::io::BufRead;
+    let _ = APP_HANDLE.set(app.clone());
+    EXIT_EMITTED.store(false, Ordering::SeqCst);
+    STOP_REQUESTED.store(false, Ordering::SeqCst);
+    TAIL_ACTIVE.store(true, Ordering::SeqCst);
+    GAME_RUNNING.store(true, Ordering::SeqCst);
+    if let Ok(mut g) = STATE_VERSION.lock() {
+        *g = version_id.clone();
+    }
+    if let Ok(mut g) = STATE_LOG_FILE.lock() {
+        *g = Some(log_file.clone());
+    }
 
-    let qlog: Arc<dyn Fn(&str, &str) + Send + Sync> = {
-        let app = app.clone();
-        let log_file = log_file.clone();
-        Arc::new(move |source: &str, line: &str| {
-            qlog_emit(&app, &log_file, source, line);
-        })
+    let jre_home = crate::runtime::install_dir(major);
+    let spec = GameSpec {
+        version_id: version_id.clone(),
+        main_class: plan.main_class.clone(),
+        workdir: plan.working_dir.to_string_lossy().into_owned(),
+        jre_home: jre_home.to_string_lossy().into_owned(),
+        jvm_args: plan.jvm_args.clone(),
+        game_args: plan.game_args.clone(),
+        natives_dir: plan.natives_dir.to_string_lossy().into_owned(),
+        log_path: log_path.to_string_lossy().into_owned(),
     };
 
-    // ---- JVM 参数装配（CreateVM options；-cp 对转 -Djava.class.path）----
+    // spec 落盘（内部目录，:game 进程同 uid 可读）
+    let spec_path = crate::paths::runtime_dir().join("game-spec.json");
+    let json = serde_json::to_string(&spec).map_err(|e| format!("spec 序列化失败：{e}"))?;
+    std::fs::write(&spec_path, json).map_err(|e| format!("spec 写入失败：{e}"))?;
+
+    qlog_emit(
+        &app,
+        &log_file,
+        "quartz",
+        "[quartz] 启动模式：:game 独立进程 JVM + Rust 显示桥（崩溃不影响启动器 UI）",
+    );
+
+    // 显示游戏视图（横屏 SurfaceView）+ 绑定 :game 服务
+    show_game_surface();
+    let ok = call_activity_string(
+        "startGameServiceStatic",
+        "(Ljava/lang/String;)V",
+        &spec_path.to_string_lossy(),
+    );
+    if !ok {
+        TAIL_ACTIVE.store(false, Ordering::SeqCst);
+        GAME_RUNNING.store(false, Ordering::SeqCst);
+        hide_game_surface();
+        return Err("绑定 :game 游戏进程服务失败".into());
+    }
+
+    // tail 线程：:game 进程把 stdout/stderr 直写日志文件，主进程跟踪新行
+    // -> launch://log（WebView 实时控制台）。退出回调会把 TAIL_ACTIVE 置否。
+    let tail_app = app.clone();
+    let tail_lf = log_file.clone();
+    let tail_path = log_path.to_path_buf();
+    std::thread::spawn(move || {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut pos: u64 = std::fs::metadata(&tail_path).map(|m| m.len()).unwrap_or(0);
+        // 上限 40 分钟（游戏长跑时 tail 静默停止，日志文件仍在实时落盘）
+        for _ in 0..(40 * 60 * 4) {
+            if !TAIL_ACTIVE.load(Ordering::SeqCst) {
+                break;
+            }
+            if let Ok(meta) = std::fs::metadata(&tail_path) {
+                if meta.len() > pos {
+                    if let Ok(mut f) = std::fs::File::open(&tail_path) {
+                        let _ = f.seek(SeekFrom::Start(pos));
+                        let mut buf = Vec::new();
+                        if f.read_to_end(&mut buf).is_ok() {
+                            pos += buf.len() as u64;
+                            let text = String::from_utf8_lossy(&buf);
+                            for line in text.lines() {
+                                if line.trim().is_empty() {
+                                    continue;
+                                }
+                                qlog_emit(&tail_app, &tail_lf, "stdout", line);
+                            }
+                        }
+                    }
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+    });
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// :game 进程执行体（GameService.nativeRunGame）
+// ---------------------------------------------------------------------------
+
+/// 显示桥注入（:game 进程版）：以给定 env/ctx（GameService 实例）注册
+/// grab/剪贴板回调。与 ensure_bridge_loaded 逻辑一致，但不依赖 ndk-context
+///（:game 进程没有 Tauri 胶水，ndk_context 为空）。
+unsafe fn bridge_init_with(env: EnvPtr, ctx: jni_sys::jobject) -> Result<(), String> {
+    let api = BridgeApi::load().ok_or("显示桥装载失败")?;
+    static INITED: AtomicBool = AtomicBool::new(false);
+    if INITED.swap(true, Ordering::SeqCst) {
+        return Ok(());
+    }
+    let tbl = &**env;
+    // 防御：清上游遗留挂起异常（同 with_jni 教训）
+    if (tbl.ExceptionCheck.unwrap())(env) != 0 {
+        (tbl.ExceptionClear.unwrap())(env);
+    }
+    // ctx.getClassLoader()
+    let ctx_cls = (tbl.GetObjectClass.unwrap())(env, ctx);
+    let get_loader_mid = (tbl.GetMethodID.unwrap())(
+        env,
+        ctx_cls,
+        c"getClassLoader".as_ptr(),
+        c"()Ljava/lang/ClassLoader;".as_ptr(),
+    );
+    let loader = (tbl.CallObjectMethodA.unwrap())(env, ctx, get_loader_mid, ptr::null());
+    if loader.is_null() {
+        (tbl.ExceptionClear.unwrap())(env);
+        return Err("ClassLoader 获取失败".into());
+    }
+    // loader.loadClass("com.quartz.launcher.QuartzBridge")
+    let str_cls = (tbl.FindClass.unwrap())(env, c"java/lang/String".as_ptr());
+    if str_cls.is_null() {
+        (tbl.ExceptionClear.unwrap())(env);
+        return Err("java/lang/String 未找到".into());
+    }
+    let name = (tbl.NewStringUTF.unwrap())(env, c"com.quartz.launcher.QuartzBridge".as_ptr());
+    let cls_cls = (tbl.GetObjectClass.unwrap())(env, loader);
+    let load_mid = (tbl.GetMethodID.unwrap())(
+        env,
+        cls_cls,
+        c"loadClass".as_ptr(),
+        c"(Ljava/lang/String;)Ljava/lang/Class;".as_ptr(),
+    );
+    let jargs = jni_sys::jvalue { l: name };
+    let cls_obj = (tbl.CallObjectMethodA.unwrap())(env, loader, load_mid, &jargs);
+    if cls_obj.is_null() {
+        (tbl.ExceptionClear.unwrap())(env);
+        return Err("QuartzBridge 类加载失败".into());
+    }
+    let gref = (tbl.NewGlobalRef.unwrap())(env, cls_obj);
+    if gref.is_null() {
+        (tbl.ExceptionClear.unwrap())(env);
+        return Err("全局引用创建失败".into());
+    }
+    let m_grab = (tbl.GetStaticMethodID.unwrap())(
+        env,
+        gref,
+        c"onGrabStateChanged".as_ptr(),
+        c"(Z)V".as_ptr(),
+    );
+    let m_clip = (tbl.GetStaticMethodID.unwrap())(
+        env,
+        gref,
+        c"accessAndroidClipboard".as_ptr(),
+        c"(ILjava/lang/String;)Ljava/lang/String;".as_ptr(),
+    );
+    if m_grab.is_null() || m_clip.is_null() {
+        (tbl.ExceptionClear.unwrap())(env);
+        return Err("回调方法注入失败".into());
+    }
+    // ART JavaVM（从当前 env 取，不依赖 ndk-context）
+    let mut vm: VmPtr = ptr::null_mut();
+    let rc = (tbl.GetJavaVM.unwrap())(env, &mut vm);
+    if rc != JNI_OK || vm.is_null() {
+        return Err("ART JavaVM 获取失败".into());
+    }
+    (api.init)(vm, gref, m_grab, m_clip);
+    eprintln!("[quartz] 显示桥已注入 :game 进程 ART 侧");
+    Ok(())
+}
+
+/// :game 进程入口（GameService.nativeRunGame JNI 调用）：
+/// 读取启动规格 -> 日志重定向 -> 环境准备 -> Surface 等待 ->
+/// dlopen JVM -> CreateJavaVM -> 安装退出捕获 -> 调用 main。
+unsafe fn run_game_from_spec(
+    env: EnvPtr,
+    ctx: jni_sys::jobject,
+    spec_path: &str,
+) -> Result<i32, String> {
+    let raw = std::fs::read_to_string(spec_path).map_err(|e| format!("spec 读取失败：{e}"))?;
+    let spec: GameSpec = serde_json::from_str(&raw).map_err(|e| format!("spec 解析失败：{e}"))?;
+
+    // 0) stdout/stderr 直写日志文件（先于一切：本函数所有输出都进日志）
+    {
+        let c = CString::new(spec.log_path.clone()).map_err(|_| "日志路径含 NUL")?;
+        let fd = libc::open(c.as_ptr(), libc::O_WRONLY | libc::O_CREAT | libc::O_APPEND, 0o644);
+        if fd >= 0 {
+            libc::dup2(fd, 1);
+            libc::dup2(fd, 2);
+            if fd > 2 {
+                libc::close(fd);
+            }
+        } else {
+            eprintln!("[quartz] 日志文件打开失败（输出将进 logcat）");
+        }
+    }
+    eprintln!(
+        "[quartz] :game 进程 {} 启动（OpenJDK JVM 独立进程模式）",
+        std::process::id()
+    );
+    eprintln!("[quartz] 本次游戏崩溃将只终止本进程，启动器 UI 不受影响");
+
+    // 1) 当前目录 + 环境变量
+    let workdir = std::path::PathBuf::from(&spec.workdir);
+    let jre_home = std::path::PathBuf::from(&spec.jre_home);
+    let cwd = CString::new(spec.workdir.clone()).unwrap();
+    libc::chdir(cwd.as_ptr());
+    std::env::set_var("JAVA_HOME", &jre_home);
+    std::env::set_var("HOME", &workdir);
+    let active_renderer = crate::renderers::active();
+    let ld = format!(
+        "{}:{}",
+        crate::renderers::install_dir(&active_renderer).display(),
+        crate::lwjgl::natives_dir().display()
+    );
+    std::env::set_var("LD_LIBRARY_PATH", ld);
+    let tmp_dir = crate::paths::runtime_dir().join("tmp");
+    let _ = std::fs::create_dir_all(&tmp_dir);
+    std::env::set_var("TMPDIR", &tmp_dir);
+    let egl_lib = crate::renderers::spec_for(&active_renderer)
+        .map(|s| s.egl_lib)
+        .unwrap_or("libEGL.so");
+    std::env::set_var(
+        "POJAVEXEC_EGL",
+        crate::renderers::install_dir(&active_renderer).join(egl_lib),
+    );
+    std::env::set_var("POJAV_RENDERER", format!("opengles_{active_renderer}"));
+    for (k, v) in crate::renderers::launch_env(&active_renderer) {
+        std::env::set_var(k, v);
+    }
+
+    // 2) 显示桥注入 ART（grab/剪贴板回调注册；ctx = GameService 实例）
+    bridge_init_with(env, ctx)?;
+
+    // 3) tagged-pointer 兼容层（Android 12+ GC SIGABRT 修复）—— 最先于 JVM dlopen
+    let tagfix = crate::paths::runtime_dir().join("libqztagfix.so");
+    if tagfix.exists() {
+        let c = CString::new(tagfix.to_string_lossy().into_owned()).unwrap();
+        if dlopen(c.as_ptr(), RTLD_NOW | RTLD_GLOBAL).is_null() {
+            eprintln!("[quartz] tagfix dlopen 失败（继续，Android 12+ 可能崩溃）");
+        } else {
+            eprintln!("[quartz] tagged-pointer 兼容层已加载");
+        }
+    }
+
+    // 4) 等 Surface（主进程 MSG_SURFACE 先于/伴随 MSG_INIT 到达；横屏旋转需时间）
+    if let Some(api) = BridgeApi::load() {
+        let mut ready = false;
+        for i in 0..240 {
+            if (api.window_ready)() == 1 {
+                ready = true;
+                break;
+            }
+            if i % 20 == 19 {
+                eprintln!("[quartz] 等待 Surface 创建…");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        if !ready {
+            return Err("游戏 Surface 创建超时（12s）：显示桥未收到 Surface".into());
+        }
+        eprintln!("[quartz] Surface 就绪");
+    }
+
+    // 5) JVM 参数装配：-cp 对转 -Djava.class.path + 追加退出捕获 hook jar；
+    //    jna.tmpdir / SharedLibraryExtractPath / java.library.path 统一改指
+    //    内部可 exec 目录（/storage/emulated/0 挂载 noexec，从那里 dlopen
+    //    提取出的 .so 必败 —— JNA/oshi NPE 与 LWJGL 版本错乱的根因）。
+    ensure_hook_jar()?;
+    let hook_jar = crate::paths::runtime_dir().join("quartz-game-hook.jar");
     let mut options: Vec<String> = Vec::new();
-    let mut args_iter = plan.jvm_args.iter().cloned().peekable();
+    let mut args_iter = spec.jvm_args.iter().cloned().peekable();
     while let Some(arg) = args_iter.next() {
         if arg == "-cp" {
             if let Some(cp) = args_iter.next() {
-                options.push(format!("-Djava.class.path={cp}"));
+                options.push(format!("-Djava.class.path={cp}:{}", hook_jar.display()));
             }
             continue;
         }
         if arg.starts_with("-cp=") {
-            options.push(format!("-Djava.class.path={}", &arg[4..]));
+            options.push(format!(
+                "-Djava.class.path={}:{}",
+                &arg[4..],
+                hook_jar.display()
+            ));
+            continue;
+        }
+        if arg.starts_with("-Djna.tmpdir=")
+            || arg.starts_with("-Dorg.lwjgl.system.SharedLibraryExtractPath=")
+            || arg.starts_with("-Djava.library.path=")
+        {
             continue;
         }
         options.push(arg);
     }
-    // Android 附加 JVM 参数（java.library.path / 渲染层 GL 库 / tmpdir / 错误报告）
-    let jre_home = crate::runtime::install_dir(major);
-    let tmp_dir = crate::paths::runtime_dir().join("tmp");
-    let _ = std::fs::create_dir_all(&tmp_dir);
-    let active_renderer = crate::renderers::active();
     let gl_lib = crate::renderers::spec_for(&active_renderer)
         .map(|s| s.gl_lib)
         .unwrap_or("libgl4es_114.so");
@@ -495,322 +852,212 @@ pub fn launch_in_process(
         "{}:{}:{}",
         crate::lwjgl::natives_dir().display(),
         crate::renderers::install_dir(&active_renderer).display(),
-        plan.natives_dir.display()
+        spec.natives_dir
     );
     options.push(format!("-Djava.library.path={jlp}"));
     options.push(format!("-Dorg.lwjgl.opengl.libname={gl_lib}"));
     options.push(format!("-Djava.io.tmpdir={}", tmp_dir.display()));
+    options.push(format!("-Djna.tmpdir={}", tmp_dir.display()));
+    options.push(format!(
+        "-Dorg.lwjgl.system.SharedLibraryExtractPath={}",
+        tmp_dir.display()
+    ));
     options.push("-XX:-UsePerfData".into());
     options.push(format!(
         "-XX:ErrorFile={}",
         crate::paths::game_root().join("logs").join("hs_err_%p.log").display()
     ));
     options.push("-Xlog:init=info:stderr".into());
+    options.push("-Djava.security.manager=allow".into());
 
-    // ---- 环境变量集（getenv 可见；实际 setenv 在 run_jvm 启动线程内执行）----
-    let renderer_env = crate::renderers::launch_env(&active_renderer);
-
-    // ---- Surface 交接（先建窗口再开 JVM）----
-    ensure_bridge_loaded()?;
-    qlog("quartz", "[quartz] 显示游戏视图（横屏 SurfaceView）");
-    show_game_surface();
-    let mut ready = false;
-    for i in 0..240 {
-        let ok = BridgeApi::load().map(|a| unsafe { (a.window_ready)() }).unwrap_or(0);
-        if ok == 1 {
-            ready = true;
-            break;
+    // 6) dlopen JRE 依赖（绝对路径，绕开 bionic 启动期缓存的 LD_LIBRARY_PATH）
+    let mut jvm_handle: *mut c_void = ptr::null_mut();
+    let libs = [
+        "lib/jli/libjli.so", "lib/libjli.so", "lib/server/libjvm.so",
+        "lib/libverify.so", "lib/libjava.so", "lib/libnet.so", "lib/libnio.so",
+        "lib/libzip.so", "lib/libjimage.so", "lib/libawt.so",
+        "lib/libawt_headless.so", "lib/libfreetype.so", "lib/libfontmanager.so",
+    ];
+    for rel in libs {
+        let p = jre_home.join(rel);
+        if !p.exists() {
+            continue;
         }
-        if i % 20 == 19 {
-            qlog("quartz", "[quartz] 等待 Surface 创建…");
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
-    if !ready {
-        hide_game_surface();
-        return Err("游戏 Surface 创建超时（12s）：显示桥未收到 Surface".into());
-    }
-    qlog("quartz", "[quartz] Surface 就绪，开始创建进程内 JVM");
-
-    // ---- stdout/stderr 重定向到管道（JVM/游戏输出进控制台 + 日志文件）----
-    let saved_fds: Arc<Mutex<Vec<i32>>> = Arc::new(Mutex::new(Vec::new()));
-    unsafe {
-        let mut out_pipe = [0 as libc::c_int; 2];
-        let mut err_pipe = [0 as libc::c_int; 2];
-        if libc::pipe(out_pipe.as_mut_ptr()) == 0 && libc::pipe(err_pipe.as_mut_ptr()) == 0 {
-            let saved_out = libc::dup(1);
-            let saved_err = libc::dup(2);
-            libc::dup2(out_pipe[1], 1);
-            libc::dup2(err_pipe[1], 2);
-            libc::close(out_pipe[1]);
-            libc::close(err_pipe[1]);
-            *saved_fds.lock().unwrap() = vec![saved_out, saved_err, out_pipe[0], err_pipe[0]];
-            let qout = qlog.clone();
-            std::thread::spawn(move || {
-                let reader = std::io::BufReader::new(unsafe {
-                    std::mem::transmute::<i32, std::fs::File>(out_pipe[0])
-                });
-                for line in reader.lines().map_while(Result::ok) {
-                    qout("stdout", &line);
-                }
-            });
-            let qerr = qlog.clone();
-            std::thread::spawn(move || {
-                let reader = std::io::BufReader::new(unsafe {
-                    std::mem::transmute::<i32, std::fs::File>(err_pipe[0])
-                });
-                for line in reader.lines().map_while(Result::ok) {
-                    qerr("stderr", &line);
-                }
-            });
+        let c = CString::new(p.to_string_lossy().into_owned()).unwrap();
+        let h = dlopen(c.as_ptr(), RTLD_NOW | RTLD_GLOBAL);
+        if h.is_null() {
+            if rel.ends_with("libjvm.so") {
+                return Err(format!("libjvm.so dlopen 失败：{}", p.display()));
+            }
+            eprintln!("[quartz] {} dlopen 失败（跳过）", p.display());
+        } else if rel.ends_with("libjvm.so") {
+            jvm_handle = h;
         }
     }
+    if jvm_handle.is_null() {
+        return Err("libjvm.so 未加载".into());
+    }
+    eprintln!("[quartz] JVM 动态库装载完成");
 
-    // ---- 启动线程：dlopen JVM -> CreateVM -> invoke main ----
-    GAME_RUNNING.store(true, Ordering::SeqCst);
-    let (done_tx, done_rx) = std::sync::mpsc::channel::<Result<i32, String>>();
-    let (destroy_tx, destroy_rx) = std::sync::mpsc::channel::<String>();
-    let version_id_thread = version_id.clone();
-    let qlog2 = qlog.clone();
-    let jre_home_thread = jre_home.clone();
-    let workdir = plan.working_dir.clone();
-    std::thread::Builder::new()
-        .name("quartz-jvm".into())
-        .stack_size(64 * 1024 * 1024)
-        .spawn(move || {
-            let result = run_jvm(
-                &jre_home_thread,
-                &workdir,
-                &plan.main_class,
-                &plan.game_args,
-                &options,
-                &active_renderer,
-                &renderer_env,
-                &qlog2,
+    // 7) JNI_CreateJavaVM
+    let create: unsafe extern "C" fn(
+        *mut VmPtr,
+        *mut *mut jni_sys::JNIEnv,
+        *mut jni_sys::JavaVMInitArgs,
+    ) -> jint = {
+        let cname = CString::new("JNI_CreateJavaVM").unwrap();
+        let p = dlsym(jvm_handle, cname.as_ptr());
+        if p.is_null() {
+            return Err("JNI_CreateJavaVM 符号缺失".into());
+        }
+        std::mem::transmute(p)
+    };
+    let mut jvm_options: Vec<jni_sys::JavaVMOption> = Vec::new();
+    let mut leaked: Vec<CString> = Vec::new();
+    for opt in &options {
+        let cs = CString::new(opt.clone()).map_err(|_| "JVM 参数含 NUL".to_string())?;
+        jvm_options.push(jni_sys::JavaVMOption {
+            optionString: cs.as_ptr() as *mut c_char,
+            extraInfo: ptr::null_mut(),
+        });
+        leaked.push(cs); // 保活
+    }
+    let mut init_args = jni_sys::JavaVMInitArgs {
+        version: JNI_VERSION_1_8,
+        nOptions: jvm_options.len() as jint,
+        options: jvm_options.as_mut_ptr(),
+        ignoreUnrecognized: 0,
+    };
+    let mut vm: VmPtr = ptr::null_mut();
+    let mut jenv: EnvPtr = ptr::null_mut();
+    let rc = create(&mut vm, &mut jenv, &mut init_args);
+    if rc != JNI_OK || vm.is_null() || jenv.is_null() {
+        return Err(format!("JNI_CreateJavaVM 失败（rc={rc}）"));
+    }
+    eprintln!("[quartz] :game 进程内 JVM 创建成功（OpenJDK 17，与 ART 并存）");
+
+    // 8) 安装退出捕获 SecurityManager（自研 hook jar）：System.exit/halt 被
+    //    否决并转为 ExitSignal，崩溃码沿调用栈返回本函数而非 os::exit。
+    let tbl = &**env;
+    {
+        let sm_name = CString::new("com/quartz/game/QuartzExitManager").unwrap();
+        let sm_cls = (tbl.FindClass.unwrap())(env, sm_name.as_ptr());
+        if sm_cls.is_null() {
+            (tbl.ExceptionClear.unwrap())(env);
+            eprintln!("[quartz] 退出捕获类未找到（hook jar 未进 classpath？）");
+        } else {
+            let mid = (tbl.GetStaticMethodID.unwrap())(
+                env,
+                sm_cls,
+                c"install".as_ptr(),
+                c"()V".as_ptr(),
             );
-            let _ = done_tx.send(result);
-            let _ = destroy_tx;
-        })
-        .map_err(|e| format!("启动线程创建失败：{e}"))?;
-
-    // ---- 看护线程：启动结果 -> 退出恢复（UI/竖屏/事件）----
-    let app_exit = app.clone();
-    let version_id_exit = version_id_thread;
-    let log_file_exit = log_file.clone();
-    let saved_fds_exit = saved_fds.clone();
-    let qlog_exit = qlog.clone();
-    let _destroy_rx = destroy_rx;
-    std::thread::spawn(move || {
-        let code: i32 = match done_rx.recv() {
-            Ok(Ok(code)) => code,
-            Ok(Err(e)) => {
-                qlog_exit("quartz", &format!("[quartz] JVM 启动失败：{e}"));
-                -1
-            }
-            Err(_) => -1,
-        };
-        JVM_SPENT.store(true, Ordering::SeqCst);
-        GAME_RUNNING.store(false, Ordering::SeqCst);
-        // 恢复 fd（短暂延迟让管道尾部输出被泵完）
-        std::thread::sleep(std::time::Duration::from_millis(300));
-        unsafe {
-            if let Ok(fds) = saved_fds_exit.lock() {
-                if fds.len() == 4 {
-                    libc::dup2(fds[0], 1);
-                    libc::dup2(fds[1], 2);
+            if mid.is_null() {
+                (tbl.ExceptionClear.unwrap())(env);
+                eprintln!("[quartz] 退出捕获 install 未找到");
+            } else {
+                (tbl.CallStaticVoidMethodA.unwrap())(env, sm_cls, mid, ptr::null());
+                if (tbl.ExceptionCheck.unwrap())(env) != 0 {
+                    (tbl.ExceptionClear.unwrap())(env);
+                    eprintln!("[quartz] 退出捕获安装失败（需 -Djava.security.manager=allow）");
+                } else {
+                    eprintln!("[quartz] 退出捕获已安装（崩溃/退出将回报启动器）");
                 }
             }
         }
-        qlog_exit("quartz", &format!("[quartz] 游戏退出，代码 {code}（进程内模式）"));
-        hide_game_surface();
-        let _ = app_exit.emit(
-            "launch://exit",
-            &LaunchExit {
-                code,
-                version: version_id_exit,
-                log_file: None,
-            },
-        );
-        let _ = log_file_exit;
-    });
-    Ok(())
+        if (tbl.ExceptionCheck.unwrap())(env) != 0 {
+            (tbl.ExceptionClear.unwrap())(env);
+        }
+    }
+
+    // 9) 定位主类并调用 main
+    let main_path = format!("{}", spec.main_class.replace('.', "/"));
+    let cls_c = CString::new(main_path.clone()).unwrap();
+    let cls = (tbl.FindClass.unwrap())(env, cls_c.as_ptr());
+    if cls.is_null() {
+        (tbl.ExceptionClear.unwrap())(env);
+        return Err(format!("主类 {} 未找到（classpath 配置错误？）", spec.main_class));
+    }
+    let mid = (tbl.GetStaticMethodID.unwrap())(
+        env,
+        cls,
+        c"main".as_ptr(),
+        c"([Ljava/lang/String;)V".as_ptr(),
+    );
+    if mid.is_null() {
+        (tbl.ExceptionClear.unwrap())(env);
+        return Err("main 方法未找到".into());
+    }
+    let str_cls = (tbl.FindClass.unwrap())(env, c"java/lang/String".as_ptr());
+    if str_cls.is_null() {
+        (tbl.ExceptionClear.unwrap())(env);
+        return Err("java/lang/String 未找到".into());
+    }
+    let arr = (tbl.NewObjectArray.unwrap())(
+        env,
+        spec.game_args.len() as i32,
+        str_cls,
+        ptr::null_mut(),
+    );
+    if arr.is_null() {
+        (tbl.ExceptionClear.unwrap())(env);
+        return Err("参数数组创建失败".into());
+    }
+    let mut cstrs: Vec<CString> = Vec::new();
+    for (i, a) in spec.game_args.iter().enumerate() {
+        let cs = CString::new(a.clone()).map_err(|_| "游戏参数含 NUL".to_string())?;
+        let js = (tbl.NewStringUTF.unwrap())(env, cs.as_ptr());
+        cstrs.push(cs);
+        if js.is_null() {
+            (tbl.ExceptionClear.unwrap())(env);
+            return Err("参数字符串创建失败".into());
+        }
+        (tbl.SetObjectArrayElement.unwrap())(env, arr, i as i32, js);
+    }
+    let arg_value = jni_sys::jvalue { l: arr };
+    eprintln!(
+        "[quartz] 调用 {} main（{} 个游戏参数）",
+        spec.main_class,
+        spec.game_args.len()
+    );
+    let call = tbl.CallStaticVoidMethodA.unwrap();
+    call(env, cls, mid, &arg_value);
+    let threw = (tbl.ExceptionCheck.unwrap())(env) != 0;
+    if threw {
+        // 异常逃逸主类（MC 崩溃且 ExitSignal 未被吞的路径）：打印后按 255 处理
+        (tbl.ExceptionDescribe.unwrap())(env);
+        (tbl.ExceptionClear.unwrap())(env);
+        eprintln!("[quartz] 主类抛出未捕获异常（详见上方 stderr）");
+        return Ok(255);
+    }
+    eprintln!("[quartz] main 返回（游戏正常退出）");
+    Ok(0)
 }
 
-/// 线程体：dlopen tagfix/bridge/JRE -> JNI_CreateJavaVM -> 调主类。
-#[allow(clippy::too_many_arguments)]
-fn run_jvm(
-    jre_home: &Path,
-    workdir: &Path,
-    main_class: &str,
-    game_args: &[String],
-    options: &[String],
-    active_renderer: &str,
-    renderer_env: &[(String, String)],
-    qlog: &Arc<dyn Fn(&str, &str) + Send + Sync>,
-) -> Result<i32, String> {
-    unsafe {
-        // 当前目录（MC 工作目录）
-        let cwd = CString::new(workdir.to_string_lossy().into_owned()).unwrap();
-        libc::chdir(cwd.as_ptr());
+// ---------------------------------------------------------------------------
+// JNI 入口（Kotlin -> Rust）
+// ---------------------------------------------------------------------------
 
-        // 环境变量
-        std::env::set_var("JAVA_HOME", jre_home);
-        std::env::set_var("HOME", workdir);
-        let ld = format!(
-            "{}:{}",
-            crate::renderers::install_dir(active_renderer).display(),
-            crate::lwjgl::natives_dir().display()
-        );
-        std::env::set_var("LD_LIBRARY_PATH", ld);
-        let tmp = crate::paths::runtime_dir().join("tmp");
-        std::env::set_var("TMPDIR", &tmp);
-        let egl_lib = crate::renderers::spec_for(active_renderer)
-            .map(|s| s.egl_lib)
-            .unwrap_or("libEGL.so");
-        let egl_path = crate::renderers::install_dir(active_renderer).join(egl_lib);
-        std::env::set_var("POJAVEXEC_EGL", &egl_path);
-        std::env::set_var("POJAV_RENDERER", format!("opengles_{active_renderer}"));
-        for (k, v) in renderer_env {
-            std::env::set_var(k, v);
+/// :game 进程执行入口 —— GameService.nativeRunGame(specPath)。
+/// 返回游戏退出码；错误路径返回 251/252（详情写 stderr -> 日志文件）。
+#[no_mangle]
+pub unsafe extern "C" fn Java_com_quartz_launcher_GameService_nativeRunGame(
+    env: EnvPtr,
+    service: jni_sys::jobject,
+    spec_path: jni_sys::jstring,
+) -> jint {
+    let tbl = &**env;
+    let p = (tbl.GetStringUTFChars.unwrap())(env, spec_path, ptr::null_mut());
+    if p.is_null() {
+        return 251;
+    }
+    let path = CStr::from_ptr(p).to_string_lossy().into_owned();
+    (tbl.ReleaseStringUTFChars.unwrap())(env, spec_path, p);
+    match run_game_from_spec(env, service, &path) {
+        Ok(code) => code as jint,
+        Err(e) => {
+            eprintln!("[quartz] 游戏启动失败：{e}");
+            252
         }
-
-        // 1) tagged-pointer 兼容层（Android 12+ GC SIGABRT 修复）—— 最先 dlopen
-        let tagfix = crate::paths::runtime_dir().join("libqztagfix.so");
-        if tagfix.exists() {
-            let c = CString::new(tagfix.to_string_lossy().into_owned()).unwrap();
-            let h = dlopen(c.as_ptr(), RTLD_NOW | RTLD_GLOBAL);
-            if h.is_null() {
-                qlog("quartz", "[quartz] tagfix dlopen 失败（继续，Android 12+ 可能崩溃）");
-            } else {
-                qlog("quartz", "[quartz] tagged-pointer 兼容层已加载（进程内）");
-            }
-        }
-
-        // 2) JRE 依赖装载（绝对路径，绕开 bionic 启动期缓存的 LD_LIBRARY_PATH）
-        let mut jvm_handle: *mut c_void = ptr::null_mut();
-        let libs = [
-            "lib/jli/libjli.so", "lib/libjli.so", "lib/server/libjvm.so",
-            "lib/libverify.so", "lib/libjava.so", "lib/libnet.so", "lib/libnio.so",
-            "lib/libzip.so", "lib/libjimage.so", "lib/libawt.so",
-            "lib/libawt_headless.so", "lib/libfreetype.so", "lib/libfontmanager.so",
-        ];
-        for rel in libs {
-            let p = jre_home.join(rel);
-            if !p.exists() {
-                continue;
-            }
-            let c = CString::new(p.to_string_lossy().into_owned()).unwrap();
-            let h = dlopen(c.as_ptr(), RTLD_NOW | RTLD_GLOBAL);
-            if h.is_null() {
-                if rel.ends_with("libjvm.so") {
-                    return Err(format!("libjvm.so dlopen 失败：{}", p.display()));
-                }
-                qlog("quartz", &format!("[quartz] {} dlopen 失败（跳过）", p.display()));
-            } else if rel.ends_with("libjvm.so") {
-                jvm_handle = h;
-            }
-        }
-        if jvm_handle.is_null() {
-            return Err("libjvm.so 未加载".into());
-        }
-        qlog("quartz", "[quartz] JVM 动态库装载完成（进程内）");
-
-        // 3) JNI_CreateJavaVM
-        let create: unsafe extern "C" fn(
-            *mut VmPtr,
-            *mut *mut jni_sys::JNIEnv,
-            *mut jni_sys::JavaVMInitArgs,
-        ) -> jint = {
-            let cname = CString::new("JNI_CreateJavaVM").unwrap();
-            let p = dlsym(jvm_handle, cname.as_ptr());
-            if p.is_null() {
-                return Err("JNI_CreateJavaVM 符号缺失".into());
-            }
-            std::mem::transmute(p)
-        };
-        let mut jvm_options: Vec<jni_sys::JavaVMOption> = Vec::new();
-        let mut leaked: Vec<CString> = Vec::new();
-        for opt in options {
-            let cs = CString::new(opt.clone()).map_err(|_| "JVM 参数含 NUL".to_string())?;
-            jvm_options.push(jni_sys::JavaVMOption {
-                optionString: cs.as_ptr() as *mut c_char,
-                extraInfo: ptr::null_mut(),
-            });
-            leaked.push(cs); // 保活
-        }
-        let mut init_args = jni_sys::JavaVMInitArgs {
-            version: JNI_VERSION_1_8,
-            nOptions: jvm_options.len() as jint,
-            options: jvm_options.as_mut_ptr(),
-            ignoreUnrecognized: 0,
-        };
-        let mut vm: VmPtr = ptr::null_mut();
-        let mut env: EnvPtr = ptr::null_mut();
-        let rc = create(&mut vm, &mut env, &mut init_args);
-        if rc != JNI_OK || vm.is_null() || env.is_null() {
-            return Err(format!("JNI_CreateJavaVM 失败（rc={rc}）"));
-        }
-        *JVM.0.lock().unwrap() = Some(vm as usize);
-        qlog("quartz", "[quartz] 进程内 JVM 创建成功（OpenJDK 17，与 ART 并存）");
-
-        // 4) 定位主类并调用 main
-        let tbl = &**env;
-        let main_path = format!("{}",
-            main_class.replace('.', "/"));
-        let cls_c = CString::new(main_path.clone()).unwrap();
-        let cls = (tbl.FindClass.unwrap())(env, cls_c.as_ptr());
-        if cls.is_null() {
-            (tbl.ExceptionClear.unwrap())(env);
-            return Err(format!("主类 {main_class} 未找到（classpath 配置错误？）"));
-        }
-        let mid = (tbl.GetStaticMethodID.unwrap())(
-            env,
-            cls,
-            c"main".as_ptr(),
-            c"([Ljava/lang/String;)V".as_ptr(),
-        );
-        if mid.is_null() {
-            (tbl.ExceptionClear.unwrap())(env);
-            return Err("main 方法未找到".into());
-        }
-        let str_cls = (tbl.FindClass.unwrap())(env, c"java/lang/String".as_ptr());
-        if str_cls.is_null() {
-            (tbl.ExceptionClear.unwrap())(env);
-            return Err("java/lang/String 未找到".into());
-        }
-        let arr = (tbl.NewObjectArray.unwrap())(env, game_args.len() as i32, str_cls, ptr::null_mut());
-        if arr.is_null() {
-            (tbl.ExceptionClear.unwrap())(env);
-            return Err("参数数组创建失败".into());
-        }
-        let mut cstrs: Vec<CString> = Vec::new();
-        for (i, a) in game_args.iter().enumerate() {
-            let cs = CString::new(a.clone()).map_err(|_| "游戏参数含 NUL".to_string())?;
-            let js = (tbl.NewStringUTF.unwrap())(env, cs.as_ptr());
-            cstrs.push(cs);
-            if js.is_null() {
-                (tbl.ExceptionClear.unwrap())(env);
-                return Err("参数字符串创建失败".into());
-            }
-            (tbl.SetObjectArrayElement.unwrap())(env, arr, i as i32, js);
-        }
-        let arg_value = jni_sys::jvalue { l: arr };
-        qlog("quartz", &format!(
-            "[quartz] 调用 {} main（{} 个游戏参数）",
-            main_class,
-            game_args.len()
-        ));
-        let call = tbl.CallStaticVoidMethodA.unwrap();
-        call(env, cls, mid, &arg_value);
-        let threw = (tbl.ExceptionCheck.unwrap())(env) != 0;
-        if threw {
-            // 异常逃逸主类（MC 崩溃且未 System.exit 的路径）：打印后按 255 处理
-            (tbl.ExceptionDescribe.unwrap())(env);
-            (tbl.ExceptionClear.unwrap())(env);
-            qlog("quartz", "[quartz] 主类抛出未捕获异常（详见上方 stderr）");
-            return Ok(255);
-        }
-        qlog("quartz", "[quartz] main 返回（游戏正常退出）");
-        Ok(0)
     }
 }

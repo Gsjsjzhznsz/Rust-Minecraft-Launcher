@@ -1359,7 +1359,7 @@ fn ensure_tagfix_lib() -> Option<PathBuf> {
 }
 
 /// 拉起 JVM 子进程并托管日志/退出（`launch://log` / `launch://exit` 事件）。
-/// v0.1.5 起仅桌面端使用；Android 走 game_bridge::launch_in_process。
+/// v0.1.7 起 Android 走 game_bridge::launch_via_game_process（:game 独立进程）。
 #[cfg_attr(target_os = "android", allow(dead_code))]
 fn spawn_game(
     version_id: String,
@@ -2017,12 +2017,11 @@ fn launch_game(version_id: String, app: AppHandle, state: State<'_, AppState>) -
     {
         ensure_lwjgl_pack(&app)?;
         ensure_renderer(&app)?;
-        // 显示桥落位：覆盖 Pojav APK 提取的旧 C 版 pojavexec（jar↔so 错位根因），
-        // 再 dlopen 注入 ART 侧。
+        // 显示桥落位（:game 进程 dlopen）：覆盖 Pojav APK 提取的旧 C 版 pojavexec
+        //（jar↔so 错位根因）。
         let _ = &state;
         game_bridge::ensure_bridge_lib()?;
-        game_bridge::ensure_bridge_loaded()?;
-        // tagged-pointer 兼容层落盘（进程内 dlopen 用，Android 12+ GC SIGABRT 修复）
+        // tagged-pointer 兼容层落盘（:game 进程 dlopen 用，Android 12+ GC SIGABRT 修复）
         if ensure_tagfix_lib().is_none() {
             eprintln!("[quartz] tagfix 落盘失败（Android 12+ 可能 GC abort）");
         }
@@ -2032,19 +2031,7 @@ fn launch_game(version_id: String, app: AppHandle, state: State<'_, AppState>) -
 
     #[cfg(target_os = "android")]
     {
-        // 同进程内 JVM 只能创建一次：上次游戏退出后再次启动 -> 自动重启应用重置。
-        if game_bridge::jvm_spent() {
-            let _ = app.emit(
-                "launch://log",
-                &LaunchLog {
-                    source: "quartz".into(),
-                    line: "[quartz] 同一应用进程内 JVM 无法二次创建，自动重启应用（重新打开后再次点启动即可）".into(),
-                },
-            );
-            game_bridge::restart_app();
-            return Ok(());
-        }
-        // 持久化启动日志（进程内路径）
+        // 持久化启动日志（:game 进程直写本文件，主进程 tail 转发到 WebView）
         let logs_dir = paths::game_root().join("logs");
         let _ = std::fs::create_dir_all(&logs_dir);
         let log_path = logs_dir.join(format!(
@@ -2059,8 +2046,8 @@ fn launch_game(version_id: String, app: AppHandle, state: State<'_, AppState>) -
         if let Ok(mut guard) = log_file.lock() {
             if let Some(f) = guard.as_mut() {
                 use std::io::Write;
-                let _ = writeln!(f, "==== Quartz launch {version_id} (java {major}, in-process) ====");
-                let _ = writeln!(f, "mode: in-process JVM + quartz-bridge (Rust display bridge)");
+                let _ = writeln!(f, "==== Quartz launch {version_id} (java {major}, :game process) ====");
+                let _ = writeln!(f, "mode: separate :game process JVM + quartz-bridge (Rust display bridge)");
                 let _ = writeln!(f, "main_class: {}", plan.main_class);
                 let _ = writeln!(f, "---- jvm options ({} 个) ----", plan.jvm_args.len());
                 for a in &plan.jvm_args {
@@ -2077,10 +2064,17 @@ fn launch_game(version_id: String, app: AppHandle, state: State<'_, AppState>) -
             "launch://log",
             &LaunchLog {
                 source: "quartz".into(),
-                line: format!("[quartz] 启动模式：进程内 JVM + Rust 显示桥（{version_id}）"),
+                line: format!("[quartz] 启动模式：:game 独立进程 JVM + Rust 显示桥（{version_id}）"),
             },
         );
-        game_bridge::launch_in_process(version_id.clone(), plan, major, app.clone(), log_file)?;
+        game_bridge::launch_via_game_process(
+            version_id.clone(),
+            plan,
+            major,
+            app.clone(),
+            log_file,
+            &log_path,
+        )?;
         return Ok(());
     }
 
@@ -2092,15 +2086,16 @@ fn launch_game(version_id: String, app: AppHandle, state: State<'_, AppState>) -
 }
 
 /// 终止运行中的游戏。
-/// Android（进程内 JVM）：System.exit 结束应用进程（日志已落盘，应用重启取证）；
-/// 桌面：SIGKILL 游戏子进程。
+/// Android（:game 独立进程）：向服务发 MSG_STOP，进程自杀，UI 由 binder
+/// death 回调恢复；桌面：SIGKILL 游戏子进程。
 #[tauri::command]
 fn stop_game(state: State<'_, AppState>, app: AppHandle) -> Result<bool, String> {
     #[cfg(target_os = "android")]
     {
         let _ = &state;
+        let _ = &app;
         if crate::game_bridge::game_running() {
-            crate::game_bridge::stop_in_process(&app);
+            crate::game_bridge::stop_game_process();
             return Ok(true);
         }
         return Ok(false);

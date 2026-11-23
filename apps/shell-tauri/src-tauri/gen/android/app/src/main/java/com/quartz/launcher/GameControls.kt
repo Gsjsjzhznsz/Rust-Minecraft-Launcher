@@ -22,11 +22,10 @@ import android.widget.TextView
  * - 左下方向键（W/A/S/D）+ 跳跃（Space）+ 潜行（Shift）；
  * - 右下「按住攻击」开关（挖掘/攻击的持续左键）；
  * - 顶部右侧：Esc（暂停）、E（背包）、T（聊天）、键盘开关（软键盘输入聊天）。
- * 全部按键经 QuartzBridge -> Rust 显示桥 -> LWJGL 键回调进入游戏。
+ * 全部按键经 GameIpc（Messenger IPC）-> :game 进程桥 -> LWJGL 键回调进入游戏。
  */
 class GameControls(context: Context) : FrameLayout(context) {
 
-    private val bridge = QuartzBridge.instance
     private val hiddenInput: EditText
     private var holdLeft = false
 
@@ -43,7 +42,7 @@ class GameControls(context: Context) : FrameLayout(context) {
                     val text = s?.toString() ?: return
                     if (text.isNotEmpty()) {
                         for (ch in text) {
-                            bridge.sendChar(ch.code, 0)
+                            GameIpc.char(ch.code, 0)
                         }
                         setText("")
                     }
@@ -156,7 +155,7 @@ class GameControls(context: Context) : FrameLayout(context) {
         view.setOnClickListener {
             holdLeft = !holdLeft
             (view as TextView).text = if (holdLeft) "攻击关" else "攻击开"
-            bridge.sendMouseButton(0, if (holdLeft) 1 else 0, 0)
+            GameIpc.mouse(0, if (holdLeft) 1 else 0, 0)
         }
         return view
     }
@@ -181,7 +180,7 @@ class GameControls(context: Context) : FrameLayout(context) {
     private fun forwardKey(keycode: Int, action: Int) {
         val glfw = GlfwKeys.toGlfwKey(keycode)
         if (glfw != 0) {
-            bridge.sendKey(glfw, 0, action, 0)
+            GameIpc.key(glfw, 0, action, 0)
         }
     }
 }

@@ -25,6 +25,14 @@ cp "$BRIDGE_OUT" /home/z/my-project/apps/shell-tauri/src-tauri/bridge/libpojavex
 $NDKBIN/llvm-strip /home/z/my-project/apps/shell-tauri/src-tauri/bridge/libpojavexec.so
 echo "[build] 显示桥就绪：$(ls -la /home/z/my-project/apps/shell-tauri/src-tauri/bridge/libpojavexec.so | awk '{print $5}') 字节"
 
+# ---- ①.5 游戏退出捕获 hook jar（自研 SecurityManager，javac --release 17）----
+HOOK_DIR=/home/z/my-project/apps/shell-tauri/src-tauri/bridge
+rm -rf "$HOOK_DIR/classes" "$HOOK_DIR/quartz-game-hook.jar"
+"$JAVA_HOME/bin/javac" --release 17 -d "$HOOK_DIR/classes" "$HOOK_DIR"/java/com/quartz/game/*.java || exit 1
+"$JAVA_HOME/bin/jar" --create --file "$HOOK_DIR/quartz-game-hook.jar" -C "$HOOK_DIR/classes" . || exit 1
+rm -rf "$HOOK_DIR/classes"
+echo "[build] 退出捕获 hook 就绪：$(ls -la "$HOOK_DIR/quartz-game-hook.jar" | awk '{print $5}') 字节"
+
 # ---- ② 壳层 APK（tauri android build）----
 cd /home/z/my-project/apps/shell-tauri/src-tauri
 # --target aarch64：仅编 arm64 ABI（默认全 ABI 编译耗时 4 倍）

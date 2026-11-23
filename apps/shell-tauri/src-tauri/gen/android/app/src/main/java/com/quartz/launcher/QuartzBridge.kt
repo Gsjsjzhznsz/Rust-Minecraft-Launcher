@@ -30,6 +30,9 @@ class QuartzBridge private constructor() {
         /** 显示桥回调：游戏进入/退出鼠标 grab（MC 捕获鼠标）。 */
         @JvmStatic
         fun onGrabStateChanged(grabbed: Boolean) {
+            // :game 进程：转发给主进程（经 Messenger）；主进程：直接更新 UI。
+            // （两处都会被调用：非对应进程的一侧因实例为空自动无操作。）
+            GameService.notifyGrab(grabbed)
             MainActivity.onGameGrabStateChangedNative(grabbed)
         }
 

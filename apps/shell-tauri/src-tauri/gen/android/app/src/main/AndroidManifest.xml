@@ -38,6 +38,14 @@
             </intent-filter>
         </activity>
 
+        <!-- 游戏运行进程（v0.1.7 崩溃隔离）：OpenJDK JVM + quartz-bridge 全部在
+             :game 进程内运行，游戏崩溃（SIGSEGV/SIGABRT/System.exit）只终止该
+             进程；主进程经 ServiceConnection binder death 回调恢复启动器 UI。 -->
+        <service
+            android:name=".GameService"
+            android:exported="false"
+            android:process=":game" />
+
         <provider
           android:name="androidx.core.content.FileProvider"
           android:authorities="${applicationId}.fileprovider"
