@@ -82,7 +82,7 @@ class GameView(context: Context) : SurfaceView(context, null, 0), SurfaceHolder.
         virtualY = 0.0
     }
 
-    private fun cancelLongPress() {
+    private fun cancelLongPressTimer() {
         removeCallbacks(longPressRunnable)
     }
 
@@ -111,7 +111,7 @@ class GameView(context: Context) : SurfaceView(context, null, 0), SurfaceHolder.
                     GameIpc.cursor(event.x, event.y)
                     GameIpc.mouse(0, 1, 0)
                     leftDown = true
-                    cancelLongPress()
+                    cancelLongPressTimer()
                     postDelayed(longPressRunnable, 600)
                 }
             }
@@ -125,7 +125,7 @@ class GameView(context: Context) : SurfaceView(context, null, 0), SurfaceHolder.
                     }
                 } else if (event.pointerCount >= 2 && secondPointerId < 0) {
                     // 第二指 = 滚轮（菜单里滚动列表）
-                    cancelLongPress()
+                    cancelLongPressTimer()
                     if (leftDown) {
                         GameIpc.mouse(0, 0, 0)
                         leftDown = false
@@ -191,7 +191,7 @@ class GameView(context: Context) : SurfaceView(context, null, 0), SurfaceHolder.
                     }
                     leftClickArmed = false
                 } else {
-                    cancelLongPress()
+                    cancelLongPressTimer()
                     if (longPressFired) {
                         GameIpc.mouse(1, 0, 0)   // 长按右键：释放
                     } else {
