@@ -5,12 +5,17 @@
 #   tauri-cli -> .toolchain/npm-global（npm 预编译二进制）
 #   SDK/NDK -> .toolchain/android-sdk；JDK -> .toolchain/jdk-21*
 # JDK 优先用 .toolchain 内的发行版；缺失时回退系统 OpenJDK 21（Debian 自带）
+# JDK：外部已就绪（CI 预装 / ensure-toolchain 已选定）优先保持；其次 .toolchain 发行版；最后系统路径
 TC=/home/z/my-project/.toolchain
-JDK_DIR=$(ls -d "$TC"/jdk-21*/bin 2>/dev/null | head -1)
-if [ -n "$JDK_DIR" ]; then
-  export JAVA_HOME=${JDK_DIR%/bin}
+if [ -x "$JAVA_HOME/bin/javac" ]; then
+  : # keep
 else
-  export JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64
+  JDK_DIR=$(ls -d "$TC"/jdk-21*/bin 2>/dev/null | head -1)
+  if [ -n "$JDK_DIR" ]; then
+    export JAVA_HOME=${JDK_DIR%/bin}
+  else
+    export JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64
+  fi
 fi
 export ANDROID_HOME=$TC/android-sdk
 export NDK_HOME=$ANDROID_HOME/ndk/27.0.12077973

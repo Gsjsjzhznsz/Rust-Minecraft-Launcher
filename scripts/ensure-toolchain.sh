@@ -31,15 +31,17 @@ if [ ! -x "$TC/npm-global/bin/tauri" ]; then
 fi
 ln -sf "$TC/npm-global/bin/tauri" "$TC/bin/cargo-tauri" 2>/dev/null || true
 
-echo "=== [3/5] JDK 21（javac/jar；sdkmanager 依赖，必须在 SDK 前）==="
-# JAVA_HOME 探测顺序：已导出且有效 > .toolchain 内 JDK > 系统 21 > 系统 17
-if [ -z "$JAVA_HOME" ] || [ ! -x "$JAVA_HOME/bin/javac" ]; then
-  for d in "$TC"/jdk-21* /usr/lib/jvm/java-21-openjdk-amd64 /usr/lib/jvm/temurin-21-jdk-amd64 \
-           /usr/lib/jvm/java-17-openjdk-amd64 /usr/lib/jvm/temurin-17-jdk-amd64; do
-    [ -x "$d/bin/javac" ] && { export JAVA_HOME="$d"; break; }
-  done
-fi
-if [ -z "$JAVA_HOME" ] || [ ! -x "$JAVA_HOME/bin/javac" ]; then
+echo "=== [3/5] JDK（优先 21；sdkmanager 依赖，必须在 SDK 前）==="
+# 优先 JDK 21（与本地已验证环境一致）；无 21 则落到 runner 预装；都没有才下载
+JAVA21=""
+for d in "$TC"/jdk-21* /usr/lib/jvm/java-21-openjdk-amd64 /usr/lib/jvm/temurin-21-jdk-amd64; do
+  [ -x "$d/bin/javac" ] && { JAVA21="$d"; break; }
+done
+if [ -n "$JAVA21" ]; then
+  export JAVA_HOME="$JAVA21"
+elif [ -n "$JAVA_HOME" ] && [ -x "$JAVA_HOME/bin/javac" ]; then
+  echo "[toolchain] 系统无 JDK 21，使用预装 $JAVA_HOME"
+else
   # 无任何系统 JDK → 安装 Adoptium 21 到 .toolchain
   curl -sSLf --retry 3 -o /tmp/jdk21.tar.gz "https://api.adoptium.net/v3/binary/latest/21/ga/linux/x64/jdk/hotspot/normal/eclipse?project=jdk" --max-time 500 \
     || { echo "[toolchain] JDK 下载失败 rc=$?"; exit 1; }
@@ -82,5 +84,5 @@ fi
 ls "$SDK/ndk/" >/dev/null || { echo "[toolchain] NDK 目录异常"; exit 1; }
 
 echo "=== [5/5] 校验 ==="
-ls "$TC"/jdk-21*/bin/javac >/dev/null
+ls "$JAVA_HOME/bin/javac" >/dev/null
 echo "TOOLCHAIN_READY"
