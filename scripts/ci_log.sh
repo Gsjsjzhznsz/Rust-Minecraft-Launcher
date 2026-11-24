@@ -22,7 +22,12 @@ for j in jobs.get("jobs", []):
         url = f"https://api.github.com/repos/{repo}/actions/jobs/{j['id']}/logs"
         req = urllib.request.Request(url, headers=H)
         try:
-            text = urllib.request.urlopen(req).read().decode("utf-8", "replace")
+            # GitHub 返回 302 → 签名的 blob URL；重定向时必须剥离 Authorization，否则 blob 端签名校验 403
+            class NoAuthRedirect(urllib.request.HTTPRedirectHandler):
+                def redirect_request(self, req_, fp, code, msg, hdrs, newurl):
+                    return urllib.request.Request(newurl, headers={"Accept": "*/*"})
+            opener = urllib.request.build_opener(NoAuthRedirect)
+            text = opener.open(req).read().decode("utf-8", "replace")
             lines = text.splitlines()
             print(f"---- log tail (total {len(lines)} lines, showing last {tailn}) ----")
             for ln in lines[-tailn:]:
