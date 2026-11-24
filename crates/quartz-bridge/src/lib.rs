@@ -24,8 +24,61 @@
 #[cfg(not(target_os = "android"))]
 pub fn placeholder() {}
 
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", feature = "host-sim"))]
 mod bridge;
 
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", feature = "host-sim"))]
 pub use bridge::*;
+
+// 主机仿真 EGL（EGL-on-GLX）：见 egl_sim.rs 头注（bridge::egl::load_api 内部经 super::egl_sim 使用）
+#[cfg(all(feature = "host-sim", not(target_os = "android")))]
+mod egl_sim;
+
+// ---------------------------------------------------------------------------
+// 主机仿真桩（仅 host-sim）：ANativeWindow 经环境变量给出 X11 Window XID，
+// EGL 走宿主 Mesa（POJAVEXEC_EGL=/usr/lib/x86_64-linux-gnu/libEGL.so）。
+// 用途：scripts/sim 沙箱复现「鼠标回调 → libffi 闭包 → CallVoidMethod」链路。
+// ---------------------------------------------------------------------------
+
+#[cfg(all(feature = "host-sim", not(target_os = "android")))]
+pub mod host_stubs {
+    use std::ffi::{c_int, c_void};
+
+    fn env_u32(key: &str, def: u32) -> u32 {
+        std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(def)
+    }
+
+    /// 返回 QUARTZ_SIM_XWINDOW 指定的 X11 Window（无则 0 = 无窗口路径）。
+    #[no_mangle]
+    pub extern "C" fn ANativeWindow_fromSurface(_env: *mut c_void, _surface: *mut c_void) -> *mut c_void {
+        let xid = env_u32("QUARTZ_SIM_XWINDOW", 0);
+        if xid != 0 { eprintln!("[host-stub] ANativeWindow_fromSurface -> XID {xid}"); }
+        xid as *mut c_void
+    }
+
+    #[no_mangle]
+    pub extern "C" fn ANativeWindow_acquire(_window: *mut c_void) {}
+
+    #[no_mangle]
+    pub extern "C" fn ANativeWindow_release(_window: *mut c_void) {}
+
+    #[no_mangle]
+    pub extern "C" fn ANativeWindow_getWidth(_window: *mut c_void) -> c_int {
+        env_u32("QUARTZ_SIM_W", 1280) as c_int
+    }
+
+    #[no_mangle]
+    pub extern "C" fn ANativeWindow_getHeight(_window: *mut c_void) -> c_int {
+        env_u32("QUARTZ_SIM_H", 720) as c_int
+    }
+
+    #[no_mangle]
+    pub extern "C" fn ANativeWindow_setBuffersGeometry(
+        _window: *mut c_void,
+        _w: c_int,
+        _h: c_int,
+        _format: c_int,
+    ) -> c_int {
+        0
+    }
+}

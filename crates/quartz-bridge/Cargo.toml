@@ -17,3 +17,6 @@ libc = { version = "0.2", optional = true }
 [features]
 default = ["bridge"]
 bridge = ["jni-sys", "libc"]
+# 主机仿真（x86_64 Linux）：桥在非 Android 目标编译，ANativeWindow 用环境变量桩。
+# 仅用于 scripts/sim 的沙箱复现，不参与 Android APK 构建。
+host-sim = ["bridge"]

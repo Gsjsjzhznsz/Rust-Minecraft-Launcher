@@ -225,6 +225,32 @@ struct State {
     cb_mouse: AtomicUsize,
     cb_scroll: AtomicUsize,
 
+    /// v0.2.5 直调修复：每个回调的 Java 对象全局引用（经 jar 的
+    /// Callback.get(蹦床指针) 反查）+ 对应接口的 invoke methodID。
+    /// 设备（bionic liblwjgl 的 libffi 闭包）首次触发回调即 SIGSEGV pc=0
+    /// （两次崩溃同指纹：lr=匿名段+0x99a8，参数 (window,0,1,0)=左键按下），
+    /// 主机复现同链路却稳定 —— 闭包路径在设备 bionic 环境不可用。
+    /// 直调路径：pump 用 CallVoidMethodA（A 变体，无 varargs）直接调
+    /// GLFWxxCallbackI.invoke，完全绕开 libffi 闭包；失败时回退旧闭包路径。
+    cb_char_obj: AtomicPtr<c_void>,
+    cb_char_mods_obj: AtomicPtr<c_void>,
+    cb_cursor_enter_obj: AtomicPtr<c_void>,
+    cb_cursor_pos_obj: AtomicPtr<c_void>,
+    cb_key_obj: AtomicPtr<c_void>,
+    cb_mouse_obj: AtomicPtr<c_void>,
+    cb_scroll_obj: AtomicPtr<c_void>,
+    /// org.lwjgl.system.Callback.get(J) 静态方法 ID + Callback 类全局引用（各解析一次）
+    cb_get_mid: AtomicPtr<c_void>,
+    cb_cbcls: AtomicPtr<c_void>,
+    /// 各接口 invoke methodID（解析一次）
+    mid_char: AtomicPtr<c_void>,
+    mid_char_mods: AtomicPtr<c_void>,
+    mid_cursor_enter: AtomicPtr<c_void>,
+    mid_cursor_pos: AtomicPtr<c_void>,
+    mid_key: AtomicPtr<c_void>,
+    mid_mouse: AtomicPtr<c_void>,
+    mid_scroll: AtomicPtr<c_void>,
+
     renderer: AtomicI32,
     windows: Mutex<HashMap<usize, Arc<RenderWindow>>>,
     main_window: Mutex<Option<usize>>,
@@ -265,6 +291,22 @@ fn state() -> &'static State {
         cb_key: AtomicUsize::new(0),
         cb_mouse: AtomicUsize::new(0),
         cb_scroll: AtomicUsize::new(0),
+        cb_char_obj: AtomicPtr::new(ptr::null_mut()),
+        cb_char_mods_obj: AtomicPtr::new(ptr::null_mut()),
+        cb_cursor_enter_obj: AtomicPtr::new(ptr::null_mut()),
+        cb_cursor_pos_obj: AtomicPtr::new(ptr::null_mut()),
+        cb_key_obj: AtomicPtr::new(ptr::null_mut()),
+        cb_mouse_obj: AtomicPtr::new(ptr::null_mut()),
+        cb_scroll_obj: AtomicPtr::new(ptr::null_mut()),
+        cb_get_mid: AtomicPtr::new(ptr::null_mut()),
+        cb_cbcls: AtomicPtr::new(ptr::null_mut()),
+        mid_char: AtomicPtr::new(ptr::null_mut()),
+        mid_char_mods: AtomicPtr::new(ptr::null_mut()),
+        mid_cursor_enter: AtomicPtr::new(ptr::null_mut()),
+        mid_cursor_pos: AtomicPtr::new(ptr::null_mut()),
+        mid_key: AtomicPtr::new(ptr::null_mut()),
+        mid_mouse: AtomicPtr::new(ptr::null_mut()),
+        mid_scroll: AtomicPtr::new(ptr::null_mut()),
         renderer: AtomicI32::new(RENDERER_GL4ES),
         windows: Mutex::new(HashMap::new()),
         main_window: Mutex::new(None),
@@ -382,6 +424,17 @@ pub mod egl {
 
     /// dlopen 渲染层 EGL 实现并解析符号（Pojav egl_loader.c 的 dlsym_EGL 语义）。
     pub fn load_api() -> Option<EglApi> {
+        // host-sim：优先使用内置 EGL-on-GLX 仿真（POJAVEXEC_EGL=sim 显式选择，
+        // 未配置时若系统无渲染层 EGL 也落到仿真）。
+        #[cfg(all(feature = "host-sim", not(target_os = "android")))]
+        {
+            let configured = std::env::var("POJAVEXEC_EGL").unwrap_or_default();
+            if configured.is_empty() || configured == "sim" {
+                log("EGL 使用主机仿真实现（EGL-on-GLX，见 egl_sim.rs）");
+                return Some(crate::egl_sim::api());
+            }
+        }
+
         extern "C" {
             fn dlopen(filename: *const c_char, flag: c_int) -> *mut c_void;
             fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
@@ -504,6 +557,19 @@ unsafe fn call_glfw_void(method_slot: &AtomicPtr<c_void>, label: &str, args: &[j
             tbl.ExceptionClear.unwrap()(env);
             log(&format!("GLFW 回调异常已清除（{label}）"));
         }
+    }
+}
+
+#[cfg(all(feature = "host-sim", not(target_os = "android")))]
+fn s2_cb(name: &str) -> usize {
+    let s = state();
+    match name {
+        "char" => s.cb_char.load(Ordering::Acquire),
+        "curpos" => s.cb_cursor_pos.load(Ordering::Acquire),
+        "key" => s.cb_key.load(Ordering::Acquire),
+        "mouse" => s.cb_mouse.load(Ordering::Acquire),
+        "scroll" => s.cb_scroll.load(Ordering::Acquire),
+        _ => 0,
     }
 }
 
@@ -1122,13 +1188,35 @@ pub extern "C" fn pojav_start_pumping() {
 #[export_name = "pojavPumpEvents"]
 pub extern "C" fn pojav_pump_events(window: *mut c_void) {
     guard!({
+        #[cfg(all(feature = "host-sim", not(target_os = "android")))]
+        {
+            use std::sync::atomic::AtomicUsize;
+            static PUMP_N: AtomicUsize = AtomicUsize::new(0);
+            let n = PUMP_N.fetch_add(1, Ordering::Relaxed);
+            if n < 3 || n % 600 == 0 {
+                log(&format!(
+                    "[diag] pump#{n} cb_slot: char={} curpos={} key={} mouse={} scroll={}",
+                    s2_cb("char"), s2_cb("curpos"), s2_cb("key"), s2_cb("mouse"), s2_cb("scroll")
+                ));
+            }
+        }
         let s = state();
         if s.upd_mouse.load(Ordering::Acquire) {
-            let cb = s.cb_cursor_pos.load(Ordering::Acquire);
-            if cb != 0 {
-                let cursor = *s.cursor.lock().unwrap();
-                let f: unsafe extern "system" fn(*mut c_void, f64, f64) = std::mem::transmute(cb);
-                unsafe { f(window, cursor.0, cursor.1) };
+            let cursor = *s.cursor.lock().unwrap();
+            // v0.2.5 直调优先；未就绪时回退旧闭包路径
+            let direct = unsafe {
+                invoke_direct(
+                    &s.cb_cursor_pos_obj,
+                    &s.mid_cursor_pos,
+                    &[jvalue { j: window as jlong }, jvalue { d: cursor.0 }, jvalue { d: cursor.1 }],
+                )
+            };
+            if !direct {
+                let cb = s.cb_cursor_pos.load(Ordering::Acquire);
+                if cb != 0 {
+                    let f: unsafe extern "system" fn(*mut c_void, f64, f64) = std::mem::transmute(cb);
+                    unsafe { f(window, cursor.0, cursor.1) };
+                }
             }
         }
         if s.upd_monitor.load(Ordering::Acquire) {
@@ -1138,48 +1226,113 @@ pub extern "C" fn pojav_pump_events(window: *mut c_void) {
         for ev in events {
             match ev.typ {
                 EVENT_TYPE_CHAR => {
-                    let cb = s.cb_char.load(Ordering::Acquire);
-                    if cb != 0 {
-                        let f: unsafe extern "system" fn(*mut c_void, u32) = std::mem::transmute(cb);
-                        unsafe { f(window, ev.i1 as u32) };
+                    let direct = unsafe {
+                        invoke_direct(
+                            &s.cb_char_obj,
+                            &s.mid_char,
+                            &[jvalue { j: window as jlong }, jvalue { i: ev.i1 }],
+                        )
+                    };
+                    if !direct {
+                        let cb = s.cb_char.load(Ordering::Acquire);
+                        if cb != 0 {
+                            let f: unsafe extern "system" fn(*mut c_void, u32) = std::mem::transmute(cb);
+                            unsafe { f(window, ev.i1 as u32) };
+                        }
                     }
                 }
                 EVENT_TYPE_CHAR_MODS => {
-                    let cb = s.cb_char_mods.load(Ordering::Acquire);
-                    if cb != 0 {
-                        let f: unsafe extern "system" fn(*mut c_void, u32, i32) = std::mem::transmute(cb);
-                        unsafe { f(window, ev.i1 as u32, ev.i2) };
+                    let direct = unsafe {
+                        invoke_direct(
+                            &s.cb_char_mods_obj,
+                            &s.mid_char_mods,
+                            &[jvalue { j: window as jlong }, jvalue { i: ev.i1 }, jvalue { i: ev.i2 }],
+                        )
+                    };
+                    if !direct {
+                        let cb = s.cb_char_mods.load(Ordering::Acquire);
+                        if cb != 0 {
+                            let f: unsafe extern "system" fn(*mut c_void, u32, i32) = std::mem::transmute(cb);
+                            unsafe { f(window, ev.i1 as u32, ev.i2) };
+                        }
                     }
                 }
                 EVENT_TYPE_CURSOR_ENTER => {
-                    let cb = s.cb_cursor_enter.load(Ordering::Acquire);
-                    if cb != 0 {
-                        let f: unsafe extern "system" fn(*mut c_void, i32) = std::mem::transmute(cb);
-                        unsafe { f(window, ev.i1) };
+                    let direct = unsafe {
+                        invoke_direct(
+                            &s.cb_cursor_enter_obj,
+                            &s.mid_cursor_enter,
+                            &[jvalue { j: window as jlong }, jvalue { z: ev.i1 as u8 }],
+                        )
+                    };
+                    if !direct {
+                        let cb = s.cb_cursor_enter.load(Ordering::Acquire);
+                        if cb != 0 {
+                            let f: unsafe extern "system" fn(*mut c_void, i32) = std::mem::transmute(cb);
+                            unsafe { f(window, ev.i1) };
+                        }
                     }
                 }
                 EVENT_TYPE_KEY => {
-                    let cb = s.cb_key.load(Ordering::Acquire);
-                    if cb != 0 {
-                        let f: unsafe extern "system" fn(*mut c_void, i32, i32, i32, i32) =
-                            std::mem::transmute(cb);
-                        unsafe { f(window, ev.i1, ev.i2, ev.i3, ev.i4) };
+                    let direct = unsafe {
+                        invoke_direct(
+                            &s.cb_key_obj,
+                            &s.mid_key,
+                            &[
+                                jvalue { j: window as jlong },
+                                jvalue { i: ev.i1 },
+                                jvalue { i: ev.i2 },
+                                jvalue { i: ev.i3 },
+                                jvalue { i: ev.i4 },
+                            ],
+                        )
+                    };
+                    if !direct {
+                        let cb = s.cb_key.load(Ordering::Acquire);
+                        if cb != 0 {
+                            let f: unsafe extern "system" fn(*mut c_void, i32, i32, i32, i32) =
+                                std::mem::transmute(cb);
+                            unsafe { f(window, ev.i1, ev.i2, ev.i3, ev.i4) };
+                        }
                     }
                 }
                 EVENT_TYPE_MOUSE_BUTTON => {
-                    let cb = s.cb_mouse.load(Ordering::Acquire);
-                    if cb != 0 {
-                        let f: unsafe extern "system" fn(*mut c_void, i32, i32, i32) =
-                            std::mem::transmute(cb);
-                        unsafe { f(window, ev.i1, ev.i2, ev.i3) };
+                    let direct = unsafe {
+                        invoke_direct(
+                            &s.cb_mouse_obj,
+                            &s.mid_mouse,
+                            &[
+                                jvalue { j: window as jlong },
+                                jvalue { i: ev.i1 },
+                                jvalue { i: ev.i2 },
+                                jvalue { i: ev.i3 },
+                            ],
+                        )
+                    };
+                    if !direct {
+                        let cb = s.cb_mouse.load(Ordering::Acquire);
+                        if cb != 0 {
+                            let f: unsafe extern "system" fn(*mut c_void, i32, i32, i32) =
+                                std::mem::transmute(cb);
+                            unsafe { f(window, ev.i1, ev.i2, ev.i3) };
+                        }
                     }
                 }
                 EVENT_TYPE_SCROLL => {
-                    let cb = s.cb_scroll.load(Ordering::Acquire);
-                    if cb != 0 {
-                        let f: unsafe extern "system" fn(*mut c_void, f64, f64) =
-                            std::mem::transmute(cb);
-                        unsafe { f(window, ev.dx, ev.dy) };
+                    let direct = unsafe {
+                        invoke_direct(
+                            &s.cb_scroll_obj,
+                            &s.mid_scroll,
+                            &[jvalue { j: window as jlong }, jvalue { d: ev.dx }, jvalue { d: ev.dy }],
+                        )
+                    };
+                    if !direct {
+                        let cb = s.cb_scroll.load(Ordering::Acquire);
+                        if cb != 0 {
+                            let f: unsafe extern "system" fn(*mut c_void, f64, f64) =
+                                std::mem::transmute(cb);
+                            unsafe { f(window, ev.dx, ev.dy) };
+                        }
                     }
                 }
                 _ => {}
@@ -1424,48 +1577,219 @@ pub unsafe extern "system" fn Java_org_lwjgl_glfw_CallbackBridge_nativeSetGrabbi
 // jar 契约：GLFW native 方法
 // ---------------------------------------------------------------------------
 
+/// 【v0.2.5 直调修复】设备实机（bionic liblwjgl 的 libffi 闭包）首次触发回调即
+/// SIGSEGV pc=0（两次崩溃同指纹：pc=0、lr=匿名段+0x99a8、参数 (window,0,1,0)=
+/// 左键按下 = 标题屏第一下触摸）；同一 jar + 同一桥在主机沙箱复现同链路却完全
+/// 稳定 —— 闭包蹦床在设备环境不可用。对策：注册回调时经 jar 自带的
+/// `Callback.get(蹦床指针)` 反查 Java 回调对象并缓存全局引用 + 各接口
+/// `invoke` methodID；pump 派发改走 `CallVoidMethodA`（A 变体，无 varargs）
+/// 直接调 `GLFWxxCallbackI.invoke`，libffi 闭包整段绕开。解析失败自动回退
+/// 旧闭包路径（不同 jar 版本的兼容安全网）。
+
+/// Callback.get(J) 静态方法 ID + Callback 类全局引用（惰性解析一次）。
+unsafe fn ensure_cb_get_mid(env: EnvPtr) -> jmethodID {
+    let s = state();
+    let cached = s.cb_get_mid.load(Ordering::Acquire) as jmethodID;
+    if !cached.is_null() {
+        return cached;
+    }
+    let tbl = unsafe { env_tbl(env) };
+    let cls = (tbl.FindClass.unwrap())(env, c"org/lwjgl/system/Callback".as_ptr());
+    if cls.is_null() {
+        tbl.ExceptionClear.unwrap()(env);
+        return ptr::null_mut();
+    }
+    let mid = (tbl.GetStaticMethodID.unwrap())(
+        env,
+        cls,
+        c"get".as_ptr(),
+        c"(J)Lorg/lwjgl/system/CallbackI;".as_ptr(),
+    );
+    if mid.is_null() {
+        tbl.ExceptionClear.unwrap()(env);
+    }
+    let gcls = (tbl.NewGlobalRef.unwrap())(env, cls);
+    (tbl.DeleteLocalRef.unwrap())(env, cls);
+    s.cb_get_mid.store(mid as *mut c_void, Ordering::Release);
+    s.cb_cbcls.store(gcls as *mut c_void, Ordering::Release);
+    mid
+}
+
+/// 接口 invoke methodID（每类型解析一次）。iface 如 "org/lwjgl/glfw/GLFWMouseButtonCallbackI"。
+unsafe fn ensure_invoke_mid(
+    env: EnvPtr,
+    iface: &str,
+    sig: &str,
+    slot: &AtomicPtr<c_void>,
+) -> jmethodID {
+    let cached = slot.load(Ordering::Acquire) as jmethodID;
+    if !cached.is_null() {
+        return cached;
+    }
+    let tbl = unsafe { env_tbl(env) };
+    let cls_name = CString::new(iface).unwrap();
+    let cls = (tbl.FindClass.unwrap())(env, cls_name.as_ptr());
+    if cls.is_null() {
+        tbl.ExceptionClear.unwrap()(env);
+        return ptr::null_mut();
+    }
+    let sig_c = CString::new(sig).unwrap();
+    let mid = (tbl.GetMethodID.unwrap())(env, cls, c"invoke".as_ptr(), sig_c.as_ptr());
+    if mid.is_null() {
+        tbl.ExceptionClear.unwrap()(env);
+    }
+    (tbl.DeleteLocalRef.unwrap())(env, cls);
+    if !mid.is_null() {
+        slot.store(mid as *mut c_void, Ordering::Release);
+    }
+    mid
+}
+
+/// 注册线程（持 env）：蹦床指针 -> Callback.get 反查 Java 对象 -> 全局引用存 obj_slot。
+/// ptr=0 时清空对象槽。任何失败都静默降级（pump 见空对象槽自动回退闭包路径）。
+unsafe fn register_callback_object(
+    env: EnvPtr,
+    obj_slot: &AtomicPtr<c_void>,
+    mid_slot: &AtomicPtr<c_void>,
+    ptr: jlong,
+    iface: &str,
+    sig: &str,
+) {
+    let tbl = unsafe { env_tbl(env) };
+    let old = obj_slot.swap(ptr::null_mut(), Ordering::AcqRel);
+    if !old.is_null() {
+        (tbl.DeleteGlobalRef.unwrap())(env, old as jobject);
+    }
+    if ptr == 0 {
+        return;
+    }
+    let get_mid = unsafe { ensure_cb_get_mid(env) };
+    if get_mid.is_null() {
+        log("Callback.get 未解析（回调走旧闭包路径）");
+        return;
+    }
+    let s = state();
+    let cls = s.cb_cbcls.load(Ordering::Acquire) as jclass;
+    if cls.is_null() {
+        return;
+    }
+    let args = [jvalue { j: ptr }];
+    let obj = (tbl.CallStaticObjectMethodA.unwrap())(env, cls, get_mid, args.as_ptr());
+    if tbl.ExceptionCheck.unwrap()(env) != 0 {
+        tbl.ExceptionClear.unwrap()(env);
+        log("Callback.get 调用异常（回调走旧闭包路径）");
+        return;
+    }
+    if obj.is_null() {
+        return;
+    }
+    let gref = (tbl.NewGlobalRef.unwrap())(env, obj);
+    (tbl.DeleteLocalRef.unwrap())(env, obj);
+    if gref.is_null() {
+        return;
+    }
+    let mid = unsafe { ensure_invoke_mid(env, iface, sig, mid_slot) };
+    if mid.is_null() {
+        log(&format!("invoke methodID 未解析（{iface}，回调走旧闭包路径）"));
+        (tbl.DeleteGlobalRef.unwrap())(env, gref);
+        return;
+    }
+    obj_slot.store(gref as *mut c_void, Ordering::Release);
+    log(&format!("回调直调就绪（{iface}）"));
+}
+
+/// pump 派发：直调 invoke（CallVoidMethodA，无 varargs）。返回 false = 回退闭包路径。
+unsafe fn invoke_direct(
+    obj_slot: &AtomicPtr<c_void>,
+    mid_slot: &AtomicPtr<c_void>,
+    args: &[jvalue],
+) -> bool {
+    let obj = obj_slot.load(Ordering::Acquire) as jobject;
+    let mid = mid_slot.load(Ordering::Acquire) as jmethodID;
+    if obj.is_null() || mid.is_null() {
+        return false;
+    }
+    let Some(env) = (unsafe { runtime_env() }) else { return false };
+    let tbl = unsafe { env_tbl(env) };
+    let Some(call) = tbl.CallVoidMethodA else { return false };
+    if tbl.ExceptionCheck.unwrap()(env) != 0 {
+        tbl.ExceptionClear.unwrap()(env);
+    }
+    call(env, obj, mid, args.as_ptr());
+    if tbl.ExceptionCheck.unwrap()(env) != 0 {
+        tbl.ExceptionClear.unwrap()(env);
+        log("Java 回调异常已清除（直调路径）");
+    }
+    true
+}
+
+
 /// 回调槽位写入 State.cb_*（pojav_pump_events 同源读取）。
 /// v0.2.3 修复：此前宏写入模块级 static、泵读 State 字段，两处存储互不连通，
 /// 游戏注册的全部 GLFW 回调（光标/按键/鼠标/滚轮）实际落空 —— 实机表现为
 /// 触摸/虚拟按键全无响应（2026-11-24 实测根因）。
 macro_rules! jni_callback_setter {
-    ($symbol:ident, $slot:ident) => {
+    ($symbol:ident, $slot:ident, $obj_slot:ident, $mid_slot:ident, $iface:literal, $sig:literal) => {
         #[no_mangle]
         pub unsafe extern "system" fn $symbol(
-            _env: *mut JNIEnv,
+            env: *mut JNIEnv,
             _class: jclass,
             _window: jlong,
             callback: jlong,
         ) -> jlong {
-            state().$slot.swap(callback as usize, Ordering::AcqRel) as jlong
+            let old = state().$slot.swap(callback as usize, Ordering::AcqRel) as jlong;
+            guard!({
+                // v0.2.5：注册即反查 Java 对象 + invoke methodID（失败降级闭包路径）
+                unsafe {
+                    register_callback_object(
+                        env,
+                        &state().$obj_slot,
+                        &state().$mid_slot,
+                        callback,
+                        $iface,
+                        $sig,
+                    )
+                };
+            });
+            old
         }
     };
 }
 
 jni_callback_setter!(
     Java_org_lwjgl_glfw_GLFW_nglfwSetCharCallback,
-    cb_char
+    cb_char, cb_char_obj, mid_char,
+    "org/lwjgl/glfw/GLFWCharCallbackI", "(JI)V"
 );
 jni_callback_setter!(
     Java_org_lwjgl_glfw_GLFW_nglfwSetCharModsCallback,
-    cb_char_mods
+    cb_char_mods, cb_char_mods_obj, mid_char_mods,
+    "org/lwjgl/glfw/GLFWCharModsCallbackI", "(JII)V"
 );
 jni_callback_setter!(
     Java_org_lwjgl_glfw_GLFW_nglfwSetCursorEnterCallback,
-    cb_cursor_enter
+    cb_cursor_enter, cb_cursor_enter_obj, mid_cursor_enter,
+    "org/lwjgl/glfw/GLFWCursorEnterCallbackI", "(JZ)V"
 );
 jni_callback_setter!(
     Java_org_lwjgl_glfw_GLFW_nglfwSetCursorPosCallback,
-    cb_cursor_pos
+    cb_cursor_pos, cb_cursor_pos_obj, mid_cursor_pos,
+    "org/lwjgl/glfw/GLFWCursorPosCallbackI", "(JDD)V"
 );
-jni_callback_setter!(Java_org_lwjgl_glfw_GLFW_nglfwSetKeyCallback, cb_key);
+jni_callback_setter!(
+    Java_org_lwjgl_glfw_GLFW_nglfwSetKeyCallback,
+    cb_key, cb_key_obj, mid_key,
+    "org/lwjgl/glfw/GLFWKeyCallbackI", "(JIIII)V"
+);
 jni_callback_setter!(
     Java_org_lwjgl_glfw_GLFW_nglfwSetMouseButtonCallback,
-    cb_mouse
+    cb_mouse, cb_mouse_obj, mid_mouse,
+    "org/lwjgl/glfw/GLFWMouseButtonCallbackI", "(JIII)V"
 );
 jni_callback_setter!(
     Java_org_lwjgl_glfw_GLFW_nglfwSetScrollCallback,
-    cb_scroll
+    cb_scroll, cb_scroll_obj, mid_scroll,
+    "org/lwjgl/glfw/GLFWScrollCallbackI", "(JDD)V"
 );
 
 #[no_mangle]
