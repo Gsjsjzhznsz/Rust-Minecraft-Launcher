@@ -17,8 +17,13 @@
 /* —— bionic 系统接口（手工声明，规避 glibc sysroot 头文件）—— */
 #define PROP_VALUE_MAX 92
 
-extern int __system_property_get(const char* name, char* value);
-extern int __system_property_set(const char* key, const char* value);
+/* 弱引用（weak）：Android 15+ 的 bionic libc 可能将 __system_property_* 归入
+ * LIBC_PRIVATE，无版本 UND 引用按名解析失败会让 dlopen 整体失败（实机
+ * 2026-11 v0.2.1 实证）。弱引用未解析时值为 NULL，运行时判空走默认值路径
+ * —— dlopen 必成功，属性有则读、无则缺省（Mesa 的 zink 驱动选择由环境
+ * 变量 GALLIUM_DRIVER/MESA_LOADER_DRIVER_OVERRIDE 锁定，不依赖属性）。 */
+extern int __system_property_get(const char* name, char* value) __attribute__((weak));
+extern int __system_property_set(const char* key, const char* value) __attribute__((weak));
 
 /* —— nostdlib 自实现工具 —— */
 static unsigned long qz_len(const char* s) {
@@ -43,7 +48,7 @@ static void qz_copyz(char* d, const char* s) {
 /* —— property API（AOSP 语义）—— */
 int property_get(const char* key, char* value, const char* default_value) {
     if (!value) return 0;
-    if (key && __system_property_get(key, value) > 0) {
+    if (key && __system_property_get && __system_property_get(key, value) > 0) {
         return (int)qz_len(value);
     }
     if (default_value) {
@@ -55,7 +60,10 @@ int property_get(const char* key, char* value, const char* default_value) {
 }
 
 int property_set(const char* key, const char* value) {
-    return __system_property_set(key, value ? value : "");
+    if (__system_property_set) {
+        return __system_property_set(key, value ? value : "");
+    }
+    return 0;
 }
 
 int property_get_bool(const char* key, char default_value) {

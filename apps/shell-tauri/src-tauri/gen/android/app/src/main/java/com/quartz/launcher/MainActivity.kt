@@ -210,7 +210,8 @@ class MainActivity : TauriActivity() {
       webView?.visibility = View.GONE
       window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
       val gv = GameView(this)
-      val controls = GameControls(this)
+      val controls = GameControls(this, gv)
+      gv.controls = controls
       gameView = gv
       gameControls = controls
       content.addView(
@@ -268,7 +269,7 @@ class MainActivity : TauriActivity() {
 
   /** 游戏鼠标 grab 状态变化（QuartzBridge 经静态方法回调）。 */
   fun onGrabStateChanged(grabbed: Boolean) {
-    gameControls?.alpha = if (grabbed) 1f else 0.85f
+    gameControls?.setGrabbed(grabbed)
   }
 
   // ------------------------------------------------------------------

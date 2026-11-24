@@ -1547,56 +1547,6 @@ unsafe fn run_game_from_spec(
     }
     eprintln!("[quartz] :game 进程内 JVM 创建成功（OpenJDK 17，与 ART 并存）");
 
-    // v0.2.0-e 诊断：回读 JVM 侧 java.class.path / java.library.path 实际值 ——
-    // 「主类未找到」时区分「属性未生效」与「jar 不可读」两类根因。
-    {
-        let tbl = &**env;
-        let sys_cls = (tbl.FindClass.unwrap())(env, c"java/lang/System".as_ptr());
-        if sys_cls.is_null() {
-            (tbl.ExceptionClear.unwrap())(env);
-            eprintln!("[quartz][diag] java/lang/System 定位失败（异常环境）");
-        } else if let Some(mid) = {
-            let m = (tbl.GetStaticMethodID.unwrap())(
-                env,
-                sys_cls,
-                c"getProperty".as_ptr(),
-                c"(Ljava/lang/String;)Ljava/lang/String;".as_ptr(),
-            );
-            if m.is_null() {
-                (tbl.ExceptionClear.unwrap())(env);
-                None
-            } else {
-                Some(m)
-            }
-        } {
-            for key in ["java.class.path", "java.library.path"] {
-                let jkey = (tbl.NewStringUTF.unwrap())(env, key.as_ptr());
-                let jargs = [jni_sys::jvalue { l: jkey }];
-                let jval = (tbl.CallStaticObjectMethodA.unwrap())(env, sys_cls, mid, jargs.as_ptr());
-                if (tbl.ExceptionCheck.unwrap())(env) != 0 {
-                    (tbl.ExceptionClear.unwrap())(env);
-                    continue;
-                }
-                if jval.is_null() {
-                    eprintln!("[quartz][diag] JVM 属性 {key} = <null>（未生效！）");
-                    continue;
-                }
-                let p = (tbl.GetStringUTFChars.unwrap())(env, jval, ptr::null_mut());
-                if p.is_null() {
-                    (tbl.ExceptionClear.unwrap())(env);
-                    continue;
-                }
-                let s = CStr::from_ptr(p).to_string_lossy().into_owned();
-                (tbl.ReleaseStringUTFChars.unwrap())(env, jval, p);
-                let head: String = s.chars().take(240).collect();
-                eprintln!("[quartz][diag] JVM 属性 {key}：len={} head={head}", s.len());
-            }
-        }
-        if (tbl.ExceptionCheck.unwrap())(env) != 0 {
-            (tbl.ExceptionClear.unwrap())(env);
-        }
-    }
-
     // JVM 初始化会覆盖 SIGABRT 处理器（HotSpot 崩溃报告用）：重装拦截 ——
     // HotSpot 写完 hs_err 后调用 abort()，仍落入本拦截（干净退出，不惊动系统）。
     install_fatal_signal_handlers();
@@ -1650,6 +1600,57 @@ unsafe fn run_game_from_spec(
             (tbl.ExceptionClear.unwrap())(env);
         }
     }
+
+    // v0.2.0-e 诊断：回读 JVM 侧 java.class.path / java.library.path 实际值 ——
+    // 「主类未找到」时区分「属性未生效」与「jar 不可读」两类根因。
+    {
+        let tbl = &**env;
+        let sys_cls = (tbl.FindClass.unwrap())(env, c"java/lang/System".as_ptr());
+        if sys_cls.is_null() {
+            (tbl.ExceptionClear.unwrap())(env);
+            eprintln!("[quartz][diag] java/lang/System 定位失败（异常环境）");
+        } else if let Some(mid) = {
+            let m = (tbl.GetStaticMethodID.unwrap())(
+                env,
+                sys_cls,
+                c"getProperty".as_ptr(),
+                c"(Ljava/lang/String;)Ljava/lang/String;".as_ptr(),
+            );
+            if m.is_null() {
+                (tbl.ExceptionClear.unwrap())(env);
+                None
+            } else {
+                Some(m)
+            }
+        } {
+            for key in ["java.class.path", "java.library.path"] {
+                let jkey = (tbl.NewStringUTF.unwrap())(env, key.as_ptr());
+                let jargs = [jni_sys::jvalue { l: jkey }];
+                let jval = (tbl.CallStaticObjectMethodA.unwrap())(env, sys_cls, mid, jargs.as_ptr());
+                if (tbl.ExceptionCheck.unwrap())(env) != 0 {
+                    (tbl.ExceptionClear.unwrap())(env);
+                    continue;
+                }
+                if jval.is_null() {
+                    eprintln!("[quartz][diag] JVM 属性 {key} = <null>（未生效！）");
+                    continue;
+                }
+                let p = (tbl.GetStringUTFChars.unwrap())(env, jval, ptr::null_mut());
+                if p.is_null() {
+                    (tbl.ExceptionClear.unwrap())(env);
+                    continue;
+                }
+                let s = CStr::from_ptr(p).to_string_lossy().into_owned();
+                (tbl.ReleaseStringUTFChars.unwrap())(env, jval, p);
+                let head: String = s.chars().take(240).collect();
+                eprintln!("[quartz][diag] JVM 属性 {key}：len={} head={head}", s.len());
+            }
+        }
+        if (tbl.ExceptionCheck.unwrap())(env) != 0 {
+            (tbl.ExceptionClear.unwrap())(env);
+        }
+    }
+
 
     // 9) 定位主类并调用 main
     let main_path = format!("{}", spec.main_class.replace('.', "/"));
