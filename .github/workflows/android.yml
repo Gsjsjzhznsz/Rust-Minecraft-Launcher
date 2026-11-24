@@ -1,0 +1,107 @@
+name: Android APK CI
+
+# Quartz Android debug APK 云端构建：
+# - 每次从零构建，不依赖本地沙箱工具链（rust/SDK/NDK/JDK 由 ensure-toolchain.sh 幂等安装）
+# - 手动触发可指定 release_tag 直接发 GitHub Release（APK 持久化）
+# - 推送 v* tag 自动构建并发布
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "发布 Release 的 tag（如 v0.2.2）；留空则只构建不发布"
+        required: false
+        default: ""
+      release_notes:
+        description: "Release 说明（支持 Markdown）"
+        required: false
+        default: ""
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: android-ci
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 构建脚本硬编码 /home/z/my-project 与 /tmp/my-project，
+      # CI 上用符号链接对齐，避免改动所有脚本（本地行为不变）
+      - name: 路径兼容层
+        run: |
+          sudo mkdir -p /home/z
+          sudo ln -sfn "$GITHUB_WORKSPACE" /home/z/my-project
+          mkdir -p /tmp/my-project/.qz-tmp /tmp/my-project/.qz-cargo-target /tmp/my-project/.qz-gradle-home /tmp/my-project/.qz-gradle-build
+          echo "path shim OK: $(readlink -f /home/z/my-project)"
+
+      # 幂等安装 rust(aarch64-linux-android) / tauri-cli / SDK(platform36+build-tools36) / NDK27 / JDK21
+      # 与本地 scripts/ensure-toolchain.sh 完全一致，保证 CI 与本地产物可复现
+      - name: 构建工具链
+        run: sh scripts/ensure-toolchain.sh
+
+      - name: UI 依赖
+        run: npm ci --prefix apps/shell-tauri/ui
+
+      # ① Rust 显示桥（release）→ libpojavexec.so
+      # ② 退出捕获 hook jar（javac --release 17）
+      # ③ tauri android build --apk --debug --target aarch64
+      - name: 构建（桥 + hook + 壳层 APK）
+        run: sh scripts/build-android.sh
+
+      # strip 壳层 so → repack → zipalign -P 16 → apksigner（repo 内 debug keystore）→ 验证
+      - name: 打包收尾
+        run: sh scripts/finalize_apk.sh
+
+      - name: 产物信息
+        run: |
+          ls -la /home/z/my-project/download/Quartz.apk
+          sha256sum /home/z/my-project/download/Quartz.apk
+
+      - name: 上传 Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Quartz-debug-apk
+          path: /home/z/my-project/download/Quartz.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      # 发 GitHub Release（手动触发填了 release_tag，或 v* tag 推送）
+      - name: 发布 Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REL_TAG: ${{ inputs.release_tag }}
+          REL_NOTES: ${{ inputs.release_notes }}
+        run: |
+          set -e
+          TAG="$REL_TAG"
+          if [ -z "$TAG" ] && [ "${GITHUB_REF_TYPE:-branch}" = "tag" ]; then
+            TAG="$GITHUB_REF_NAME"
+          fi
+          if [ -z "$TAG" ]; then
+            echo "[ci] 未指定 release_tag，跳过发布（仅上传 Artifact）"
+            exit 0
+          fi
+          cp /home/z/my-project/download/Quartz.apk "/tmp/Quartz-${TAG}.apk"
+          NOTES="$REL_NOTES"
+          if [ -z "$NOTES" ]; then
+            NOTES=$(printf '%b' "Quartz Android debug APK（自动构建）。\n\n- 包名：\`com.quartz.launcher\`\n- ABI：arm64-v8a\n- 构建提交：${GITHUB_SHA}\n- 安装前请先卸载旧版本（签名变更会导致安装失败）")
+          fi
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "/tmp/Quartz-${TAG}.apk" --clobber
+            echo "[ci] 已上传资产到已有 Release $TAG"
+          else
+            gh release create "$TAG" "/tmp/Quartz-${TAG}.apk" \
+              --title "Quartz ${TAG}" \
+              --notes "$NOTES" \
+              --target "$GITHUB_SHA"
+            echo "[ci] Release $TAG 已创建"
+          fi

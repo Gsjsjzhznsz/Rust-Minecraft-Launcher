@@ -22,7 +22,16 @@ elif [ -x /tmp/apkwork/btbin/usr/bin/aarch64-linux-gnu-strip ]; then
 fi
 [ -n "$STRIP_BIN" ] || { echo "[pack] ERROR: no aarch64 strip tool found"; exit 1; }
 echo "[pack] strip tool: $STRIP_BIN"
-SRC_APK=${QUARTZ_RAW_APK:-/home/z/my-project/apps/shell-tauri/src-tauri/gen/android/app/build/outputs/apk/universal/debug/app-universal-debug.apk}
+# SRC_APK 自动探测：环境变量 > gradle 重定向输出（buildDirectory 指向 /tmp）> 常规 gen/android 输出
+SRC_APK=${QUARTZ_RAW_APK:-}
+if [ -z "$SRC_APK" ]; then
+  for c in /tmp/my-project/.qz-gradle-build/app/outputs/apk/universal/debug/app-universal-debug.apk \
+           /home/z/my-project/apps/shell-tauri/src-tauri/gen/android/app/build/outputs/apk/universal/debug/app-universal-debug.apk; do
+    [ -f "$c" ] && { SRC_APK="$c"; break; }
+  done
+fi
+[ -n "$SRC_APK" ] && [ -f "$SRC_APK" ] || { echo "[pack] ERROR: 找不到壳层 APK（设置 QUARTZ_RAW_APK 或先跑 build-android.sh）"; exit 1; }
+echo "[pack] SRC_APK: $SRC_APK"
 OUT_APK=/home/z/my-project/download/Quartz.apk
 KS=/home/z/my-project/keystore/quartz-debug.keystore
 

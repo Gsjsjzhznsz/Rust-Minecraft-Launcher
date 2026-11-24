@@ -26,6 +26,7 @@ if [ ! -x "$TC/npm-global/bin/tauri" ]; then
   npm install -g @tauri-apps/cli@^2 >/tmp/npm-tauri.log 2>&1
 fi
 ln -sf "$TC/npm-global/bin/tauri" "$TC/bin/cargo-tauri" 2>/dev/null || true
+mkdir -p "$TC/bin"
 
 echo "=== [3/4] Android SDK（cmdline-tools + platform 36 + build-tools 36 + NDK 27）==="
 SDK="$TC/android-sdk"

@@ -7,14 +7,14 @@ export TMPDIR=/tmp/my-project/.qz-tmp
 export CARGO_TARGET_DIR=/tmp/my-project/.qz-cargo-target
 export GRADLE_USER_HOME=/tmp/my-project/.qz-gradle-home
 export _JAVA_OPTIONS="-Djava.io.tmpdir=/tmp/my-project/.qz-tmp"
-# NDK 工具链（手动 cargo build 时 cc-rs/ring 需要）
-NDKBIN=/home/z/my-project/.toolchain/android-sdk/ndk/27.0.12077973/toolchains/llvm/prebuilt/linux-x86_64/bin
+# NDK 工具链（手动 cargo build 时 cc-rs/ring 需要；NDK_HOME 由 setup-env.sh 提供，本地与 CI 一致）
+NDKBIN=$NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin
 export PATH="$NDKBIN:$PATH"
 export CC_aarch64_linux_android=$NDKBIN/aarch64-linux-android24-clang
 export CXX_aarch64_linux_android=$NDKBIN/aarch64-linux-android24-clang++
 export AR_aarch64_linux_android=$NDKBIN/llvm-ar
 export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$NDKBIN/aarch64-linux-android24-clang
-mkdir -p "$TMPDIR"
+mkdir -p "$TMPDIR" "$CARGO_TARGET_DIR" "$GRADLE_USER_HOME"
 
 # ---- ① 显示桥（release：GL 调度/事件泵在游戏热路径上）----
 cargo build -p quartz-bridge --release --target aarch64-linux-android \
