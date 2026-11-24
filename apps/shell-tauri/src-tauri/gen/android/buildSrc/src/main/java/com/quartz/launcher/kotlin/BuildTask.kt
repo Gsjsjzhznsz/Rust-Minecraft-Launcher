@@ -62,7 +62,13 @@ abstract class BuildTask : DefaultTask() {
         val rootDirRel = rootDirRel ?: throw GradleException("rootDirRel cannot be null")
         val target = target ?: throw GradleException("target cannot be null")
         val release = release ?: throw GradleException("release cannot be null")
-        val args = listOf("/home/z/.npm-global/lib/node_modules/@tauri-apps/cli/tauri.js", "android", "android-studio-script");
+        // tauri-cli JS 入口动态解析（本地与 CI 通用）：
+        // 1) QUARTZ_TAURI_CLI_JS 显式指定  2) NPM_CONFIG_PREFIX 派生（setup-env.sh 已导出）
+        // 3) 旧默认前缀兜底
+        val cliJs = System.getenv("QUARTZ_TAURI_CLI_JS")
+            ?: System.getenv("NPM_CONFIG_PREFIX")?.let { "$it/lib/node_modules/@tauri-apps/cli/tauri.js" }
+            ?: "/home/z/.npm-global/lib/node_modules/@tauri-apps/cli/tauri.js"
+        val args = listOf(cliJs, "android", "android-studio-script");
 
         execOperations.exec {
             workingDir(File(projectDir, rootDirRel))
