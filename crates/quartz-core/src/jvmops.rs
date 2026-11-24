@@ -93,6 +93,8 @@ pub struct PlanInputs<'a> {
     pub natives_root: &'a Path,
     pub assets_root: &'a Path,
     pub versions_root: &'a Path,
+    /// client jar 路径（inheritsFrom 链解析后指向基版本 jar；None = versions/<id>/<id>.jar）。
+    pub client_jar_path: Option<PathBuf>,
     pub instance_dir: &'a Path,
     pub account: &'a Account,
     pub memory_mb: u32,
@@ -123,10 +125,10 @@ pub fn build_launch_plan(input: &PlanInputs) -> Result<LaunchPlan> {
             classpath.push(input.libraries_root.join(rel));
         }
     }
-    let client_jar = input
-        .versions_root
-        .join(&version.id)
-        .join(format!("{}.jar", version.id));
+    let client_jar = match &input.client_jar_path {
+        Some(p) => p.clone(),
+        None => input.versions_root.join(&version.id).join(format!("{}.jar", version.id)),
+    };
     classpath.push(client_jar);
 
     // ---- natives 目录：每个 natives jar 独立子目录，避免 so 冲突 ----
@@ -186,6 +188,21 @@ pub fn build_launch_plan(input: &PlanInputs) -> Result<LaunchPlan> {
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default(),
     );
+    // Fabric/Quilt jvm 参数引用的变量（library_directory = 库仓库根）。
+    vars.insert(
+        "library_directory".into(),
+        input.libraries_root.display().to_string(),
+    );
+    vars.insert("classpath_separator".into(), ":".to_string());
+    // authlib-injector：外置登录账号注入 -javaagent（拦截会话请求到 Yggdrasil 服务器）。
+    if matches!(input.account.kind, crate::auth::AccountKind::Authlib) {
+        if let Some(server) = &input.account.authlib_server {
+            vars.insert("authlib_injector".into(), {
+                let jar = crate::auth::authlib::injector_jar();
+                format!("{}={}", jar.display(), server)
+            });
+        }
+    }
 
     // ---- JVM 参数 ----
     // 现代版本（1.13+）以版本 JSON 的 arguments.jvm 为准，启动器只补缺；
@@ -206,6 +223,21 @@ pub fn build_launch_plan(input: &PlanInputs) -> Result<LaunchPlan> {
     if !jvm_args.iter().any(|s| s == "-cp" || s.starts_with("-cp=")) {
         jvm_args.push("-cp".into());
         jvm_args.push(vars["classpath"].clone());
+    }
+    // authlib-injector agent 参数置于最前（需在游戏类加载前生效）。
+    if let Some(agent) = vars.get("authlib_injector") {
+        jvm_args.insert(0, format!("-javaagent:{}", agent));
+    }
+    // 用户自定义 JVM 参数：追加在计划之后（重复参数如 -Xmx 以用户为准：
+    // Java 实际取后出现的值，因此移除先前的同前缀参数再追加）。
+    let extra = crate::settings::load().extra_jvm_args;
+    if !extra.is_empty() {
+        for a in &extra {
+            if a.starts_with("-Xmx") || a.starts_with("-Xms") {
+                jvm_args.retain(|x| !x.starts_with(&a[..4.min(a.len())]));
+            }
+        }
+        jvm_args.extend(extra);
     }
 
     // ---- 游戏参数 ----
@@ -346,6 +378,7 @@ mod tests {
             natives_root: &root.join("natives"),
             assets_root: &root.join("assets"),
             versions_root: &root.join("versions"),
+            client_jar_path: None,
             instance_dir: &inst,
             account: &account,
             memory_mb: 2048,
@@ -428,6 +461,7 @@ mod tests {
             natives_root: &root.join("natives"),
             assets_root: &root.join("assets"),
             versions_root: &root.join("versions"),
+            client_jar_path: None,
             instance_dir: &inst,
             account: &account,
             memory_mb: 2048,

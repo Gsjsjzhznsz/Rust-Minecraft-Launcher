@@ -1,4 +1,5 @@
-//! 账号体系：离线账号（含离线 UUID 算法）与微软账号（设备码 + XBL 链路）。
+//! 账号体系：离线账号（含离线 UUID 算法）、微软账号（设备码 + XBL 链路）
+//! 与 authlib-injector 外置登录（Yggdrasil 协议，对标 FCL）。
 //!
 //! 合规边界：
 //! - 不缓存明文长期令牌到公共目录；生产实现应接入 OS keychain（iOS Keychain /
@@ -6,6 +7,7 @@
 //! - `microsoft::DEFAULT_CLIENT_ID` 必须使用项目自己在 Azure 注册的
 //!   Public Client ID，禁止硬编码第三方应用的 client_id。
 
+pub mod authlib;
 pub mod microsoft;
 
 use crate::error::{Error, Result};
@@ -17,6 +19,8 @@ use serde::{Deserialize, Serialize};
 pub enum AccountKind {
     Microsoft,
     Offline,
+    /// authlib-injector 外置登录（Yggdrasil 服务器）。
+    Authlib,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -32,6 +36,9 @@ pub struct Account {
     pub refresh_token: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_type: Option<String>,
+    /// authlib 账号：Yggdrasil 认证服务器地址（注入 -javaagent 时使用）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authlib_server: Option<String>,
 }
 
 /// Java `UUID.nameUUIDFromBytes` 的等价实现：MD5 -> RFC4122 v3。
@@ -69,6 +76,7 @@ pub fn offline_account(name: &str) -> Account {
         access_token: "0".to_string(),
         refresh_token: None,
         user_type: Some("legacy".to_string()),
+        authlib_server: None,
     }
 }
 
@@ -129,6 +137,11 @@ pub fn save_store(store: &AccountsStore) -> Result<()> {
 pub fn add_offline_account(name: &str) -> Result<Account> {
     let name = validate_username(name)?;
     let account = offline_account(&name);
+    add_account(account)
+}
+
+/// 写入/更新任意账号并置为选中（微软 / authlib 登录成功后调用）。
+pub fn add_account(account: Account) -> Result<Account> {
     let mut store = load_store()?;
     store.accounts.retain(|a| a.uuid != account.uuid);
     store.accounts.push(account.clone());

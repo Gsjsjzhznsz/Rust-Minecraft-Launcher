@@ -176,6 +176,24 @@ impl InstanceStore {
         }
         Ok(true)
     }
+
+    /// 修改实例字段（渲染器 / 内存 / loader 等），原子写回索引。
+    pub fn update(&self, id: &str, patch: impl FnOnce(&mut Instance)) -> Result<Instance> {
+        let mut instances = self.load()?;
+        let inst = instances
+            .iter_mut()
+            .find(|i| i.id == id)
+            .ok_or_else(|| crate::error::Error::Other(format!("实例不存在：{id}")))?;
+        patch(inst);
+        let updated = inst.clone();
+        self.save(&instances)?;
+        Ok(updated)
+    }
+
+    /// 按 id 查找实例（不存在返回 None）。
+    pub fn get(&self, id: &str) -> Result<Option<Instance>> {
+        Ok(self.load()?.into_iter().find(|i| i.id == id))
+    }
 }
 
 /// 返回 ISO8601/UTC 风格时间戳（秒精度）。
@@ -370,8 +388,6 @@ pub async fn install_standard(
         }
     }
 
-    let total: u64 = tasks.iter().filter_map(|t| t.size).sum();
-
     // 存储空间前置检查：只统计真正缺失的任务（重试时已存在文件不计入需求），
     // 外加 64MB 对齐/临时副本余量。空间不足在此给出可行动报错，
     // 而不是下到一半 ENOSPC（os error 28）。
@@ -393,6 +409,16 @@ pub async fn install_standard(
         .map_err(crate::error::Error::Other)?;
     }
 
+    // ⑥ 并行下载（共享执行器，进度换算与失败聚合一致）
+    execute_download_plan(tasks, &progress).await
+}
+
+/// 共享下载执行器：8 并发、SHA-1 校验、断点跳过、失败聚合与进度上报。
+/// install_standard 与 install_loader 共用，保证两类安装的进度语义一致。
+pub async fn execute_download_plan(
+    tasks: Vec<crate::download::DownloadTask>,
+    progress: &tokio::sync::mpsc::Sender<DownloadProgress>,
+) -> Result<()> {
     // 任务元数据：label -> (stage, size, dest)（供进度换算与跳过补算）
     let mut meta_by_label = std::collections::BTreeMap::new();
     for t in &tasks {
@@ -409,10 +435,19 @@ pub async fn install_standard(
     // ⑥ 并行下载：8 并发、单文件 3 次重试、SHA-1 校验、.qz-part 原子改名
     let (tx, mut rx) = tokio::sync::mpsc::channel::<crate::download::ProgressEvent>(64);
     let plan = crate::download::DownloadPlan::new(tasks);
-    let exec_client = client.clone();
+    let exec_client = crate::meta::http_client();
     let exec = tokio::spawn(async move {
         crate::download::execute(&plan, &exec_client, DOWNLOAD_CONCURRENCY, tx).await
     });
+
+    let total: u64 = {
+        // plan 已被 move，从元数据聚合总字节
+        meta_by_label
+            .values()
+            .map(|(_, sz, _)| *sz)
+            .sum::<u64>()
+            .max(0)
+    };
 
     let mut done_bytes: u64 = 0;
     let mut last_emit = std::time::Instant::now() - std::time::Duration::from_secs(1);
@@ -478,11 +513,343 @@ pub async fn install_standard(
     }
 
     send_progress(
-        &progress,
+        progress,
         download_progress("done", "", total, total, true, None),
     )
     .await;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Modloader 安装（Fabric / Quilt / Forge / NeoForge / OptiFine）
+//
+// 对标 FCL / ZL2 的安装器编排：
+// - Fabric / Quilt：官方 meta profile JSON（自带 inheritsFrom）直接落位为
+//   版本 JSON，再下载其 libraries —— 纯 Rust，不需要跑 JVM 安装器；
+// - Forge / NeoForge：下载官方 installer，用已装运行时 java 以
+//   `--installClient` 无头模式安装（官方支持，写 versions/<id>/ 与 libraries）；
+// - OptiFine：BMCLAPI 直装包 + 自生成 tweaker 版本 JSON（1.12- 完整支持；
+//   1.13+ OptiFine 官方安装器需 GUI patch，暂不承诺）。
+//
+// 基版本缺失时自动先安装原版（install_standard 串联，进度同一通道）。
+// ---------------------------------------------------------------------------
+
+/// 从 profile JSON 提取版本 id（fabric meta 的 id 形如 fabric-loader-0.15.11-1.20.4）。
+fn profile_version_id(text: &str) -> Result<String> {
+    let v: serde_json::Value = serde_json::from_str(text)?;
+    Ok(v.get("id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string())
+}
+
+/// loader 版本安装的统一入口。返回安装后的版本 id。
+pub async fn install_loader(
+    client: &reqwest::Client,
+    mc_version: &str,
+    spec: &LoaderSpec,
+    progress: tokio::sync::mpsc::Sender<DownloadProgress>,
+) -> Result<String> {
+    crate::paths::ensure_layout()?;
+
+    match spec {
+        LoaderSpec::Fabric { loader_version } | LoaderSpec::Quilt { loader_version } => {
+            install_meta_loader(client, mc_version, spec, loader_version, progress).await
+        }
+        LoaderSpec::Forge { version } => {
+            install_forge_like(client, mc_version, &crate::modkit::loaders::forge_installer_url(mc_version, version), progress).await
+        }
+        LoaderSpec::NeoForge { version } => {
+            install_forge_like(client, mc_version, &crate::modkit::loaders::neoforge_installer_url(version), progress).await
+        }
+        LoaderSpec::OptiFine { version } => {
+            install_optifine(client, mc_version, version, progress).await
+        }
+    }
+}
+
+/// Fabric / Quilt：profile JSON 落位 + 库下载。
+async fn install_meta_loader(
+    client: &reqwest::Client,
+    mc_version: &str,
+    spec: &LoaderSpec,
+    loader_version: &str,
+    progress: tokio::sync::mpsc::Sender<DownloadProgress>,
+) -> Result<String> {
+    // ① 基版本必须就绪（缺则串联安装原版，进度同一通道）
+    if !crate::paths::version_json(mc_version).exists() {
+        send_progress(
+            &progress,
+            download_progress("prepare", &format!("基版本 {mc_version} 未安装，自动先安装"), 0, 0, false, None),
+        )
+        .await;
+        install_standard(client, mc_version, progress.clone()).await?;
+    }
+
+    // ② profile JSON
+    let text = match spec {
+        LoaderSpec::Fabric { .. } => {
+            crate::modkit::loaders::fabric_profile_json(mc_version, loader_version).await?
+        }
+        LoaderSpec::Quilt { .. } => {
+            crate::modkit::loaders::quilt_profile_json(mc_version, loader_version).await?
+        }
+        _ => unreachable!("install_meta_loader 只处理 Fabric/Quilt"),
+    };
+    let vid = profile_version_id(&text)?;
+    if vid.is_empty() {
+        return Err(crate::error::Error::Other(
+            "loader profile 缺少 id，无法确定版本目录".into(),
+        ));
+    }
+    send_progress(
+        &progress,
+        download_progress("loader-json", &format!("{vid}.json"), 0, 0, false, None),
+    )
+    .await;
+    let profile: crate::model::VersionJson = serde_json::from_str(&text)?;
+    let vdir = crate::paths::version_dir(&vid);
+    tokio::fs::create_dir_all(&vdir).await?;
+    tokio::fs::write(crate::paths::version_json(&vid), &text).await?;
+
+    // ③ 库任务（继承版本只装自身库；client jar / assets 由基版本提供）
+    let ctx = standard_rules_ctx();
+    let libs_root = crate::paths::libraries_dir();
+    let tasks = meta_tasks(&profile, &ctx, &libs_root);
+    // 空任务集也要走执行器（保持 done 事件一致性）
+    execute_download_plan(tasks, &progress).await?;
+    Ok(vid)
+}
+
+/// 汇集一个版本定义的库 + natives 下载任务（去重）。
+fn meta_tasks(
+    version: &crate::model::VersionJson,
+    ctx: &crate::rules::RuntimeCtx,
+    libs_root: &std::path::Path,
+) -> Vec<crate::download::DownloadTask> {
+    let mut tasks: Vec<crate::download::DownloadTask> = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for task in crate::meta::collect_library_tasks(version, ctx, libs_root)
+        .into_iter()
+        .chain(crate::meta::collect_native_tasks(version, ctx, libs_root))
+    {
+        if seen.insert(task.dest.clone()) {
+            tasks.push(task);
+        }
+    }
+    tasks
+}
+
+/// Forge / NeoForge：下载官方 installer，用已装运行时 java 无头安装。
+/// installer 会写 versions/<id>/ 与 libraries/（与标准布局一致）。
+async fn install_forge_like(
+    client: &reqwest::Client,
+    mc_version: &str,
+    installer_url: &str,
+    progress: tokio::sync::mpsc::Sender<DownloadProgress>,
+) -> Result<String> {
+    // ① 基版本必须就绪
+    if !crate::paths::version_json(mc_version).exists() {
+        send_progress(
+            &progress,
+            download_progress("prepare", &format!("基版本 {mc_version} 未安装，自动先安装"), 0, 0, false, None),
+        )
+        .await;
+        install_standard(client, mc_version, progress.clone()).await?;
+    }
+
+    // ② 安装 installer 运行所需的 java 运行时（Forge 1.17+ 要 16+；按基版本 javaVersion）
+    let base = crate::meta::load_version(mc_version)?;
+    let major = base
+        .java_version
+        .as_ref()
+        .map(|j| j.major_version)
+        .unwrap_or(8);
+    if !crate::runtime::is_installed(major) {
+        return Err(crate::error::Error::MissingConfig(format!(
+            "安装 Forge/NeoForge 需要运行时 JRE {major}，请先在「设置 → 运行时」下载"
+        )));
+    }
+
+    // ③ 下载 installer jar
+    send_progress(
+        &progress,
+        download_progress("loader-installer", "installer.jar", 0, 0, false, None),
+    )
+    .await;
+    let mut resp = crate::mirror::get_stream(client, installer_url).await?;
+    let mut data: Vec<u8> = Vec::new();
+    while let Some(chunk) = crate::mirror::next_chunk(&mut resp).await? {
+        data.extend_from_slice(&chunk);
+    }
+    if data.is_empty() {
+        return Err(crate::error::Error::Other(format!("installer 下载为空：{installer_url}")));
+    }
+    let tmp = std::env::temp_dir().join(format!(
+        "qz-loader-installer-{}.jar",
+        std::process::id()
+    ));
+    std::fs::write(&tmp, &data)?;
+
+    // ④ 版本目录快照（安装后 diff 得到 installer 写入的版本 id）
+    let versions_before = list_dir_names(&crate::paths::versions_dir());
+
+    // ⑤ 无头安装：java -jar installer --installClient <minecraft_dir>
+    let java = crate::runtime::java_bin(major);
+    let mc_dir = crate::paths::minecraft_dir();
+    let tmp2 = tmp.clone();
+    let output = tokio::task::spawn_blocking(move || {
+        std::process::Command::new(java)
+            .arg("-jar")
+            .arg(&tmp2)
+            .arg("--installClient")
+            .arg(&mc_dir)
+            .output()
+    })
+    .await
+    .map_err(|e| crate::error::Error::Other(format!("installer 任务失败：{e}")))??;
+
+    let _ = std::fs::remove_file(&tmp);
+    if !output.status.success() {
+        let tail: String = String::from_utf8_lossy(&output.stderr)
+            .lines()
+            .rev()
+            .take(12)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+            .join("\n");
+        return Err(crate::error::Error::Other(format!(
+            "installer 退出码 {}：{}",
+            output.status.code().unwrap_or(-1),
+            tail
+        )));
+    }
+
+    // ⑥ diff 得到新版本 id（installer 命名规则随版本变化，以实盘结果为准）
+    let versions_after = list_dir_names(&crate::paths::versions_dir());
+    let added: Vec<String> = versions_after
+        .iter()
+        .filter(|v| !versions_before.contains(v))
+        .cloned()
+        .collect();
+    let vid = match added.len() {
+        1 => added[0].clone(),
+        _ => {
+            return Err(crate::error::Error::Other(format!(
+                "installer 未写入新版本目录（退出成功但无新增版本），可能是不兼容的 Forge/NeoForge 组合"
+            )))
+        }
+    };
+    send_progress(
+        &progress,
+        download_progress("done", &vid, 1, 1, true, None),
+    )
+    .await;
+    Ok(vid)
+}
+
+/// OptiFine：BMCLAPI 直装 jar 落到本地库 + 生成 tweaker 版本 JSON。
+/// 1.8-1.12.2 走 LaunchWrapper tweaker（minecraftArguments 追加 --tweakClass）；
+/// 1.13+ OptiFine 官方改为 installer patch 模型，本路径不承诺，报可行动错误。
+async fn install_optifine(
+    client: &reqwest::Client,
+    mc_version: &str,
+    of_version: &str,
+    progress: tokio::sync::mpsc::Sender<DownloadProgress>,
+) -> Result<String> {
+    // 解析 of_version 形如 "HD U I6"（3 段）或 "HD I6"（2 段）。
+    // BMCLAPI 条目 type / patch 由 list_optifine_versions 提供。
+
+    // 基版本必须就绪
+    if !crate::paths::version_json(mc_version).exists() {
+        install_standard(client, mc_version, progress.clone()).await?;
+    }
+    // 1.13+ OptiFine 官方安装器需要 GUI patch 流程（修改 client jar 本体），
+    // 无法在无头环境完成 —— 提前给出可行动错误，不浪费下载。
+    let major = {
+        let base = crate::meta::load_version(mc_version)?;
+        base.java_version
+            .as_ref()
+            .map(|j| j.major_version)
+            .unwrap_or(8)
+    };
+    if major > 12 {
+        return Err(crate::error::Error::Other(
+            "OptiFine 1.13+ 官方安装器需要 GUI patch 流程，暂不支持；1.8-1.12.2 完整可用".into(),
+        ));
+    }
+
+    // 版本号约定："HD U I6"（3 段）或 "HD I6"（2 段）；下载 URL 只需 type + patch。
+    let parts: Vec<&str> = of_version.split_whitespace().collect();
+    if parts.len() < 2 || parts.len() > 3 {
+        return Err(crate::error::Error::Other(format!(
+            "OptiFine 版本格式需为 \"<type> [kind] <patch>\"（如 \"HD U I6\"），收到：{of_version}"
+        )));
+    }
+    let of_type = parts[0];
+    let of_patch = parts[parts.len() - 1];
+
+    let url = crate::modkit::loaders::optifine_download_url(mc_version, of_type, of_patch);
+    send_progress(
+        &progress,
+        download_progress("loader-libs", "OptiFine.jar", 0, 0, false, None),
+    )
+    .await;
+    let mut resp = crate::mirror::get_stream(client, &url).await?;
+    let mut data: Vec<u8> = Vec::new();
+    while let Some(chunk) = crate::mirror::next_chunk(&mut resp).await? {
+        data.extend_from_slice(&chunk);
+    }
+    if data.is_empty() {
+        return Err(crate::error::Error::Other(format!("OptiFine 下载为空：{url}")));
+    }
+
+    // jar 落位：本地 maven 布局 optifine:OptiFine:{ver}，供 classpath 引用
+    let coord_ver = format!("{mc_version}_{of_type}_{of_patch}");
+    let rel = format!("optifine/OptiFine/{coord_ver}/OptiFine-{coord_ver}.jar");
+    let dest = crate::paths::libraries_dir().join(&rel);
+    tokio::fs::create_dir_all(dest.parent().unwrap()).await?;
+    tokio::fs::write(&dest, &data).await?;
+
+    // 版本 JSON：继承基版本 + OptiFine 本地库 + tweaker（1.8-1.12.2 LaunchWrapper 模型）。
+    // url 为空字符串 = 本地安装库（无下载任务，见 meta::library_jar_url 约定）。
+    let vid = format!("{mc_version}-OptiFine_{of_type}_{of_patch}");
+    let json = serde_json::json!({
+        "id": vid,
+        "inheritsFrom": mc_version,
+        "releaseTime": iso_now(),
+        "time": iso_now(),
+        "type": "release",
+        "mainClass": "net.minecraft.launchwrapper.Launch",
+        "minecraftArguments": "--tweakClass optifine.OptiFineTweaker",
+        "libraries": [
+            { "name": format!("optifine:OptiFine:{coord_ver}"), "url": "" }
+        ]
+    });
+    let vdir = crate::paths::version_dir(&vid);
+    tokio::fs::create_dir_all(&vdir).await?;
+    tokio::fs::write(
+        crate::paths::version_json(&vid),
+        serde_json::to_string_pretty(&json)?,
+    )
+    .await?;
+    send_progress(&progress, download_progress("done", &vid, 1, 1, true, None)).await;
+    Ok(vid)
+}
+
+fn list_dir_names(dir: &std::path::Path) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            if e.path().is_dir() {
+                out.push(e.file_name().to_string_lossy().into_owned());
+            }
+        }
+    }
+    out.sort();
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -507,10 +874,10 @@ pub struct AssetStatus {
 }
 
 /// 读版本的资产索引（未安装/无资产索引返回 None）。
+/// 走 inheritsFrom 链解析：loader 版本（Fabric/Forge 等）继承基版本的资产索引。
 pub fn asset_index_for_version(version_id: &str) -> Option<(String, String)> {
-    let text = std::fs::read_to_string(crate::paths::version_json(version_id)).ok()?;
-    let version: crate::model::VersionJson = serde_json::from_str(&text).ok()?;
-    let idx = version.asset_index.as_ref()?;
+    let resolved = crate::meta::resolve_version_chain(version_id).ok()?;
+    let idx = resolved.version.asset_index.as_ref()?;
     let id = idx.id.clone();
     let index_text = std::fs::read_to_string(crate::paths::asset_index_file(&id)).ok()?;
     Some((id, index_text))

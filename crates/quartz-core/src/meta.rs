@@ -62,10 +62,19 @@ pub fn library_allowed(lib: &Library, ctx: &RuntimeCtx) -> bool {
 /// 计算库的 jar 下载 URL：
 /// 优先 downloads.artifact.url；否则旧格式 url 基址 + Maven 相对路径；
 /// 再否则 Mojang 默认仓库。
+/// 本地私有库约定：url 为空字符串 -> 本地安装的库（无下载任务，仅 classpath 引用）。
 pub fn library_jar_url(lib: &Library) -> Option<String> {
     if let Some(dl) = &lib.downloads {
         if let Some(a) = &dl.artifact {
+            if a.url.is_empty() {
+                return None;
+            }
             return Some(a.url.clone());
+        }
+    }
+    if let Some(base) = &lib.url {
+        if base.is_empty() {
+            return None;
         }
     }
     let rel = maven_rel_path(&lib.name, None)?;
@@ -267,6 +276,191 @@ pub fn version_json_summary(v: &Value) -> Result<(String, String)> {
 /// 便捷：PathBuf 组装。
 pub fn objects_dir(assets_root: &std::path::Path) -> PathBuf {
     assets_root.join("objects")
+}
+
+// ---------------------------------------------------------------------------
+// inheritsFrom 链解析（loader 版本 -> 原版基版本）
+//
+// 对标官方启动器 / HMCL / Prism 的合并语义：
+// - libraries：child 在前 + parent 补齐，按 maven 坐标去重（child 优先）；
+// - arguments.jvm / arguments.game：parent 在前、child 追加，精确重复去重；
+// - mainClass / minecraftArguments：child 有则覆盖（minecraftArguments 拼接）；
+// - assetIndex / assets / javaVersion / downloads：child 缺失时回退 parent；
+// - client jar：child "jar" 字段 || 链根版本 id。
+// ---------------------------------------------------------------------------
+
+/// 链解析结果：合并后的版本 + 实际 client jar 所属版本 id。
+pub struct ResolvedVersion {
+    pub version: crate::model::VersionJson,
+    /// client jar 所在版本目录（"jar" 字段覆盖 || 链根 id）。
+    pub jar_version: String,
+    /// 链根版本 id（原版），客户端 jar / natives 校验用它。
+    pub base_id: String,
+}
+
+const MAX_CHAIN_DEPTH: usize = 10;
+
+/// 读单个版本 JSON（typed），未安装时报错。
+pub fn load_version(version_id: &str) -> Result<crate::model::VersionJson> {
+    let path = crate::paths::version_json(version_id);
+    let text = std::fs::read_to_string(&path).map_err(|_| {
+        Error::Other(format!(
+            "版本 {version_id} 未安装（缺少 {}），请先在「下载游戏」页下载",
+            path.display()
+        ))
+    })?;
+    serde_json::from_str(&text).map_err(|e| {
+        Error::Other(format!("版本 {version_id} JSON 解析失败：{e}"))
+    })
+}
+
+/// 解析 inheritsFrom 链并合并为可启动版本。
+/// 循环继承 / 深度超限 / 任一环节缺失都会给出可行动报错。
+pub fn resolve_version_chain(version_id: &str) -> Result<ResolvedVersion> {
+    // ① 从 child 到 base 收集链（typed 解析保留继承信息）
+    let mut chain: Vec<crate::model::VersionJson> = Vec::new();
+    let mut cur = version_id.to_string();
+    loop {
+        let v = load_version(&cur)?;
+        let parent = v.inherits_from.clone();
+        chain.push(v);
+        match parent {
+            Some(p) if chain.len() < MAX_CHAIN_DEPTH => cur = p,
+            Some(_) => {
+                return Err(Error::Other(format!(
+                    "版本继承链超过 {MAX_CHAIN_DEPTH} 层（疑似循环继承）：{version_id}"
+                )))
+            }
+            None => break,
+        }
+    }
+    let base_id = cur.clone();
+
+    // ② jar 覆盖字段：任意层声明 "jar" 则采用（取最靠近 child 的声明）
+    let jar_version = chain[0].jar.clone().unwrap_or_else(|| base_id.clone());
+
+    // ③ 从 base 向 child 逐层合并
+    //    合并载体用 Value 以便无损处理参数数组（Str / Ruled 混合项）。
+    let mut merged: Value = serde_json::to_value(chain.last().unwrap())?;
+    for child in chain[..chain.len() - 1].iter().rev() {
+        merge_parent_child(&mut merged, child)?;
+    }
+
+    // ④ child 的 id 必须保留（class 目录 / natives 目录都以它命名）
+    merged["id"] = Value::String(version_id.to_string());
+
+    let version: crate::model::VersionJson = serde_json::from_str(&merged.to_string())?;
+    Ok(ResolvedVersion {
+        version,
+        jar_version,
+        base_id,
+    })
+}
+
+/// 把一层 child 合并进 accumulated（acc 语义上是「当前父版本」）。
+fn merge_parent_child(acc: &mut Value, child: &crate::model::VersionJson) -> Result<()> {
+    // - mainClass：child 覆盖
+    if !child.main_class.is_empty() {
+        acc["mainClass"] = Value::String(child.main_class.clone());
+    }
+    // - jar 字段：child 覆盖（jar_version 已在 resolve 层处理，这里同步进 JSON）
+    if let Some(j) = &child.jar {
+        acc["jar"] = Value::String(j.clone());
+    }
+    // - assetIndex / assets / javaVersion / downloads：child 有则覆盖
+    let field_overrides: Vec<(&str, Option<Value>)> = vec![
+        (
+            "assetIndex",
+            child.asset_index.as_ref().and_then(|v| serde_json::to_value(v).ok()),
+        ),
+        ("assets", child.assets.as_ref().and_then(|v| serde_json::to_value(v).ok())),
+        (
+            "javaVersion",
+            child.java_version.as_ref().and_then(|v| serde_json::to_value(v).ok()),
+        ),
+        (
+            "downloads",
+            if child.downloads.is_empty() {
+                None
+            } else {
+                serde_json::to_value(&child.downloads).ok()
+            },
+        ),
+    ];
+    for (key, value) in field_overrides {
+        if let Some(v) = value {
+            acc[key] = v;
+        }
+    }
+    // - minecraftArguments（旧格式）：parent 在前、child 追加
+    if let Some(ma) = &child.minecraft_arguments {
+        let parent = acc
+            .get("minecraftArguments")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let combined = if parent.is_empty() {
+            ma.clone()
+        } else {
+            format!("{parent} {ma}")
+        };
+        acc["minecraftArguments"] = Value::String(combined);
+    }
+    // - arguments（新格式）：jvm / game 均 parent 在前、child 追加；精确重复去重
+    let acc_jvm = acc
+        .get("arguments")
+        .and_then(|a| a.get("jvm"))
+        .cloned()
+        .unwrap_or(Value::Array(vec![]));
+    let acc_game = acc
+        .get("arguments")
+        .and_then(|a| a.get("game"))
+        .cloned()
+        .unwrap_or(Value::Array(vec![]));
+    let child_jvm = serde_json::to_value(&child.arguments.as_ref().map(|a| &a.jvm))?;
+    let child_game = serde_json::to_value(&child.arguments.as_ref().map(|a| &a.game))?;
+    let mut jvm = as_array_or_empty(&acc_jvm);
+    let mut game = as_array_or_empty(&acc_game);
+    for v in as_array_or_empty(&child_jvm) {
+        if !array_contains_exact(&jvm, &v) {
+            jvm.push(v);
+        }
+    }
+    for v in as_array_or_empty(&child_game) {
+        if !array_contains_exact(&game, &v) {
+            game.push(v);
+        }
+    }
+    acc["arguments"] = serde_json::json!({ "jvm": jvm, "game": game });
+    // - libraries：child 在前（优先），parent 补齐；按 name 去重
+    let mut libs: Vec<Value> = Vec::new();
+    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let push_libs = |items: &Value, seen: &mut std::collections::BTreeSet<String>, libs: &mut Vec<Value>| {
+        if let Some(arr) = items.as_array() {
+            for item in arr {
+                let name = item
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                if name.is_empty() || seen.insert(name) {
+                    libs.push(item.clone());
+                }
+            }
+        }
+    };
+    push_libs(&serde_json::to_value(&child.libraries)?, &mut seen, &mut libs);
+    push_libs(acc.get("libraries").unwrap_or(&Value::Null), &mut seen, &mut libs);
+    acc["libraries"] = Value::Array(libs);
+    Ok(())
+}
+
+fn as_array_or_empty(v: &Value) -> Vec<Value> {
+    v.as_array().cloned().unwrap_or_default()
+}
+
+/// 精确值比较（字符串全等 / 对象全等）。
+fn array_contains_exact(arr: &[Value], needle: &Value) -> bool {
+    arr.iter().any(|v| v == needle)
 }
 
 #[cfg(test)]

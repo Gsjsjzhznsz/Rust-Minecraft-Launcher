@@ -1,5 +1,6 @@
 //! 内容生态：整合包（Modrinth .mrpack）与 modloader 元数据。
 
+pub mod loaders;
 pub mod mrpack;
 
 use crate::error::Result;

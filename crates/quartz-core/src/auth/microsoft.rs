@@ -263,6 +263,7 @@ pub async fn device_code_login(
         access_token: mc.access_token,
         refresh_token: msa.refresh_token.clone(),
         user_type: Some("msa".to_string()),
+        authlib_server: None,
     })
 }
 

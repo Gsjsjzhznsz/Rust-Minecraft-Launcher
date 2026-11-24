@@ -29,7 +29,7 @@
 
 use quartz_core::instance::DownloadProgress;
 use quartz_core::renderbus::{self, DeviceCaps};
-use quartz_core::{auth, host_arch, instance, jvmops, lwjgl, meta, model, paths, platform, renderers, rules, runtime, RuntimeCtx};
+use quartz_core::{auth, content, host_arch, instance, jvmops, lwjgl, meta, modkit, model, paths, platform, renderers, rules, runtime, settings, RuntimeCtx};
 use serde::Serialize;
 use serde_json::json;
 use std::path::{Path, PathBuf};
@@ -1080,6 +1080,7 @@ fn plan_offline(player: String, memory_mb: u32) -> Result<serde_json::Value, Str
         java_major: version.java_version.as_ref().map(|j| j.major_version).unwrap_or(17),
         java_path: None,
         window: None,
+        client_jar_path: None,
         lwjgl_classes_jar: None,
     })
     .map_err(|e| e.to_string())?;
@@ -1485,6 +1486,560 @@ async fn download_lwjgl(app: AppHandle, state: State<'_, AppState>) -> Result<()
 }
 
 // ---------------------------------------------------------------------------
+// Modloader 安装 / 实例体系 / 微软与 authlib 登录 / 整合包 / 内容管理 / 设置
+// （对标 FCL / ZL2 的完整启动器功能面；编排全部在 quartz-core，命令层只做接线）
+// ---------------------------------------------------------------------------
+
+/// loader 类型校验与映射：fabric / quilt / forge / neoforge / optifine。
+fn parse_loader_spec(loader: &str, loader_version: &str) -> Result<instance::LoaderSpec, String> {
+    let lv = loader_version.to_string();
+    match loader {
+        "fabric" => Ok(instance::LoaderSpec::Fabric { loader_version: lv }),
+        "quilt" => Ok(instance::LoaderSpec::Quilt { loader_version: lv }),
+        "forge" => Ok(instance::LoaderSpec::Forge { version: lv }),
+        "neoforge" => Ok(instance::LoaderSpec::NeoForge { version: lv }),
+        "optifine" => Ok(instance::LoaderSpec::OptiFine { version: lv }),
+        _ => Err(format!("未知 loader 类型：{loader}（支持 fabric/quilt/forge/neoforge/optifine）")),
+    }
+}
+
+/// loader 版本列表条目。
+#[derive(Serialize)]
+pub struct LoaderEntry {
+    pub version: String,
+    pub stable: bool,
+}
+
+/// 某 MC 版本可用的 loader 版本列表。
+#[tauri::command]
+async fn list_loader_versions(loader: String, mc: String) -> Result<Vec<LoaderEntry>, String> {
+    let out = match loader.as_str() {
+        "fabric" => modkit::loaders::list_fabric_loaders(&mc)
+            .await
+            .map_err(|e| format!("Fabric 版本列表拉取失败：{e}"))?
+            .into_iter()
+            .map(|v| LoaderEntry { version: v.version, stable: v.stable })
+            .collect(),
+        "quilt" => modkit::loaders::list_quilt_loaders(&mc)
+            .await
+            .map_err(|e| format!("Quilt 版本列表拉取失败：{e}"))?
+            .into_iter()
+            .map(|v| LoaderEntry { version: v.version, stable: v.stable })
+            .collect(),
+        "forge" => modkit::loaders::list_forge_versions(&mc)
+            .await
+            .map_err(|e| format!("Forge 版本列表拉取失败：{e}"))?
+            .into_iter()
+            .map(|v| LoaderEntry { version: v, stable: true })
+            .collect(),
+        "neoforge" => modkit::loaders::list_neoforge_versions(&mc)
+            .await
+            .map_err(|e| format!("NeoForge 版本列表拉取失败：{e}"))?
+            .into_iter()
+            .map(|v| LoaderEntry { version: v, stable: true })
+            .collect(),
+        "optifine" => modkit::loaders::list_optifine_versions(&mc)
+            .await
+            .map_err(|e| format!("OptiFine 版本列表拉取失败：{e}"))?
+            .into_iter()
+            .map(|v| LoaderEntry { version: v.name.trim_start_matches("OptiFine ").to_string(), stable: true })
+            .collect(),
+        _ => return Err(format!("未知 loader 类型：{loader}")),
+    };
+    Ok(out)
+}
+
+/// 安装 modloader（基版本缺失自动先装原版；进度经 `loader://progress` 上报）。
+#[tauri::command]
+async fn install_loader_cmd(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    mc: String,
+    loader: String,
+    loader_version: String,
+) -> Result<(), String> {
+    if state
+        .downloading
+        .lock()
+        .map_err(|_| "内部状态锁异常")?
+        .clone()
+    {
+        return Err("已有下载任务正在进行，请等待完成后再试".to_string());
+    }
+    let spec = parse_loader_spec(&loader, &loader_version)?;
+    check_download_floor(&paths::game_root())?;
+    *state.downloading.lock().map_err(|_| "内部状态锁异常")? = true;
+    let busy = state.downloading.clone();
+    let app = app.clone();
+
+    tauri::async_runtime::spawn(async move {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<instance::DownloadProgress>(128);
+        let forwarder_app = app.clone();
+        let forwarder = tokio::spawn(async move {
+            while let Some(ev) = rx.recv().await {
+                let _ = forwarder_app.emit("loader://progress", &ev);
+            }
+        });
+        let client = meta::http_client();
+        let result = instance::install_loader(&client, &mc, &spec, tx).await;
+        if let Err(e) = &result {
+            let _ = app.emit(
+                "loader://progress",
+                &instance::DownloadProgress {
+                    stage: "error".to_string(),
+                    current: 0,
+                    total: 0,
+                    percent: 0.0,
+                    file: String::new(),
+                    done: false,
+                    error: Some(e.to_string()),
+                },
+            );
+        }
+        drop(result);
+        if let Ok(mut busy) = busy.lock() {
+            *busy = false;
+        }
+        let _ = forwarder.await;
+    });
+    Ok(())
+}
+
+// ---- 实例体系（FCL 版本隔离语义） ----
+
+fn instances_store() -> instance::InstanceStore {
+    instance::InstanceStore::new(paths::minecraft_dir().join("instances"))
+}
+
+/// 实例列表（附选中标记与 loader 描述）。
+#[tauri::command]
+fn list_instances() -> Result<Vec<serde_json::Value>, String> {
+    let store = instances_store();
+    let list = store.load().map_err(|e| e.to_string())?;
+    let selected = settings::load().selected_instance;
+    Ok(list
+        .into_iter()
+        .map(|i| {
+            let loader_desc = i
+                .loader
+                .as_ref()
+                .map(|l| match l {
+                    instance::LoaderSpec::Fabric { loader_version } => format!("Fabric {loader_version}"),
+                    instance::LoaderSpec::Quilt { loader_version } => format!("Quilt {loader_version}"),
+                    instance::LoaderSpec::Forge { version } => format!("Forge {version}"),
+                    instance::LoaderSpec::NeoForge { version } => format!("NeoForge {version}"),
+                    instance::LoaderSpec::OptiFine { version } => format!("OptiFine {version}"),
+                })
+                .unwrap_or_else(|| "原版".to_string());
+            json!({
+                "id": i.id,
+                "name": i.name,
+                "mcVersion": i.mc_version,
+                "loaderDesc": loader_desc,
+                "javaMajor": i.java_major,
+                "memoryMb": i.memory_mb,
+                "renderer": i.renderer,
+                "createdAt": i.created_at,
+                "selected": selected.as_deref() == Some(i.id.as_str()),
+            })
+        })
+        .collect())
+}
+
+/// 新建实例（不触发下载；首次启动按需安装版本与 loader）。
+#[tauri::command]
+fn create_instance_cmd(
+    name: String,
+    mc_version: String,
+    loader: Option<String>,
+    loader_version: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let spec = match (&loader, &loader_version) {
+        (Some(l), Some(v)) => Some(parse_loader_spec(l, v)?),
+        (Some(_), None) => return Err("指定了 loader 但缺少 loader 版本".to_string()),
+        _ => None,
+    };
+    // java 主版本：优先 loader 要求，其次基版本（安装时由版本 JSON 决定）
+    let java_major = spec
+        .as_ref()
+        .map(|_| modkit::loader_requires_jvm_major(loader.as_ref().unwrap()))
+        .unwrap_or(17);
+    let input = instance::CreateInstance {
+        id: format!("{}-{}", mc_version.replace('.', "_"), chrono_like_id()),
+        name: name.trim().to_string(),
+        mc_version: mc_version.clone(),
+        loader: spec,
+        java_major,
+        memory_mb: get_memory_mb_inner(),
+    };
+    let inst = instances_store().create(input).map_err(|e| e.to_string())?;
+    settings::save(&settings::Settings {
+        selected_instance: Some(inst.id.clone()),
+        ..settings::load()
+    })
+    .map_err(|e| e.to_string())?;
+    Ok(json!({ "id": inst.id, "name": inst.name }))
+}
+
+fn chrono_like_id() -> String {
+    let n = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    format!("{n:x}")
+}
+
+/// 删除实例（含目录）。
+#[tauri::command]
+fn delete_instance_cmd(id: String) -> Result<bool, String> {
+    let ok = instances_store().delete(&id).map_err(|e| e.to_string())?;
+    let mut s = settings::load();
+    if s.selected_instance.as_deref() == Some(id.as_str()) {
+        s.selected_instance = None;
+        settings::save(&s).map_err(|e| e.to_string())?;
+    }
+    Ok(ok)
+}
+
+/// 选中实例（None = 回到全局 .minecraft）。
+#[tauri::command]
+fn select_instance(id: Option<String>) -> Result<(), String> {
+    if let Some(i) = &id {
+        let _ = instances_store()
+            .get(i)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("实例不存在：{i}"))?;
+    }
+    settings::save(&settings::Settings {
+        selected_instance: id,
+        ..settings::load()
+    })
+    .map_err(|e| e.to_string())
+}
+
+/// 修改实例内存分配。
+#[tauri::command]
+fn set_instance_memory(id: String, memory_mb: u32) -> Result<(), String> {
+    instances_store()
+        .update(&id, |i| i.memory_mb = memory_mb)
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// 修改实例渲染器（None = 自动）。
+#[tauri::command]
+fn set_instance_renderer(id: String, renderer: Option<String>) -> Result<(), String> {
+    instances_store()
+        .update(&id, |i| i.renderer = renderer)
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+// ---- 微软账号（设备码） ----
+
+/// 微软设备码登录：后台轮询直到成功/失败。
+/// 事件：`ms://prompt`（DeviceCodeResp，展示 user_code + verification_uri）、
+/// `ms://result`（{ ok, account?, error? }）。
+/// client_id 必须在设置页配置项目自有 Azure Public Client ID。
+#[tauri::command]
+fn ms_login(app: AppHandle) -> Result<(), String> {
+    let client_id = settings::load()
+        .azure_client_id
+        .unwrap_or_else(|| auth::microsoft::DEFAULT_CLIENT_ID.to_string());
+    if client_id.is_empty() {
+        return Err(
+            "未配置 Azure client_id：请在「设置」页填入项目自有 Public Client ID 后重试".to_string(),
+        );
+    }
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let client = meta::http_client();
+        let result = async {
+            let dc = auth::microsoft::device_code_request(&client, &client_id)
+                .await
+                .map_err(|e| format!("设备码申请失败：{e}"))?;
+            let _ = app.emit("ms://prompt", &dc);
+            // 按 interval 轮询（与 device_code_login 内部一致的语义，但事件化）
+            let mut interval = dc.interval.max(1);
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+                match auth::microsoft::poll_token(&client, &client_id, &dc.device_code)
+                    .await
+                    .map_err(|e| e.to_string())?
+                {
+                    auth::microsoft::TokenOutcome::Success(msa) => {
+                        let xbl = auth::microsoft::xbl_user_token(&client, &msa.access_token)
+                            .await
+                            .map_err(|e| format!("XBL 认证失败：{e}"))?;
+                        let xsts = auth::microsoft::xsts_authorize(&client, &xbl.token)
+                            .await
+                            .map_err(|e| format!("XSTS 认证失败：{e}"))?;
+                        let uhs = xsts
+                            .display_claims
+                            .xui
+                            .first()
+                            .map(|c| c.uhs.clone())
+                            .ok_or("XSTS 响应缺少 uhs")?;
+                        let mc = auth::microsoft::mc_login(&client, &uhs, &xsts.token)
+                            .await
+                            .map_err(|e| format!("Minecraft 会话获取失败：{e}"))?;
+                        let prof = auth::microsoft::profile(&client, &mc.access_token)
+                            .await
+                            .map_err(|e| format!("档案获取失败：{e}"))?;
+                        let account = auth::add_account(auth::Account {
+                            kind: auth::AccountKind::Microsoft,
+                            username: prof.name,
+                            uuid: auth::microsoft::dashed_uuid(&prof.id),
+                            access_token: mc.access_token,
+                            refresh_token: msa.refresh_token,
+                            user_type: Some("msa".into()),
+                            authlib_server: None,
+                        })
+                        .map_err(|e| e.to_string())?;
+                        break Ok(account);
+                    }
+                    auth::microsoft::TokenOutcome::Pending { interval: i } => {
+                        interval = i;
+                        continue;
+                    }
+                    auth::microsoft::TokenOutcome::Failed { error } => {
+                        break Err(format!("MSA 授权失败：{error}"));
+                    }
+                }
+            }
+        }
+        .await;
+        let payload = match result {
+            Ok(account) => json!({ "ok": true, "account": account, "error": serde_json::Value::Null }),
+            Err(e) => json!({ "ok": false, "account": serde_json::Value::Null, "error": e }),
+        };
+        let _ = app.emit("ms://result", &payload);
+    });
+    Ok(())
+}
+
+// ---- authlib-injector 外置登录 ----
+
+/// authlib 外置登录（Yggdrasil 协议）：成功后写入 accounts.json 并选中。
+#[tauri::command]
+async fn authlib_login(
+    server: String,
+    username: String,
+    password: String,
+) -> Result<auth::Account, String> {
+    let client = meta::http_client();
+    let account = auth::authlib::login(&client, &server, &username, &password)
+        .await
+        .map_err(|e| format!("外置登录失败：{e}"))?;
+    // injector jar 未就绪只警告不阻塞（启动时再检查）
+    auth::add_account(account.clone()).map_err(|e| e.to_string())?;
+    Ok(account)
+}
+
+/// authlib-injector agent 安装状态。
+#[tauri::command]
+fn authlib_status() -> serde_json::Value {
+    json!({
+        "installed": auth::authlib::injector_jar().exists(),
+        "version": auth::authlib::installed_version(),
+    })
+}
+
+/// 下载 authlib-injector agent jar（后台；`authlib://progress` 上报）。
+#[tauri::command]
+async fn download_authlib(app: AppHandle) -> Result<(), String> {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let client = meta::http_client();
+        let result = auth::authlib::download_injector(&client).await;
+        let payload = match &result {
+            Ok(v) => json!({ "done": true, "version": v, "error": serde_json::Value::Null }),
+            Err(e) => json!({ "done": false, "version": serde_json::Value::Null, "error": e.to_string() }),
+        };
+        let _ = app.emit("authlib://progress", &payload);
+    });
+    Ok(())
+}
+
+// ---- Modrinth 整合包导入 ----
+
+/// 导入 .mrpack 整合包：建实例 -> 装 loader -> 下载内容文件。
+/// 进度：`mrpack://progress`（与 download://progress 同构）。
+#[tauri::command]
+async fn import_mrpack(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    path: String,
+    instance_name: Option<String>,
+) -> Result<(), String> {
+    if state
+        .downloading
+        .lock()
+        .map_err(|_| "内部状态锁异常")?
+        .clone()
+    {
+        return Err("已有下载任务正在进行，请等待完成后再试".to_string());
+    }
+    let src = std::path::PathBuf::from(&path);
+    if !src.exists() {
+        return Err(format!("整合包文件不存在：{path}"));
+    }
+    // ① 先读索引（同步、快）确定 loader 与版本要求
+    let index = modkit::mrpack::read_index(&src).map_err(|e| format!("整合包解析失败：{e}"))?;
+    if index.game != "minecraft" {
+        return Err(format!("不支持的整合包游戏：{}", index.game));
+    }
+    let mc = index
+        .dependencies
+        .get("minecraft")
+        .cloned()
+        .ok_or("整合包缺少 minecraft 版本依赖")?;
+    // ② 建实例（loader 稍后按依赖安装）
+    let loader_kind: Option<(&str, String)> = index
+        .dependencies
+        .get("fabric-loader")
+        .map(|v| ("fabric", v.clone()))
+        .or_else(|| index.dependencies.get("quilt-loader").map(|v| ("quilt", v.clone())))
+        .or_else(|| index.dependencies.get("forge").map(|v| ("forge", v.clone())))
+        .or_else(|| index.dependencies.get("neoforge").map(|v| ("neoforge", v.clone())));
+    let name = instance_name.unwrap_or_else(|| index.name.clone());
+    let (spec, java_major) = match &loader_kind {
+        Some((k, v)) => (
+            Some(parse_loader_spec(k, v)?),
+            modkit::loader_requires_jvm_major(k),
+        ),
+        None => (None, 17),
+    };
+    let input = instance::CreateInstance {
+        id: format!("mrpack-{}", chrono_like_id()),
+        name: name.trim().to_string(),
+        mc_version: mc.clone(),
+        loader: spec,
+        java_major,
+        memory_mb: get_memory_mb_inner(),
+    };
+    let inst = instances_store().create(input).map_err(|e| e.to_string())?;
+    let inst_dir = instances_store().instance_dir(&inst.id);
+
+    *state.downloading.lock().map_err(|_| "内部状态锁异常")? = true;
+    let busy = state.downloading.clone();
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<instance::DownloadProgress>(128);
+        let forwarder_app = app.clone();
+        let forwarder = tokio::spawn(async move {
+            while let Some(ev) = rx.recv().await {
+                let _ = forwarder_app.emit("mrpack://progress", &ev);
+            }
+        });
+        let client = meta::http_client();
+        let result: Result<(), String> = async {
+            // ③ loader 安装（链式先装基版本）
+            if let Some(spec) = &inst.loader {
+                instance::install_loader(&client, &mc, spec, tx.clone())
+                    .await
+                    .map_err(|e| format!("loader 安装失败：{e}"))?;
+            } else {
+                instance::install_standard(&client, &mc, tx.clone())
+                    .await
+                    .map_err(|e| format!("基版本安装失败：{e}"))?;
+            }
+            // ④ 内容文件（mods/shaderpacks/config 等，按 env.client 过滤）
+            let tasks = modkit::mrpack::client_download_tasks(&index, &inst_dir);
+            instance::execute_download_plan(tasks, &tx)
+                .await
+                .map_err(|e| format!("整合包文件下载失败：{e}"))?;
+            Ok(())
+        }
+        .await;
+        if let Err(e) = &result {
+            let _ = app.emit(
+                "mrpack://progress",
+                &instance::DownloadProgress {
+                    stage: "error".to_string(),
+                    current: 0,
+                    total: 0,
+                    percent: 0.0,
+                    file: String::new(),
+                    done: false,
+                    error: Some(e.clone()),
+                },
+            );
+        }
+        if let Ok(mut busy) = busy.lock() {
+            *busy = false;
+        }
+        let _ = forwarder.await;
+    });
+    Ok(())
+}
+
+// ---- 内容管理 ----
+
+/// 列出某类内容（mods/resourcepacks/shaderpacks/saves/screenshots/logs）。
+/// instance_id 有值时列出实例目录下的内容。
+#[tauri::command]
+fn list_content_cmd(
+    kind: String,
+    instance_id: Option<String>,
+) -> Result<Vec<content::ContentEntry>, String> {
+    let k = content::ContentKind::parse(&kind).ok_or_else(|| format!("未知内容类型：{kind}"))?;
+    let dir = instance_dir_for(&instance_id);
+    content::list_content(k, dir.as_deref()).map_err(|e| e.to_string())
+}
+
+/// 删除内容项。
+#[tauri::command]
+fn delete_content_cmd(
+    kind: String,
+    name: String,
+    instance_id: Option<String>,
+) -> Result<bool, String> {
+    let k = content::ContentKind::parse(&kind).ok_or_else(|| format!("未知内容类型：{kind}"))?;
+    let dir = instance_dir_for(&instance_id);
+    content::delete_content(k, &name, dir.as_deref()).map_err(|e| e.to_string())
+}
+
+/// 实例内容目录解析（None = 全局 .minecraft）。
+fn instance_dir_for(instance_id: &Option<String>) -> Option<std::path::PathBuf> {
+    instance_id.as_ref().map(|id| {
+        instances_store()
+            .instance_dir(id)
+    })
+}
+
+// ---- 设置 ----
+
+/// 当前设置（不含敏感字段原文：azure_client_id 只返回是否已配置）。
+#[tauri::command]
+fn get_settings() -> serde_json::Value {
+    let s = settings::load();
+    json!({
+        "extraJvmArgs": s.extra_jvm_args,
+        "azureClientIdSet": s.azure_client_id.is_some(),
+        "azureClientId": s.azure_client_id,
+        "memoryMb": s.memory_mb,
+        "selectedInstance": s.selected_instance,
+    })
+}
+
+/// 覆盖式设置用户自定义 JVM 参数。
+#[tauri::command]
+fn set_jvm_args_cmd(args: Vec<String>) -> Result<(), String> {
+    settings::set_jvm_args(args)
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+/// 设置 Azure Public Client ID（None 清除）。
+#[tauri::command]
+fn set_azure_client_id(id: Option<String>) -> Result<(), String> {
+    settings::set_azure_client_id(id)
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+// ---------------------------------------------------------------------------
 // 游戏启动（M0 已接入）
 // ---------------------------------------------------------------------------
 
@@ -1508,21 +2063,33 @@ pub struct LaunchExit {
     pub log_tail: Option<String>,
 }
 
-/// 启动前自检：版本文件 / Java 主版本 / 账号 / 运行时状态。
+/// 启动前自检：版本文件（含继承链）/ Java 主版本 / 账号 / 运行时状态。
 #[tauri::command]
 fn launch_preflight(version_id: String) -> serde_json::Value {
-    let json_path = paths::version_json(&version_id);
-    let parsed = std::fs::read_to_string(&json_path)
-        .ok()
-        .and_then(|t| serde_json::from_str::<model::VersionJson>(&t).ok());
-    let java_major = parsed
+    let chain_ok = meta::resolve_version_chain(&version_id).ok();
+    let java_major = chain_ok
         .as_ref()
-        .map(|v| v.java_version.as_ref().map(|j| j.major_version).unwrap_or(17))
+        .map(|r| {
+            r.version
+                .java_version
+                .as_ref()
+                .map(|j| j.major_version)
+                .unwrap_or(17)
+        })
         .unwrap_or(17);
+    let jar_installed = chain_ok
+        .as_ref()
+        .map(|r| {
+            paths::versions_dir()
+                .join(&r.jar_version)
+                .join(format!("{}.jar", r.jar_version))
+                .exists()
+        })
+        .unwrap_or(false);
     let account_ok = auth::active_account().unwrap_or(None).is_some();
     json!({
-        "versionInstalled": paths::version_jar(&version_id).exists(),
-        "versionJsonOk": parsed.is_some(),
+        "versionInstalled": chain_ok.is_some() && jar_installed,
+        "versionJsonOk": chain_ok.is_some(),
         "javaMajor": java_major,
         "accountOk": account_ok,
         "runtimeInstalled": runtime::is_installed(java_major),
@@ -1532,14 +2099,24 @@ fn launch_preflight(version_id: String) -> serde_json::Value {
     })
 }
 
-/// 解析版本 JSON 并装配 LaunchPlan（版本未安装 / JSON 损坏时报错）。
-fn build_plan_for(version_id: &str) -> Result<(model::VersionJson, jvmops::LaunchPlan, u32), String> {
-    let text = std::fs::read_to_string(paths::version_json(version_id))
-        .map_err(|_| format!("版本 {version_id} 未安装（缺少版本 JSON），请先在「下载游戏」页完成下载"))?;
-    let version: model::VersionJson =
-        serde_json::from_str(&text).map_err(|e| format!("版本 JSON 解析失败：{e}"))?;
-    if !paths::version_jar(version_id).exists() {
-        return Err(format!("版本 {version_id} 的 client jar 缺失，请重新下载"));
+/// 解析版本 JSON（含 inheritsFrom 链）并装配 LaunchPlan。
+/// 实例隔离：instance_id 有值时游戏目录 = 实例目录（saves/mods/config 隔离，
+/// 资产/库仍全局共享，与 FCL 的版本隔离语义一致）。
+fn build_plan_for(
+    version_id: &str,
+    instance_id: Option<&str>,
+) -> Result<(model::VersionJson, jvmops::LaunchPlan, u32), String> {
+    let resolved = meta::resolve_version_chain(version_id)
+        .map_err(|e| format!("版本解析失败：{e}"))?;
+    let version = resolved.version;
+    let jar_path = paths::versions_dir()
+        .join(&resolved.jar_version)
+        .join(format!("{}.jar", resolved.jar_version));
+    if !jar_path.exists() {
+        return Err(format!(
+            "版本 {} 的 client jar 缺失，请重新下载",
+            resolved.jar_version
+        ));
     }
     let major = version
         .java_version
@@ -1554,8 +2131,20 @@ fn build_plan_for(version_id: &str) -> Result<(model::VersionJson, jvmops::Launc
         .filter(|l| rules::evaluate(&l.rules, &ctx))
         .collect();
 
-    let game_dir = paths::minecraft_dir();
-    let natives_root = game_dir.join("natives");
+    let mc_dir = paths::minecraft_dir();
+    let natives_root = mc_dir.join("natives");
+    let instance_dir = match instance_id {
+        Some(id) => {
+            let store = instance::InstanceStore::new(mc_dir.join("instances"));
+            let found = store
+                .get(id)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| format!("实例不存在：{id}"))?;
+            let _ = found;
+            store.instance_dir(id)
+        }
+        None => mc_dir.clone(),
+    };
     // Android：移植版 LWJGL 合并 jar 替换 Mojang org.lwjgl:*（glibc natives 不可用）
     let lwjgl_jar = if cfg!(target_os = "android") && lwjgl::is_installed() {
         Some(lwjgl::classes_jar())
@@ -1570,7 +2159,8 @@ fn build_plan_for(version_id: &str) -> Result<(model::VersionJson, jvmops::Launc
         natives_root: &natives_root,
         assets_root: &paths::assets_dir(),
         versions_root: &paths::versions_dir(),
-        instance_dir: &game_dir,
+        client_jar_path: Some(jar_path),
+        instance_dir: &instance_dir,
         account: &auth::active_account()
             .map_err(|e| e.to_string())?
             .ok_or("尚未登录，请先在「账户」页添加账号")?,
@@ -2245,8 +2835,14 @@ fn ensure_renderer(app: &AppHandle) -> Result<(), String> {
 /// 真实启动：版本 JSON -> LaunchPlan -> 游戏运行（M0 已接入）。
 /// Android：进程内 JVM + 显示桥（SurfaceView + EGL，v0.1.5 游戏显示接入）；
 /// 桌面：JVM 子进程。JVM pack 缺失时返回 `RUNTIME_MISSING:<major>`，UI 自动触发下载。
+/// instance_id 有值时启动到实例隔离目录（FCL 版本隔离语义）。
 #[tauri::command]
-fn launch_game(version_id: String, app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+fn launch_game(
+    version_id: String,
+    instance_id: Option<String>,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
     let running = {
         #[cfg(target_os = "android")]
         {
@@ -2260,7 +2856,7 @@ fn launch_game(version_id: String, app: AppHandle, state: State<'_, AppState>) -
     if running {
         return Err("已有游戏进程在运行，请先停止后再启动".to_string());
     }
-    let (_version, plan, major) = build_plan_for(&version_id)?;
+    let (_version, plan, major) = build_plan_for(&version_id, instance_id.as_deref())?;
     if !runtime::is_installed(major) {
         return Err(format!("RUNTIME_MISSING:{major}"));
     }
@@ -2422,6 +3018,24 @@ pub fn run() {
             repair_assets,
             list_logs,
             read_log_tail,
+            list_loader_versions,
+            install_loader_cmd,
+            list_instances,
+            create_instance_cmd,
+            delete_instance_cmd,
+            select_instance,
+            set_instance_memory,
+            set_instance_renderer,
+            ms_login,
+            authlib_login,
+            authlib_status,
+            download_authlib,
+            import_mrpack,
+            list_content_cmd,
+            delete_content_cmd,
+            get_settings,
+            set_jvm_args_cmd,
+            set_azure_client_id,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

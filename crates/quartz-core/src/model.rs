@@ -54,6 +54,12 @@ pub struct VersionJson {
     pub kind: String,
     #[serde(default)]
     pub main_class: String,
+    /// 继承的父版本（Fabric/Quilt/Forge/OptiFine 等 loader 版本指向原版基版本）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inherits_from: Option<String>,
+    /// 覆盖默认使用的 client jar（官方版本格式 "jar" 字段；缺省用 <id>.jar）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jar: Option<String>,
     /// 1.13+ 新格式参数（对象数组）。
     #[serde(default)]
     pub arguments: Option<Arguments>,

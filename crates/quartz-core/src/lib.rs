@@ -18,6 +18,7 @@
 //! 测试数据全部内嵌于 `fixtures`（合成样例，结构与真实清单一致，哈希为占位）。
 
 pub mod auth;
+pub mod content;
 pub mod download;
 pub mod error;
 pub mod inputbus;
@@ -34,6 +35,7 @@ pub mod renderbus;
 pub mod renderers;
 pub mod rules;
 pub mod runtime;
+pub mod settings;
 pub mod space;
 pub mod uipack;
 
