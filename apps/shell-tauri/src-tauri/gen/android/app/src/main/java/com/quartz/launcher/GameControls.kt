@@ -8,6 +8,7 @@ import android.graphics.Paint
 import android.graphics.Path
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
+import android.os.Build
 import android.text.Editable
 import android.text.TextWatcher
 import android.view.Gravity
@@ -15,6 +16,7 @@ import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
+import android.view.WindowInsets
 import android.view.inputmethod.InputMethodManager
 import android.widget.EditText
 import android.widget.FrameLayout
@@ -23,15 +25,17 @@ import android.widget.SeekBar
 import android.widget.TextView
 
 /**
- * 游戏内虚拟控制层（v0.1.5，v0.2.1-f 对标 FCL 完整化）：
- * - 左下方向键（W/A/S/D）+ 跳跃 + 潜行 + 疾跑（双击 W 或独立开关）；
- * - 右下动作键：跳跃、丢弃（Q）、副手（F）、「按住攻击」开关；
- * - 右边缘：热键栏 1-9 快捷键列；
- * - 左上系统键：疾跑开关、F3 调试、F5 视角、中键（选取方块）；
- * - 顶部右侧：Esc（暂停）、E（背包）、T（聊天）、键盘、灵敏度；
- * - 滚轮按钮（▲▼）：热键栏切换（grab 模式下双指被右键占用）；
- * - 虚拟光标可视化（未 grab 菜单模式）：跟随触摸移动的鼠标箭头。
- * 全部按键经 GameIpc（Messenger IPC）-> :game 进程桥 -> LWJGL 键回调进入游戏。
+ * 游戏内虚拟控制层（v0.1.5，v0.2.3 布局重排）：<br>
+ * - 菜单模式（未 grab）：仅左上系统键 + 顶部功能键 + 虚拟光标；移动/动作/热键全部隐藏（对标 FCL）；<br>
+ * - 游戏内（grab）：左下方向键（W/A/S/D）+ 疾跑（双击 W）；右下动作键：跳跃、潜行、丢弃（Q）、副手（F）、「按住攻击」；<br>
+ * - 底部中央：热键 1-9 + 滚轮 ▲▼ 横排（避开 MC 自绘热栏与系统手势条）；<br>
+ * - 左上系统键：疾跑开关、F3 调试、F5 视角、中键（选取方块）；<br>
+ * - 顶部右侧：Esc（暂停）、E（背包）、T（聊天）、键盘、灵敏度；<br>
+ * - 虚拟光标可视化（未 grab 菜单模式）：跟随触摸移动的鼠标箭头；<br>
+ * - 系统栏避让：容器按 WindowInsets 打 padding（状态栏/手势条/刘海不遮挡按键）。<br>
+ * v0.2.3 修复：热键列与动作键在右缘重叠、滚轮列与左上系统键重叠、初始未隐藏
+ * grab 专用控件 —— 实机截图确认的三处「按键错位」。全部按键经 GameIpc
+ * （Messenger IPC）-> :game 进程桥 -> LWJGL 键回调进入游戏。
  */
 class GameControls(
     context: Context,
@@ -46,9 +50,12 @@ class GameControls(
 
     /** 虚拟光标视图（未 grab 菜单模式显示）。 */
     private val cursorView: View
-    /** 滚轮/热键列（grab 模式才显示，菜单模式隐藏避免误触）。 */
-    private val wheelCol: LinearLayout
-    private val hotbarCol: LinearLayout
+    /** 底部中央热键横排（1-9 + 滚轮 ▲▼，仅 grab 模式显示）。 */
+    private val hotbarRow: LinearLayout
+    /** 移动键（W/A/S/D，仅 grab 模式显示）。 */
+    private val dpad: LinearLayout
+    /** 右下动作键（跳跃/潜行/丢弃/副手/攻击，仅 grab 模式显示）。 */
+    private val actions: LinearLayout
 
     init {
         // ---- 隐藏输入框（软键盘文本 -> sendChar）----
@@ -80,6 +87,25 @@ class GameControls(
             elevation = dp(8).toFloat()
         }
         addView(cursorView)
+
+        // ---- 系统栏避让：容器 padding = 系统窗口 insets（状态栏/手势条/刘海）----
+        setOnApplyWindowInsetsListener { v, insets ->
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                val bars = insets.getInsets(
+                    WindowInsets.Type.systemBars() or WindowInsets.Type.displayCutout()
+                )
+                v.setPadding(bars.left, bars.top, bars.right, bars.bottom)
+            } else {
+                @Suppress("DEPRECATION")
+                v.setPadding(
+                    insets.systemWindowInsetLeft,
+                    insets.systemWindowInsetTop,
+                    insets.systemWindowInsetRight,
+                    insets.systemWindowInsetBottom
+                )
+            }
+            insets
+        }
 
         // ---- 顶部右侧功能键 ----
         val topRow = row().apply {
@@ -113,8 +139,8 @@ class GameControls(
         sysCol.addView(pickButton())
         addView(sysCol)
 
-        // ---- 左下方向键（W 双击 = 疾跑）----
-        val dpad = LinearLayout(context).apply {
+        // ---- 左下方向键（W 双击 = 疾跑；仅 grab 模式显示）----
+        dpad = LinearLayout(context).apply {
             orientation = LinearLayout.VERTICAL
             layoutParams = LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT,
@@ -131,8 +157,8 @@ class GameControls(
         })
         addView(dpad)
 
-        // ---- 右下动作键 ----
-        val actions = LinearLayout(context).apply {
+        // ---- 右下动作键（仅 grab 模式显示）----
+        actions = LinearLayout(context).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.END
             layoutParams = LayoutParams(
@@ -151,34 +177,32 @@ class GameControls(
         actions.addView(holdButton())
         addView(actions)
 
-        // ---- 右边缘热键栏 1-9 ----
-        hotbarCol = LinearLayout(context).apply {
-            orientation = LinearLayout.VERTICAL
-            layoutParams = LayoutParams(
+        // ---- 底部中央热键横排（1-9 + 滚轮 ▲▼，仅 grab 模式显示）----
+        // 旧版为右缘竖排热键列 + 左缘竖排滚轮列，与右下动作键/左上系统键重叠
+        //（实机截图确认），且底部贴边被手势条遮挡 —— 合并为底中央横排，
+        // 抬高避开 MC 自绘热栏。
+        hotbarRow = LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            layoutParams = FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT,
-                Gravity.CENTER or Gravity.END
-            )
-            setPadding(0, 0, dp(4), 0)
+                Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
+            ).apply {
+                bottomMargin = dp(64) // 抬过 MC 自绘热栏（22 gui px × 缩放）
+            }
         }
+        hotbarRow.addView(wheelButton("▲", +1.0))
         for (n in 1..9) {
-            hotbarCol.addView(digitButton(n))
+            hotbarRow.addView(digitButton(n))
         }
-        addView(hotbarCol)
+        hotbarRow.addView(wheelButton("▼", -1.0))
+        addView(hotbarRow)
 
-        // ---- 滚轮列（grab 模式专用：热键栏切换）----
-        wheelCol = LinearLayout(context).apply {
-            orientation = LinearLayout.VERTICAL
-            layoutParams = LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT,
-                Gravity.CENTER or Gravity.START
-            )
-            setPadding(dp(4), 0, 0, 0)
-        }
-        wheelCol.addView(wheelButton("▲", +1.0))
-        wheelCol.addView(wheelButton("▼", -1.0))
-        addView(wheelCol)
+        // ---- 初始为菜单模式：光标可见，grab 专用控件全部隐藏 ----
+        // 此前仅靠游戏 grab 回调切换，主菜单阶段从未回调 → 热键/滚轮列
+        // 以默认 VISIBLE 状态叠在菜单上（实机截图确认）。
+        setGrabbed(false)
     }
 
     override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
@@ -190,11 +214,12 @@ class GameControls(
         }
     }
 
-    /** grab 状态切换：菜单模式显示光标，游戏内显示滚轮列+热键栏。 */
+    /** grab 状态切换：菜单模式显示光标（隐藏移动/动作/热键），游戏内反之。 */
     fun setGrabbed(grabbed: Boolean) {
         cursorView.visibility = if (grabbed) View.GONE else View.VISIBLE
-        wheelCol.visibility = if (grabbed) View.VISIBLE else View.GONE
-        hotbarCol.visibility = if (grabbed) View.VISIBLE else View.GONE
+        hotbarRow.visibility = if (grabbed) View.VISIBLE else View.GONE
+        dpad.visibility = if (grabbed) View.VISIBLE else View.GONE
+        actions.visibility = if (grabbed) View.VISIBLE else View.GONE
         alpha = if (grabbed) 1f else 0.85f
     }
 

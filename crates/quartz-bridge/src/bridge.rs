@@ -1406,8 +1406,12 @@ pub unsafe extern "system" fn Java_org_lwjgl_glfw_CallbackBridge_nativeSetGrabbi
 // jar 契约：GLFW native 方法
 // ---------------------------------------------------------------------------
 
+/// 回调槽位写入 State.cb_*（pojav_pump_events 同源读取）。
+/// v0.2.3 修复：此前宏写入模块级 static、泵读 State 字段，两处存储互不连通，
+/// 游戏注册的全部 GLFW 回调（光标/按键/鼠标/滚轮）实际落空 —— 实机表现为
+/// 触摸/虚拟按键全无响应（2026-11-24 实测根因）。
 macro_rules! jni_callback_setter {
-    ($symbol:ident, $slot:expr) => {
+    ($symbol:ident, $slot:ident) => {
         #[no_mangle]
         pub unsafe extern "system" fn $symbol(
             _env: *mut JNIEnv,
@@ -1415,44 +1419,36 @@ macro_rules! jni_callback_setter {
             _window: jlong,
             callback: jlong,
         ) -> jlong {
-            $slot.swap(callback as usize, Ordering::AcqRel) as jlong
+            state().$slot.swap(callback as usize, Ordering::AcqRel) as jlong
         }
     };
 }
 
 jni_callback_setter!(
     Java_org_lwjgl_glfw_GLFW_nglfwSetCharCallback,
-    CB_CHAR
+    cb_char
 );
 jni_callback_setter!(
     Java_org_lwjgl_glfw_GLFW_nglfwSetCharModsCallback,
-    CB_CHAR_MODS
+    cb_char_mods
 );
 jni_callback_setter!(
     Java_org_lwjgl_glfw_GLFW_nglfwSetCursorEnterCallback,
-    CB_CURSOR_ENTER
+    cb_cursor_enter
 );
 jni_callback_setter!(
     Java_org_lwjgl_glfw_GLFW_nglfwSetCursorPosCallback,
-    CB_CURSOR_POS
+    cb_cursor_pos
 );
-jni_callback_setter!(Java_org_lwjgl_glfw_GLFW_nglfwSetKeyCallback, CB_KEY);
+jni_callback_setter!(Java_org_lwjgl_glfw_GLFW_nglfwSetKeyCallback, cb_key);
 jni_callback_setter!(
     Java_org_lwjgl_glfw_GLFW_nglfwSetMouseButtonCallback,
-    CB_MOUSE
+    cb_mouse
 );
 jni_callback_setter!(
     Java_org_lwjgl_glfw_GLFW_nglfwSetScrollCallback,
-    CB_SCROLL
+    cb_scroll
 );
-
-static CB_CHAR: AtomicUsize = AtomicUsize::new(0);
-static CB_CHAR_MODS: AtomicUsize = AtomicUsize::new(0);
-static CB_CURSOR_ENTER: AtomicUsize = AtomicUsize::new(0);
-static CB_CURSOR_POS: AtomicUsize = AtomicUsize::new(0);
-static CB_KEY: AtomicUsize = AtomicUsize::new(0);
-static CB_MOUSE: AtomicUsize = AtomicUsize::new(0);
-static CB_SCROLL: AtomicUsize = AtomicUsize::new(0);
 
 #[no_mangle]
 pub unsafe extern "system" fn Java_org_lwjgl_glfw_GLFW_nglfwSetShowingWindow(
