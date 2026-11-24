@@ -168,6 +168,30 @@ pub fn ensure_hook_jar() -> Result<(), String> {
     Ok(())
 }
 
+/// zink 专用：以带正确 SONAME 的 libcutils shim 覆盖 pack 缺陷库。
+///
+/// 根因（实机 2026-11）：IronizedZink v1.1.0 的 libcutils.so 无 DT_SONAME，
+/// bionic dlopen 按完整路径注册 soinfo；libgallium_dri / libEGL_mesa 的
+/// DT_NEEDED "libcutils.so" 按名解析在 clns 命名空间必败（两次预载 pass
+/// 均失败，EGL 起不来）。shim 由交叉 gcc 编译（SONAME=libcutils.so、
+/// 无 DT_NEEDED、property_* 转发系统 bionic、atrace no-op），符号集与
+/// pack 原版完全对齐。幂等：size 一致即跳过。
+pub fn ensure_zink_cutils_shim() -> Result<(), String> {
+    const SHIM: &[u8] = include_bytes!("../bridge/libqzcutils.so");
+    let dst = crate::renderers::install_dir("zink").join("libcutils.so");
+    if !dst.parent().map(|p| p.exists()).unwrap_or(false) {
+        return Ok(()); // zink 未安装（不选 zink 渲染时目录不存在，跳过）
+    }
+    let stale = std::fs::metadata(&dst)
+        .map(|m| m.len() != SHIM.len() as u64)
+        .unwrap_or(true);
+    if stale {
+        std::fs::write(&dst, SHIM).map_err(|e| format!("写入 libcutils shim 失败：{e}"))?;
+        eprintln!("[quartz] zink libcutils shim 已落位（SONAME 修复覆盖 pack 缺陷库）");
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // ART 侧桥接初始化（QuartzBridge 类注入）
 // ---------------------------------------------------------------------------
@@ -1147,6 +1171,13 @@ unsafe fn run_game_from_spec(
         std::env::set_var(k, v);
     }
 
+    // 1.4) zink：SONAME 修复 shim 覆盖 pack 缺陷 libcutils（预载前必须就位）
+    if active_renderer == "zink" {
+        if let Err(e) = ensure_zink_cutils_shim() {
+            eprintln!("[quartz] libcutils shim 落位失败（zink 按名解析将失败）：{e}");
+        }
+    }
+
     // 1.5) 渲染层依赖预载（链接器命名空间按名解析 DT_NEEDED 时不搜索应用
     //      数据目录：zink 的 libc++_shared/libcutils/libglapi/libglxshim/
     //      libgallium_dri 必须由壳层按绝对路径先行 dlopen，之后 Mesa EGL
@@ -1343,6 +1374,9 @@ unsafe fn run_game_from_spec(
         tmp_dir.display()
     ));
     // G1 调优（Pojav 系移动端默认配方）：降低长停顿，改善低端机体验。
+    // v0.2.0-e 修复：G1NewSizePercent 在 OpenJDK17 为 experimental —— 解锁项
+    // 必须位于所有实验项之前（缺它则全参数集 rc=-6，退化到最小集回退路径）。
+    options.push("-XX:+UnlockExperimentalVMOptions".into());
     options.push("-XX:+UseG1GC".into());
     options.push("-XX:G1NewSizePercent=20".into());
     options.push("-XX:G1ReservePercent=20".into());
@@ -1355,6 +1389,36 @@ unsafe fn run_game_from_spec(
     ));
     options.push("-Xlog:init=info:stderr".into());
     options.push("-Djava.security.manager=allow".into());
+
+    // classpath 预检（v0.2.0-e）：逐 jar 存在性/非空 —— 下载管线漏项、
+    // client jar 缺失（「主类未找到」头号嫌疑）在 CreateJavaVM 前直报。
+    for o in &options {
+        if let Some(cp) = o.strip_prefix("-Djava.class.path=") {
+            let entries: Vec<&str> = cp.split(':').collect();
+            let mut missing: Vec<String> = Vec::new();
+            let mut ok = 0usize;
+            for (i, entry) in entries.iter().enumerate() {
+                match std::fs::metadata(entry) {
+                    Ok(m) if m.len() > 0 => ok += 1,
+                    Ok(_) => missing.push(format!("[{i}] {entry}（0 字节）")),
+                    Err(e) => missing.push(format!("[{i}] {entry}（{e}）")),
+                }
+            }
+            if missing.is_empty() {
+                eprintln!("[quartz] classpath 预检：{ok}/{} 项全部就绪", entries.len());
+            } else {
+                eprintln!(
+                    "[quartz] classpath 预检：{}/{} 项就绪，{} 项异常：",
+                    ok,
+                    entries.len(),
+                    missing.len()
+                );
+                for m in &missing {
+                    eprintln!("[quartz] classpath 异常：{m}");
+                }
+            }
+        }
+    }
 
     // 6) dlopen JRE 依赖（绝对路径，绕开 bionic 启动期缓存的 LD_LIBRARY_PATH）
     let mut jvm_handle: *mut c_void = ptr::null_mut();
@@ -1431,18 +1495,29 @@ unsafe fn run_game_from_spec(
             options.len()
         );
         let mut minimal: Vec<String> = Vec::new();
+        // v0.2.0-e 最小集扩充：除 classpath/library.path/tmpdir 等硬需求外，
+        // 保留 JNA/LWJGL/Netty 路径与启动器标识 —— 历史版本最小集过瘦，
+        // 回退成功后 JNA 引导库缺失会让 oshi/text2speech 全线炸。
+        // Xmx 用 spec 原值（-Xmx 前缀匹配），不再硬编码 512M。
         for o in &options {
             let keep = o.starts_with("-Djava.class.path=")
                 || o.starts_with("-Djava.library.path=")
                 || o.starts_with("-Djava.io.tmpdir=")
+                || o.starts_with("-Djna.tmpdir=")
+                || o.starts_with("-Djna.boot.library.path=")
+                || o.starts_with("-Djna.nounpack=")
+                || o.starts_with("-Dorg.lwjgl.")
+                || o.starts_with("-Dio.netty.native.workdir=")
+                || o.starts_with("-Dminecraft.launcher.")
+                || o.starts_with("-Xmx")
                 || o.starts_with("-Djava.security.manager=")
                 || o.starts_with("-XX:ErrorFile=");
             if keep {
                 minimal.push(o.clone());
             }
         }
-        minimal.push("-Xmx512M".into());
         minimal.push("-XX:-UsePerfData".into());
+        minimal.push("-XX:+UnlockExperimentalVMOptions".into());
         eprintln!(
             "[quartz] 最小参数集（{} 项）重试 CreateJavaVM…",
             minimal.len()
@@ -1471,6 +1546,57 @@ unsafe fn run_game_from_spec(
         );
     }
     eprintln!("[quartz] :game 进程内 JVM 创建成功（OpenJDK 17，与 ART 并存）");
+
+    // v0.2.0-e 诊断：回读 JVM 侧 java.class.path / java.library.path 实际值 ——
+    // 「主类未找到」时区分「属性未生效」与「jar 不可读」两类根因。
+    {
+        let tbl = &**env;
+        let sys_cls = (tbl.FindClass.unwrap())(env, c"java/lang/System".as_ptr());
+        if sys_cls.is_null() {
+            (tbl.ExceptionClear.unwrap())(env);
+            eprintln!("[quartz][diag] java/lang/System 定位失败（异常环境）");
+        } else if let Some(mid) = {
+            let m = (tbl.GetStaticMethodID.unwrap())(
+                env,
+                sys_cls,
+                c"getProperty".as_ptr(),
+                c"(Ljava/lang/String;)Ljava/lang/String;".as_ptr(),
+            );
+            if m.is_null() {
+                (tbl.ExceptionClear.unwrap())(env);
+                None
+            } else {
+                Some(m)
+            }
+        } {
+            for key in ["java.class.path", "java.library.path"] {
+                let jkey = (tbl.NewStringUTF.unwrap())(env, key.as_ptr());
+                let jargs = [jni_sys::jvalue { l: jkey }];
+                let jval = (tbl.CallStaticObjectMethodA.unwrap())(env, sys_cls, mid, jargs.as_ptr());
+                if (tbl.ExceptionCheck.unwrap())(env) != 0 {
+                    (tbl.ExceptionClear.unwrap())(env);
+                    continue;
+                }
+                if jval.is_null() {
+                    eprintln!("[quartz][diag] JVM 属性 {key} = <null>（未生效！）");
+                    continue;
+                }
+                let p = (tbl.GetStringUTFChars.unwrap())(env, jval, ptr::null_mut());
+                if p.is_null() {
+                    (tbl.ExceptionClear.unwrap())(env);
+                    continue;
+                }
+                let s = CStr::from_ptr(p).to_string_lossy().into_owned();
+                (tbl.ReleaseStringUTFChars.unwrap())(env, jval, p);
+                let head: String = s.chars().take(240).collect();
+                eprintln!("[quartz][diag] JVM 属性 {key}：len={} head={head}", s.len());
+            }
+        }
+        if (tbl.ExceptionCheck.unwrap())(env) != 0 {
+            (tbl.ExceptionClear.unwrap())(env);
+        }
+    }
+
     // JVM 初始化会覆盖 SIGABRT 处理器（HotSpot 崩溃报告用）：重装拦截 ——
     // HotSpot 写完 hs_err 后调用 abort()，仍落入本拦截（干净退出，不惊动系统）。
     install_fatal_signal_handlers();
@@ -1496,6 +1622,8 @@ unsafe fn run_game_from_spec(
         let sm_name = CString::new("com/quartz/game/QuartzExitManager").unwrap();
         let sm_cls = (tbl.FindClass.unwrap())(env, sm_name.as_ptr());
         if sm_cls.is_null() {
+            // v0.2.0-e：先打印真实异常堆栈再清除（诊断「找不到」的真实原因）
+            (tbl.ExceptionDescribe.unwrap())(env);
             (tbl.ExceptionClear.unwrap())(env);
             eprintln!("[quartz] 退出捕获类未找到（hook jar 未进 classpath？）");
         } else {
@@ -1528,6 +1656,9 @@ unsafe fn run_game_from_spec(
     let cls_c = CString::new(main_path.clone()).unwrap();
     let cls = (tbl.FindClass.unwrap())(env, cls_c.as_ptr());
     if cls.is_null() {
+        // v0.2.0-e：打印真实异常（ClassNotFoundException 详情）再清除 ——
+        // 区分「类缺失」与「加载器初始化失败」；上方 [diag] 回读可交叉验证。
+        (tbl.ExceptionDescribe.unwrap())(env);
         (tbl.ExceptionClear.unwrap())(env);
         return Err(format!("主类 {} 未找到（classpath 配置错误？）", spec.main_class));
     }

@@ -67,6 +67,12 @@ const IRONIZED_ZINK_APK: &str =
 /// bionic shim（DT_NEEDED 实测确认）—— 白名单缺 libc++_shared.so 时
 /// dlopen(libcutils.so) 必败，连带 libEGL_mesa / libgallium_dri 全链失败，
 /// EGL 未初始化 → LWJGL 函数指针 NULL → pc=0 SIGSEGV。
+///
+/// v0.2.0-e 实机诊断②：pack 的 libcutils.so **无 DT_SONAME** —— bionic
+/// dlopen 按完整路径注册 soinfo，libgallium_dri/libEGL_mesa 的 DT_NEEDED
+/// "libcutils.so" 按名解析在 clns 命名空间必败。对策：提取原版落位后，
+/// game_bridge::ensure_zink_cutils_shim() 在预载前用带 SONAME 的 shim
+/// 覆盖（bridge/libcutils_shim.c 交叉编译，符号集与原版对齐）。
 const ZINK_APK_LIBS: &[(&str, &str)] = &[
     ("libEGL_mesa.so", "libEGL_mesa.so"),
     ("libglapi.so", "libglapi.so"),
