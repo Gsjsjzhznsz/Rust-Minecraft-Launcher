@@ -192,6 +192,68 @@ pub fn ensure_zink_cutils_shim() -> Result<(), String> {
     Ok(())
 }
 
+/// 渲染层 EGL 预检（v0.2.7）：预载完成后立刻按桥接层同款语义 dlopen 渲染层
+/// EGL 实现 + eglGetDisplay(EGL_DEFAULT_DISPLAY) + eglInitialize 一次。
+///
+/// 根因（2026-11-24 17:35 实机日志）：zink（Mesa libEGL_mesa）在该设备
+/// eglInitialize 返回 0x3001（EGL_NOT_INITIALIZED，Vulkan 驱动/平台初始化
+/// 失败），此前预检只看文件存在性 → 一路 CreateJavaVM + MC 启动到
+/// pojavCreateContext 返回 NULL → LWJGL IllegalStateException → 退出码 255，
+/// 用户只见「直接崩溃」。这里失败即提前干净退出（252 通道），错误行带
+/// QUARTZ_RENDERER_EGL_FAIL 标记 —— 主进程 finish_game_exit 捕获后自动回退
+/// 渲染层（见 fallback_renderer_after_exit）。预检与后续 load_api 的二次
+/// dlopen/eglInitialize 幂等（句柄复用，EGL 对已初始化 display 返回 TRUE）。
+fn probe_renderer_egl(id: &str) -> Result<(), String> {
+    let dir = crate::renderers::install_dir(id);
+    let egl_lib = crate::renderers::spec_for(id)
+        .map(|s| s.egl_lib)
+        .unwrap_or("libEGL.so");
+    let path = dir.join(egl_lib);
+    let fail = |detail: String| -> Result<(), String> {
+        let msg = format!("QUARTZ_RENDERER_EGL_FAIL:renderer={id}:{detail}");
+        eprintln!("[quartz] 渲染层 EGL 预检失败：{msg}");
+        Err(msg)
+    };
+    if !path.exists() {
+        return fail(format!("渲染层库缺失 {}", path.display()));
+    }
+    unsafe {
+        let c = CString::new(path.to_string_lossy().into_owned()).unwrap();
+        let h = dlopen(c.as_ptr(), RTLD_NOW | RTLD_GLOBAL);
+        if h.is_null() {
+            let e = last_dlerror();
+            return fail(format!("dlopen 失败 {e}"));
+        }
+        type GetDisplay = unsafe extern "system" fn(*mut c_void) -> *mut c_void;
+        type Initialize =
+            unsafe extern "system" fn(*mut c_void, *mut i32, *mut i32) -> u32;
+        type GetError = unsafe extern "system" fn() -> i32;
+        let mut fns: Vec<(*mut c_void, &str)> = Vec::new();
+        for sym in ["eglGetDisplay", "eglInitialize", "eglGetError"] {
+            let cs = CString::new(sym).unwrap();
+            let p = dlsym(h, cs.as_ptr());
+            if p.is_null() {
+                return fail(format!("{sym} 符号缺失"));
+            }
+            fns.push((p, sym));
+        }
+        let get_display: GetDisplay = std::mem::transmute(fns[0].0);
+        let initialize: Initialize = std::mem::transmute(fns[1].0);
+        let get_error: GetError = std::mem::transmute(fns[2].0);
+        let dpy = get_display(ptr::null_mut());
+        if dpy.is_null() {
+            return fail(format!("eglGetDisplay=NULL err={:#06x}", get_error()));
+        }
+        let (mut major, mut minor) = (0i32, 0i32);
+        if initialize(dpy, &mut major, &mut minor) != 1 {
+            let err = get_error();
+            return fail(format!("eglInitialize={err:#06x}"));
+        }
+        eprintln!("[quartz] 渲染层 EGL 预检通过：{id}（EGL {major}.{minor}）");
+        Ok(())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // ART 侧桥接初始化（QuartzBridge 类注入）
 // ---------------------------------------------------------------------------
@@ -578,6 +640,9 @@ pub fn finish_game_exit(code: i32) {
     // 同步排干游戏日志剩余行：nativeRunGame 的错误详情（如 JNI_CreateJavaVM
     // 失败原因）与 MSG_EXIT 同窗期落盘，tail 线程轮询赶不上 —— 不排干就是盲盒。
     drain_game_log_to_console();
+    // v0.2.7 渲染层自动回退（扫描 EGL 失败标记，见函数注释）—— 在 emit 退出
+    // 事件前执行，让 UI 日志带上回退说明。
+    maybe_fallback_renderer_after_exit();
     GAME_RUNNING.store(false, Ordering::SeqCst);
     TAIL_ACTIVE.store(false, Ordering::SeqCst);
     hide_game_surface();
@@ -622,6 +687,54 @@ fn append_state_log(line: &str) {
     }
 }
 
+/// v0.2.7 渲染层自动回退：检测 :game 退出日志中的渲染层 EGL 失败标记
+/// （QUARTZ_RENDERER_EGL_FAIL 来自 :game 内预检 probe_renderer_egl；兼容桥接层
+/// 迟败路径的「EGL 初始化失败」行），自动把选中渲染层回退到 MobileGlues
+///（1.17+ 唯一完整 GLES3 转译层）并在 UI 日志写明原因。
+/// zink/Mesa 在部分设备 eglInitialize 0x3001（2026-11-24 实机）——没有这一步
+/// 用户就陷入「选 Zink → 直接崩溃」的闪退循环。幂等：已是 MobileGlues 则不动作。
+fn maybe_fallback_renderer_after_exit() {
+    let Some(path) = STATE_GAME_LOG_PATH
+        .lock()
+        .ok()
+        .and_then(|g| g.clone())
+    else {
+        return;
+    };
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    // 只扫退出前的尾部（预检标记在末尾；桥接层迟败标记距尾部 ≤100 行）。
+    let tail: String = text
+        .lines()
+        .rev()
+        .take(120)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>()
+        .join("\n");
+    let hit = tail.contains("QUARTZ_RENDERER_EGL_FAIL") || tail.contains("EGL 初始化失败");
+    if !hit {
+        return;
+    }
+    let active = crate::renderers::active();
+    if active == "mobileglues" {
+        append_state_log("[quartz] 渲染层 EGL 初始化失败且当前已是 MobileGlues：无可回退目标，保持不变");
+        return;
+    }
+    match crate::renderers::set_active("mobileglues") {
+        Ok(()) => {
+            let line = format!(
+                "[quartz] 渲染层「{active}」在该设备 EGL 初始化失败（详见上方错误），已自动回退到 MobileGlues —— 下次启动生效"
+            );
+            eprintln!("{line}");
+            append_state_log(&line);
+        }
+        Err(e) => append_state_log(&format!("[quartz] 渲染层自动回退失败：{e}")),
+    }
+}
+
 /// 停止游戏：向 :game 进程服务发 MSG_STOP（服务自杀进程），
 /// UI 恢复由 binder death 回调（gameProcessGone）完成。
 pub fn stop_game_process() {
@@ -629,257 +742,32 @@ pub fn stop_game_process() {
     let _ = call_activity_static("stopGameServiceStatic", "()V", &[]);
 }
 
-/// 致命信号拦截（:game 进程）：SIGABRT/SIGBUS/SIGFPE/SIGILL 到达时写一行证据到
-/// 日志（fd 2 已重定向到游戏日志），随后 _exit(128+sig)。
-/// 目的：让 :game 进程以“正常退出”姿态死亡 —— 不经 debuggerd/ams_crash 通道，
-/// 部分 ROM（MIUI 等）对崩溃进程会整组杀掉应用，此拦截切断该路径；
-/// 启动器 UI 经 binder death 回调可靠恢复。
-/// 注意：故意不拦截 SIGSEGV —— HotSpot 依赖它做隐式空检查；JVM 致命错误写完
-/// hs_err 后走 abort()，仍会落入本拦截。
-///
-/// v0.2.4 诊断增强（SA_SIGINFO）：追加 pc/lr/寄存器现场 + dladdr(lr) 定位
-/// 崩溃模块（HotSpot 写 hs_err 后 abort 的场景，pc/lr 指向 JIT/匿名段，
-/// 模块名能区分 JVM 代码缓存 vs 匿名执行内存）。处理内只做 write + dladdr
-/// （bionic dladdr 无锁无分配），不碰 std 格式化。
-#[repr(C)]
-struct SigUContext {
-    uc_flags: u64,
-    uc_link: *mut c_void,
-    uc_stack: [u64; 3],
-    uc_mcontext: SigMContext,
-}
+/// 【v0.2.7 已移除】致命信号拦截（SIGABRT/SIGBUS/SIGFPE/SIGILL 干净退出）。
+/// 移除原因（两个独立的实锤）：
+/// ① 采集实现有 aarch64 结构体错位 —— SigMContext 首字段 fault_address 在
+///    kernel arm64 sigcontext（regs[31], sp, pc, pstate, __reserved）里**不存在**
+///    （那是 x86 布局），整体移位 8 字节：记录的 fault 实为 x0、lr 实为 sp、
+///    pc 实为 pstate……v0.2.4/v0.2.6 全部「fatal signal」记录（pc=0xb8、sp=0、
+///    fault=0x80001204）因此都是移位垃圾，v0.2.5/v0.2.6 的「设备 ucontext 不可信」
+///    结论也源于这个 bug（两次启动逐位一致 = 真实寄存器本就确定，不是假快照）。
+/// ② 拦截本身吞掉 tombstone：SIGILL/SIGABRT 走本拦截即 _exit，debuggerd 不产
+///    报告，只剩错位寄存器；而 SIGSEGV（不拦）的 19:10 tombstone 反而完整可用
+///    （pc=0、lr=匿名段+0x99a8 指纹即由它定位）。HyperOS 实测 :game 崩溃走
+///    debuggerd 不影响启动器 UI（binder death 恢复，2026-11-24 19:10 验证）。
+/// 结论：所有致命信号统一交还原生链 → debuggerd tombstone（logcat crash 缓冲
+/// 由下方 gameProcessGone 兜底采集进 launch 日志），下轮崩溃可精确符号化。
+/// SIGSEGV 不插桩的 v0.2.6 结论不变（HotSpot 隐式空检查依赖原生处理链）。
 
-/// Linux aarch64 sigcontext 布局（kernel asm/sigcontext.h）。
-#[repr(C)]
-struct SigMContext {
-    fault_address: u64,
-    regs: [u64; 31], // x0..x30
-    sp: u64,
-    pc: u64,
-    pstate: u64,
-}
-
-unsafe extern "C" fn quartz_on_fatal_signal(
-    sig: c_int,
-    _info: *mut libc::siginfo_t,
-    uctx: *mut c_void,
-) {
-    // 仅 async-signal-safe 操作：栈上缓冲 + write + dladdr。
-    const MSG: &[u8] = b"==== [quartz] :game fatal signal (intercepted, clean exit) ====\n";
-    unsafe { libc::write(2, MSG.as_ptr() as *const c_void, MSG.len()) };
-
-    let uc = unsafe { &*(uctx as *const SigUContext) };
-    let pc = uc.uc_mcontext.pc;
-    let lr = uc.uc_mcontext.regs[30];
-    let mut buf = [0u8; 512];
-    let mut n = 0usize;
-    fn push_str(buf: &mut [u8], n: &mut usize, s: &str) {
-        for b in s.as_bytes() {
-            if *n < buf.len() {
-                buf[*n] = *b;
-                *n += 1;
-            }
-        }
-    }
-    fn push_hex(buf: &mut [u8], n: &mut usize, v: u64) {
-        const HEX: &[u8; 16] = b"0123456789abcdef";
-        if *n < buf.len() {
-            buf[*n] = b'0';
-            *n += 1;
-        }
-        if *n < buf.len() {
-            buf[*n] = b'x';
-            *n += 1;
-        }
-        // 完整 16 位十六进制（崩溃地址无歧义，肉眼对齐 logcat tombstone 方便）
-        for shift in (0..64).step_by(4).rev() {
-            let d = ((v >> shift) & 0xf) as usize;
-            if *n < buf.len() {
-                buf[*n] = HEX[d];
-                *n += 1;
-            }
-        }
-    }
-    push_str(&mut buf, &mut n, "[quartz][fatal] sig=");
-    push_hex(&mut buf, &mut n, sig as u64);
-    push_str(&mut buf, &mut n, " pc=");
-    push_hex(&mut buf, &mut n, pc);
-    push_str(&mut buf, &mut n, " lr=");
-    push_hex(&mut buf, &mut n, lr);
-    push_str(&mut buf, &mut n, " sp=");
-    push_hex(&mut buf, &mut n, uc.uc_mcontext.sp);
-    push_str(&mut buf, &mut n, " fault=");
-    push_hex(&mut buf, &mut n, uc.uc_mcontext.fault_address);
-    push_str(&mut buf, &mut n, " x0=");
-    push_hex(&mut buf, &mut n, uc.uc_mcontext.regs[0]);
-    push_str(&mut buf, &mut n, " x1=");
-    push_hex(&mut buf, &mut n, uc.uc_mcontext.regs[1]);
-    // dladdr(lr)：崩溃发生模块 + 最近符号（JIT 匿名段时模块名为 <anonymous>）
-    let mut info: libc::Dl_info = unsafe { std::mem::zeroed() };
-    if unsafe { libc::dladdr(lr as *const c_void, &mut info) } != 0 {
-        if !info.dli_fname.is_null() {
-            let fname = unsafe { CStr::from_ptr(info.dli_fname) };
-            push_str(&mut buf, &mut n, " lr_mod=");
-            push_str(&mut buf, &mut n, &fname.to_string_lossy());
-            let base = info.dli_fbase as usize;
-            if lr as usize >= base {
-                push_str(&mut buf, &mut n, "+");
-                push_hex(&mut buf, &mut n, (lr as usize - base) as u64);
-            }
-        }
-        if !info.dli_sname.is_null() {
-            let sname = unsafe { CStr::from_ptr(info.dli_sname) };
-            push_str(&mut buf, &mut n, " lr_sym=");
-            push_str(&mut buf, &mut n, &sname.to_string_lossy());
-        }
-    }
-    if unsafe { libc::dladdr(pc as *const c_void, &mut info) } != 0
-        && !info.dli_fname.is_null()
-    {
-        let fname = unsafe { CStr::from_ptr(info.dli_fname) };
-        push_str(&mut buf, &mut n, " pc_mod=");
-        push_str(&mut buf, &mut n, &fname.to_string_lossy());
-    }
-    push_str(&mut buf, &mut n, "\n");
-    unsafe { libc::write(2, buf.as_ptr() as *const c_void, n) };
-    unsafe { libc::_exit(128 + sig) };
-}
-
-fn install_fatal_signal_handlers() {
-    unsafe {
-        for sig in [libc::SIGABRT, libc::SIGBUS, libc::SIGFPE, libc::SIGILL] {
-            let mut act: libc::sigaction = std::mem::zeroed();
-            act.sa_sigaction = quartz_on_fatal_signal as *const () as usize;
-            act.sa_flags = libc::SA_RESTART | libc::SA_SIGINFO;
-            libc::sigaction(sig, &act, ptr::null_mut());
-        }
-    }
-}
-
-/// SIGSEGV pc=0 专诊（v0.2.5）：调用空函数指针的崩溃指纹（设备两次闪退同现：
-/// pc=0、lr=匿名段+0x99a8、参数 (window,0,1,0)）。pc=0 时输出完整寄存器现场 +
-/// /proc/self/maps —— 匿名执行段按基址/大小即能判明身份（HotSpot 代码缓存 vs
-/// libffi 闭包池 vs ART JIT），并留 tombstone 级证据。pc!=0（HotSpot 隐式空检查、
-/// 栈守卫等）一律转发原处理器，JVM 语义不受影响。
-static SEGV_OLD_HANDLER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-/// 0=未安装；1=默认动作（SIG_DFL）；2=SA_SIGINFO 处理器
-static SEGV_OLD_KIND: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
-unsafe extern "C" fn quartz_on_segv_diag(
-    sig: c_int,
-    info: *mut libc::siginfo_t,
-    uctx: *mut c_void,
-) {
-    let uc = unsafe { &*(uctx as *const SigUContext) };
-    let pc = uc.uc_mcontext.pc;
-    if pc != 0 {
-        // 非「调用空指针」：转发原处理器（HotSpot 隐式空检查/守卫页路径）
-        match SEGV_OLD_KIND.load(Ordering::SeqCst) {
-            2 => {
-                let h = SEGV_OLD_HANDLER.load(Ordering::SeqCst);
-                if h != 0 {
-                    let f: extern "C" fn(c_int, *mut libc::siginfo_t, *mut c_void) =
-                        std::mem::transmute(h);
-                    unsafe { f(sig, info, uctx) };
-                    return;
-                }
-            }
-            _ => {}
-        }
-        // 无原处理器：恢复默认并重发（让 debuggerd 记录）
-        unsafe {
-            let mut dfl: libc::sigaction = std::mem::zeroed();
-            libc::sigemptyset(&mut dfl.sa_mask);
-            libc::sigaction(libc::SIGSEGV, &dfl, ptr::null_mut());
-            libc::raise(sig);
-            // 不可达
-            libc::_exit(128 + sig);
-        }
-    }
-    // pc == 0：调用空函数指针 —— 写全量现场后干净退出
-    const MSG: &[u8] =
-        b"==== [quartz] :game SIGSEGV pc=0 (null function pointer call) ====\n";
-    unsafe { libc::write(2, MSG.as_ptr() as *const c_void, MSG.len()) };
-    let mut buf = [0u8; 4096];
-    let mut n = 0usize;
-    fn push_str(buf: &mut [u8], n: &mut usize, s: &str) {
-        for b in s.as_bytes() {
-            if *n < buf.len() {
-                buf[*n] = *b;
-                *n += 1;
-            }
-        }
-    }
-    fn push_hex(buf: &mut [u8], n: &mut usize, v: u64) {
-        const HEX: &[u8; 16] = b"0123456789abcdef";
-        push_str(buf, n, "0x");
-        for shift in (0..64).step_by(4).rev() {
-            let d = ((v >> shift) & 0xf) as usize;
-            if *n < buf.len() {
-                buf[*n] = HEX[d];
-                *n += 1;
-            }
-        }
-    }
-    push_str(&mut buf, &mut n, "[quartz][segv0] ");
-    for (i, r) in uc.uc_mcontext.regs.iter().enumerate() {
-        push_str(&mut buf, &mut n, &format!("x{i}="));
-        push_hex(&mut buf, &mut n, *r);
-        if i % 4 == 3 {
-            push_str(&mut buf, &mut n, "\n");
-        } else {
-            push_str(&mut buf, &mut n, " ");
-        }
-    }
-    push_str(&mut buf, &mut n, "sp=");
-    push_hex(&mut buf, &mut n, uc.uc_mcontext.sp);
-    push_str(&mut buf, &mut n, " pc=");
-    push_hex(&mut buf, &mut n, pc);
-    push_str(&mut buf, &mut n, " fault=");
-    push_hex(&mut buf, &mut n, uc.uc_mcontext.fault_address);
-    push_str(&mut buf, &mut n, "\n");
-    push_str(&mut buf, &mut n, "[quartz][segv0] ---- /proc/self/maps ----\n");
-    unsafe { libc::write(2, buf.as_ptr() as *const c_void, n) };
-    // maps 全量转写（open/read/write 均为 async-signal-safe 系统调用）
-    unsafe {
-        let path = c"/proc/self/maps";
-        let fd = libc::open(path.as_ptr(), libc::O_RDONLY);
-        if fd >= 0 {
-            let mut rbuf = [0u8; 8192];
-            loop {
-                let r = libc::read(fd, rbuf.as_mut_ptr() as *mut c_void, rbuf.len());
-                if r <= 0 {
-                    break;
-                }
-                libc::write(2, rbuf.as_ptr() as *const c_void, r as usize);
-            }
-            libc::close(fd);
-        }
-    }
-    let tail = b"[quartz][segv0] ---- maps end ----\n";
-    unsafe { libc::write(2, tail.as_ptr() as *const c_void, tail.len()) };
-    libc::_exit(128 + sig);
-}
-
-fn install_segv_diag() {
-    unsafe {
-        let mut old: libc::sigaction = std::mem::zeroed();
-        libc::sigaction(libc::SIGSEGV, ptr::null_mut(), &mut old);
-        let (h, kind): (usize, usize) = if old.sa_sigaction == libc::SIG_DFL as usize {
-            (0, 1)
-        } else {
-            (old.sa_sigaction, 2)
-        };
-        SEGV_OLD_HANDLER.store(h, Ordering::SeqCst);
-        SEGV_OLD_KIND.store(kind, Ordering::SeqCst);
-        let mut act: libc::sigaction = std::mem::zeroed();
-        act.sa_sigaction = quartz_on_segv_diag as *const () as usize;
-        act.sa_flags = libc::SA_SIGINFO;
-        libc::sigemptyset(&mut act.sa_mask);
-        libc::sigaction(libc::SIGSEGV, &act, ptr::null_mut());
-        eprintln!("[quartz] SIGSEGV pc=0 专诊已装（pc!=0 转发原处理器：{kind}）");
-    }
-}
+// 【v0.2.6 已移除】SIGSEGV pc=0 专诊处理器（v0.2.5 引入，实机为害）：
+// 设计上 pc!=0 转发原处理器、pc==0 落盘现场，但设备实机（Android 15 / MTK，
+// ART sigchain 与 HotSpot 信号处理链并存）证明其 ucontext 读取不可信 ——
+// 两次独立启动的「寄存器现场」逐位一致（真实快照不可能），fault=0x80001204
+// 恰为 HotSpot 堆基址 0x800000000+offset 的隐式空检查指纹，却被按「pc=0
+// 调空指针」误杀 —— 游戏在 FindClass(主类) 的类加载期第一次隐式空检查处
+// 直接退出（「直接崩溃」，MC 未进 main）。结论：**SIGSEGV 一律不插桩**，
+// HotSpot/aarch64 的隐式空检查、栈守卫、安全点轮询依赖原生处理链
+// （sigchain → HotSpot javaSignalHandler）完整工作；真实 pc=0 崩溃的取证
+// 走 debuggerd tombstone（v0.2.3/v0.2.4 实测可靠，0x99a8 闭包指纹即由它定位）。
 
 /// 主进程回调：:game 进程正常结束（GameService 发 MSG_EXIT 后自杀）。
 #[no_mangle]
@@ -907,9 +795,9 @@ pub unsafe extern "C" fn Java_com_quartz_launcher_GameHost_gameProcessGone(
         });
     }
     finish_game_exit(if stopped { 137 } else { 134 });
-    // 崩溃证据补充采集（异步，不拖慢 UI 恢复）：v0.1.8 起致命信号已在 :game
-    // 侧拦截为干净退出（通常无 debuggerd 记录），此处兜底抓取 crash 缓冲，
-    // JVM 写 hs_err 前的 abort / 拦截器未覆盖的极端路径仍可留痕。
+    // 崩溃证据补充采集（异步，不拖慢 UI 恢复）：v0.2.7 起致命信号一律交还
+    // 原生链（拦截器已移除），debuggerd tombstone 会落 logcat crash 缓冲，
+    // 此处把缓冲采集进 launch 日志；JVM hs_err 同步回收（SIGABRT 家族）。
     if !stopped {
         std::thread::spawn(|| {
             let out = std::process::Command::new("logcat")
@@ -1382,10 +1270,11 @@ unsafe fn run_game_from_spec(
         spec.game_root,
         spec.runtime_dir
     );
-    // 致命信号拦截：先装一次（覆盖 JVM dlopen/初始化期间的 abort）——
-    // 让崩溃进程以干净退出码消失，避免部分 ROM 因 debuggerd 崩溃报告整组杀掉应用。
-    install_fatal_signal_handlers();
-    install_segv_diag();
+    // 【v0.2.7】不装任何致命信号拦截：SIGABRT/SIGBUS/SIGFPE/SIGILL 全部交还
+    // 原生链 → debuggerd tombstone（HyperOS 实测不影响启动器 UI，2026-11-24
+    // 19:10 SIGSEGV 验证）。SIGSEGV 本就不插桩（v0.2.6 结论：HotSpot 隐式空
+    // 检查/栈守卫/安全点依赖原生处理链）。历史拦截器的 aarch64 ucontext
+    // 结构体错位 bug 与取证策略变更详见文件中部【v0.2.7 已移除】注释块。
 
     // 1) 当前目录 + 环境变量
     let workdir = std::path::PathBuf::from(&spec.workdir);
@@ -1490,6 +1379,12 @@ unsafe fn run_game_from_spec(
                 failed.join(", ")
             );
         }
+    }
+    // 1.6) 渲染层 EGL 预检（v0.2.7）：zink/Mesa EGL 初始化失败（实机 0x3001）
+    //      在此处立即干净退出（QUARTZ_RENDERER_EGL_FAIL 标记 → 主进程检测后
+    //      自动回退渲染层），不再带病 CreateJavaVM 撞 LWJGL 空上下文 255。
+    if let Err(e) = probe_renderer_egl(&active_renderer) {
+        return Err(e);
     }
     if active_renderer == "zink" {
         // Mesa 着色器磁盘缓存（可写内部目录；不设则 mesa 退回内存缓存）
@@ -1804,12 +1699,8 @@ unsafe fn run_game_from_spec(
     }
     eprintln!("[quartz] :game 进程内 JVM 创建成功（OpenJDK 17，与 ART 并存）");
 
-    // JVM 初始化会覆盖 SIGABRT 处理器（HotSpot 崩溃报告用）：重装拦截 ——
-    // HotSpot 写完 hs_err 后调用 abort()，仍落入本拦截（干净退出，不惊动系统）。
-    // SIGSEGV 专诊同步重装（此时捕获的「原处理器」即为 HotSpot 隐式空检查处理器，
-    // pc!=0 的 SIGSEGV 转发回它，语义不变）。
-    install_fatal_signal_handlers();
-    install_segv_diag();
+    // 【v0.2.7】不重装信号拦截（已整体移除，见文件中部注释块）：HotSpot 写完
+    // hs_err 后 abort() 直接落 debuggerd tombstone，取证完整。
 
     // 7.5) 显式注入 runtime VM：统一桥路径后，壳层先 dlopen 了桥库，libart
     //      的 System.loadLibrary 发现库已载会跳过 JNI_OnLoad —— rt_vm/GLFW

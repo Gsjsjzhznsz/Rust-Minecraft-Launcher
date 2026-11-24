@@ -1203,20 +1203,20 @@ pub extern "C" fn pojav_pump_events(window: *mut c_void) {
         let s = state();
         if s.upd_mouse.load(Ordering::Acquire) {
             let cursor = *s.cursor.lock().unwrap();
-            // v0.2.5 直调优先；未就绪时回退旧闭包路径
-            let direct = unsafe {
-                invoke_direct(
+            // v0.2.7 统一派发：直调优先；Android 不回落闭包（见 pump_dispatch 注释）
+            unsafe {
+                pump_dispatch(
+                    "cursor-pos",
                     &s.cb_cursor_pos_obj,
                     &s.mid_cursor_pos,
+                    &s.cb_cursor_pos,
                     &[jvalue { j: window as jlong }, jvalue { d: cursor.0 }, jvalue { d: cursor.1 }],
-                )
-            };
-            if !direct {
-                let cb = s.cb_cursor_pos.load(Ordering::Acquire);
-                if cb != 0 {
-                    let f: unsafe extern "system" fn(*mut c_void, f64, f64) = std::mem::transmute(cb);
-                    unsafe { f(window, cursor.0, cursor.1) };
-                }
+                    |cb| {
+                        let f: unsafe extern "system" fn(*mut c_void, f64, f64) =
+                            std::mem::transmute(cb);
+                        unsafe { f(window, cursor.0, cursor.1) };
+                    },
+                );
             }
         }
         if s.upd_monitor.load(Ordering::Acquire) {
@@ -1226,58 +1226,60 @@ pub extern "C" fn pojav_pump_events(window: *mut c_void) {
         for ev in events {
             match ev.typ {
                 EVENT_TYPE_CHAR => {
-                    let direct = unsafe {
-                        invoke_direct(
+                    unsafe {
+                        pump_dispatch(
+                            "char",
                             &s.cb_char_obj,
                             &s.mid_char,
+                            &s.cb_char,
                             &[jvalue { j: window as jlong }, jvalue { i: ev.i1 }],
-                        )
-                    };
-                    if !direct {
-                        let cb = s.cb_char.load(Ordering::Acquire);
-                        if cb != 0 {
-                            let f: unsafe extern "system" fn(*mut c_void, u32) = std::mem::transmute(cb);
-                            unsafe { f(window, ev.i1 as u32) };
-                        }
+                            |cb| {
+                                let f: unsafe extern "system" fn(*mut c_void, u32) =
+                                    std::mem::transmute(cb);
+                                unsafe { f(window, ev.i1 as u32) };
+                            },
+                        );
                     }
                 }
                 EVENT_TYPE_CHAR_MODS => {
-                    let direct = unsafe {
-                        invoke_direct(
+                    unsafe {
+                        pump_dispatch(
+                            "char-mods",
                             &s.cb_char_mods_obj,
                             &s.mid_char_mods,
+                            &s.cb_char_mods,
                             &[jvalue { j: window as jlong }, jvalue { i: ev.i1 }, jvalue { i: ev.i2 }],
-                        )
-                    };
-                    if !direct {
-                        let cb = s.cb_char_mods.load(Ordering::Acquire);
-                        if cb != 0 {
-                            let f: unsafe extern "system" fn(*mut c_void, u32, i32) = std::mem::transmute(cb);
-                            unsafe { f(window, ev.i1 as u32, ev.i2) };
-                        }
+                            |cb| {
+                                let f: unsafe extern "system" fn(*mut c_void, u32, i32) =
+                                    std::mem::transmute(cb);
+                                unsafe { f(window, ev.i1 as u32, ev.i2) };
+                            },
+                        );
                     }
                 }
                 EVENT_TYPE_CURSOR_ENTER => {
-                    let direct = unsafe {
-                        invoke_direct(
+                    unsafe {
+                        pump_dispatch(
+                            "cursor-enter",
                             &s.cb_cursor_enter_obj,
                             &s.mid_cursor_enter,
+                            &s.cb_cursor_enter,
                             &[jvalue { j: window as jlong }, jvalue { z: ev.i1 as u8 }],
-                        )
-                    };
-                    if !direct {
-                        let cb = s.cb_cursor_enter.load(Ordering::Acquire);
-                        if cb != 0 {
-                            let f: unsafe extern "system" fn(*mut c_void, i32) = std::mem::transmute(cb);
-                            unsafe { f(window, ev.i1) };
-                        }
+                            |cb| {
+                                let f: unsafe extern "system" fn(*mut c_void, i32) =
+                                    std::mem::transmute(cb);
+                                unsafe { f(window, ev.i1) };
+                            },
+                        );
                     }
                 }
                 EVENT_TYPE_KEY => {
-                    let direct = unsafe {
-                        invoke_direct(
+                    unsafe {
+                        pump_dispatch(
+                            "key",
                             &s.cb_key_obj,
                             &s.mid_key,
+                            &s.cb_key,
                             &[
                                 jvalue { j: window as jlong },
                                 jvalue { i: ev.i1 },
@@ -1285,54 +1287,49 @@ pub extern "C" fn pojav_pump_events(window: *mut c_void) {
                                 jvalue { i: ev.i3 },
                                 jvalue { i: ev.i4 },
                             ],
-                        )
-                    };
-                    if !direct {
-                        let cb = s.cb_key.load(Ordering::Acquire);
-                        if cb != 0 {
-                            let f: unsafe extern "system" fn(*mut c_void, i32, i32, i32, i32) =
-                                std::mem::transmute(cb);
-                            unsafe { f(window, ev.i1, ev.i2, ev.i3, ev.i4) };
-                        }
+                            |cb| {
+                                let f: unsafe extern "system" fn(*mut c_void, i32, i32, i32, i32) =
+                                    std::mem::transmute(cb);
+                                unsafe { f(window, ev.i1, ev.i2, ev.i3, ev.i4) };
+                            },
+                        );
                     }
                 }
                 EVENT_TYPE_MOUSE_BUTTON => {
-                    let direct = unsafe {
-                        invoke_direct(
+                    unsafe {
+                        pump_dispatch(
+                            "mouse-button",
                             &s.cb_mouse_obj,
                             &s.mid_mouse,
+                            &s.cb_mouse,
                             &[
                                 jvalue { j: window as jlong },
                                 jvalue { i: ev.i1 },
                                 jvalue { i: ev.i2 },
                                 jvalue { i: ev.i3 },
                             ],
-                        )
-                    };
-                    if !direct {
-                        let cb = s.cb_mouse.load(Ordering::Acquire);
-                        if cb != 0 {
-                            let f: unsafe extern "system" fn(*mut c_void, i32, i32, i32) =
-                                std::mem::transmute(cb);
-                            unsafe { f(window, ev.i1, ev.i2, ev.i3) };
-                        }
+                            |cb| {
+                                let f: unsafe extern "system" fn(*mut c_void, i32, i32, i32) =
+                                    std::mem::transmute(cb);
+                                unsafe { f(window, ev.i1, ev.i2, ev.i3) };
+                            },
+                        );
                     }
                 }
                 EVENT_TYPE_SCROLL => {
-                    let direct = unsafe {
-                        invoke_direct(
+                    unsafe {
+                        pump_dispatch(
+                            "scroll",
                             &s.cb_scroll_obj,
                             &s.mid_scroll,
+                            &s.cb_scroll,
                             &[jvalue { j: window as jlong }, jvalue { d: ev.dx }, jvalue { d: ev.dy }],
-                        )
-                    };
-                    if !direct {
-                        let cb = s.cb_scroll.load(Ordering::Acquire);
-                        if cb != 0 {
-                            let f: unsafe extern "system" fn(*mut c_void, f64, f64) =
-                                std::mem::transmute(cb);
-                            unsafe { f(window, ev.dx, ev.dy) };
-                        }
+                            |cb| {
+                                let f: unsafe extern "system" fn(*mut c_void, f64, f64) =
+                                    std::mem::transmute(cb);
+                                unsafe { f(window, ev.dx, ev.dy) };
+                            },
+                        );
                     }
                 }
                 _ => {}
@@ -1721,6 +1718,41 @@ unsafe fn invoke_direct(
         log("Java 回调异常已清除（直调路径）");
     }
     true
+}
+
+/// pump 事件派发统一入口（v0.2.7 收口）：优先 v0.2.5 直调路径（CallVoidMethodA
+/// 调 Java 回调对象）。直调任一环未就绪时：
+/// - Android：**丢弃事件**（记一次日志）—— 设备实机 tombstone 两次同指纹
+///   （pc=0，lr=匿名执行段+0x99a8 = libjnidispatch/libffi 静态蹦床区）证明
+///   设备环境 libffi 闭包调用必崩；旧回退名义上是「降级」，实际是「复活已知
+///   崩溃路径」。输入事件丢一帧无碍，进程崩溃则整局游戏没了。
+/// - host-sim：回落闭包路径（沙箱 libffi 正常，模拟测试依赖它）。
+unsafe fn pump_dispatch(
+    label: &str,
+    obj_slot: &AtomicPtr<c_void>,
+    mid_slot: &AtomicPtr<c_void>,
+    cb_slot: &AtomicUsize,
+    args: &[jvalue],
+    fallback: impl FnOnce(usize),
+) {
+    let direct = unsafe { invoke_direct(obj_slot, mid_slot, args) };
+    if direct {
+        return;
+    }
+    let cb = cb_slot.load(Ordering::Acquire);
+    if cb == 0 {
+        return;
+    }
+    #[cfg(target_os = "android")]
+    {
+        log(&format!(
+            "{label} 直调未就绪，事件丢弃（Android 不回落 libffi 闭包：设备实机 pc=0）"
+        ));
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        fallback(cb);
+    }
 }
 
 
