@@ -720,6 +720,24 @@ pub extern "C" fn pojav_create_context(share: *mut c_void) -> *mut c_void {
                 ],
                 es_bit: A_ES3,
             },
+            // #7 空属性（默认 config）：attrib_list 只含 EGL_NONE 是 spec 允许的
+            // 合规形态，任何实现都必须接受。v0.2.4 新增 —— 实机日志（MobileGlues）
+            // 显示 #0-#6 连「SURFACE_TYPE+RENDERABLE_TYPE」最简集都以
+            // EGL_BAD_ATTRIBUTE(0x3004) 拒绝，此前直接跌入 eglGetConfigs 兜底
+            // 拿到无语义项 config（renderable=0x0000）。空属性档优先于盲目兜底。
+            Ladder {
+                attrs: [
+                    egl::EGL_NONE, 0,
+                    0, 0,
+                    0, 0,
+                    0, 0,
+                    0, 0,
+                    0, 0,
+                    0, 0,
+                    0, 0,
+                ],
+                es_bit: A_ES3,
+            },
         ];
         let mut config: egl::EGLConfig = ptr::null_mut();
         let mut format: i32 = 0;

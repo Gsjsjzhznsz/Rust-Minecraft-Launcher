@@ -636,20 +636,121 @@ pub fn stop_game_process() {
 /// 启动器 UI 经 binder death 回调可靠恢复。
 /// 注意：故意不拦截 SIGSEGV —— HotSpot 依赖它做隐式空检查；JVM 致命错误写完
 /// hs_err 后走 abort()，仍会落入本拦截。
-extern "C" fn quartz_on_fatal_signal(sig: c_int) {
-    const MSG: &str = "==== [quartz] :game fatal signal (intercepted, clean exit) ====\n";
-    unsafe {
-        libc::write(2, MSG.as_ptr() as *const c_void, MSG.len());
-        libc::_exit(128 + sig);
+///
+/// v0.2.4 诊断增强（SA_SIGINFO）：追加 pc/lr/寄存器现场 + dladdr(lr) 定位
+/// 崩溃模块（HotSpot 写 hs_err 后 abort 的场景，pc/lr 指向 JIT/匿名段，
+/// 模块名能区分 JVM 代码缓存 vs 匿名执行内存）。处理内只做 write + dladdr
+/// （bionic dladdr 无锁无分配），不碰 std 格式化。
+#[repr(C)]
+struct SigUContext {
+    uc_flags: u64,
+    uc_link: *mut c_void,
+    uc_stack: [u64; 3],
+    uc_mcontext: SigMContext,
+}
+
+/// Linux aarch64 sigcontext 布局（kernel asm/sigcontext.h）。
+#[repr(C)]
+struct SigMContext {
+    fault_address: u64,
+    regs: [u64; 31], // x0..x30
+    sp: u64,
+    pc: u64,
+    pstate: u64,
+}
+
+unsafe extern "C" fn quartz_on_fatal_signal(
+    sig: c_int,
+    _info: *mut libc::siginfo_t,
+    uctx: *mut c_void,
+) {
+    // 仅 async-signal-safe 操作：栈上缓冲 + write + dladdr。
+    const MSG: &[u8] = b"==== [quartz] :game fatal signal (intercepted, clean exit) ====\n";
+    unsafe { libc::write(2, MSG.as_ptr() as *const c_void, MSG.len()) };
+
+    let uc = unsafe { &*(uctx as *const SigUContext) };
+    let pc = uc.uc_mcontext.pc;
+    let lr = uc.uc_mcontext.regs[30];
+    let mut buf = [0u8; 512];
+    let mut n = 0usize;
+    fn push_str(buf: &mut [u8], n: &mut usize, s: &str) {
+        for b in s.as_bytes() {
+            if *n < buf.len() {
+                buf[*n] = *b;
+                *n += 1;
+            }
+        }
     }
+    fn push_hex(buf: &mut [u8], n: &mut usize, v: u64) {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        if *n < buf.len() {
+            buf[*n] = b'0';
+            *n += 1;
+        }
+        if *n < buf.len() {
+            buf[*n] = b'x';
+            *n += 1;
+        }
+        // 完整 16 位十六进制（崩溃地址无歧义，肉眼对齐 logcat tombstone 方便）
+        for shift in (0..64).step_by(4).rev() {
+            let d = ((v >> shift) & 0xf) as usize;
+            if *n < buf.len() {
+                buf[*n] = HEX[d];
+                *n += 1;
+            }
+        }
+    }
+    push_str(&mut buf, &mut n, "[quartz][fatal] sig=");
+    push_hex(&mut buf, &mut n, sig as u64);
+    push_str(&mut buf, &mut n, " pc=");
+    push_hex(&mut buf, &mut n, pc);
+    push_str(&mut buf, &mut n, " lr=");
+    push_hex(&mut buf, &mut n, lr);
+    push_str(&mut buf, &mut n, " sp=");
+    push_hex(&mut buf, &mut n, uc.uc_mcontext.sp);
+    push_str(&mut buf, &mut n, " fault=");
+    push_hex(&mut buf, &mut n, uc.uc_mcontext.fault_address);
+    push_str(&mut buf, &mut n, " x0=");
+    push_hex(&mut buf, &mut n, uc.uc_mcontext.regs[0]);
+    push_str(&mut buf, &mut n, " x1=");
+    push_hex(&mut buf, &mut n, uc.uc_mcontext.regs[1]);
+    // dladdr(lr)：崩溃发生模块 + 最近符号（JIT 匿名段时模块名为 <anonymous>）
+    let mut info: libc::Dl_info = unsafe { std::mem::zeroed() };
+    if unsafe { libc::dladdr(lr as *const c_void, &mut info) } != 0 {
+        if !info.dli_fname.is_null() {
+            let fname = unsafe { CStr::from_ptr(info.dli_fname) };
+            push_str(&mut buf, &mut n, " lr_mod=");
+            push_str(&mut buf, &mut n, &fname.to_string_lossy());
+            let base = info.dli_fbase as usize;
+            if lr as usize >= base {
+                push_str(&mut buf, &mut n, "+");
+                push_hex(&mut buf, &mut n, (lr as usize - base) as u64);
+            }
+        }
+        if !info.dli_sname.is_null() {
+            let sname = unsafe { CStr::from_ptr(info.dli_sname) };
+            push_str(&mut buf, &mut n, " lr_sym=");
+            push_str(&mut buf, &mut n, &sname.to_string_lossy());
+        }
+    }
+    if unsafe { libc::dladdr(pc as *const c_void, &mut info) } != 0
+        && !info.dli_fname.is_null()
+    {
+        let fname = unsafe { CStr::from_ptr(info.dli_fname) };
+        push_str(&mut buf, &mut n, " pc_mod=");
+        push_str(&mut buf, &mut n, &fname.to_string_lossy());
+    }
+    push_str(&mut buf, &mut n, "\n");
+    unsafe { libc::write(2, buf.as_ptr() as *const c_void, n) };
+    unsafe { libc::_exit(128 + sig) };
 }
 
 fn install_fatal_signal_handlers() {
     unsafe {
         for sig in [libc::SIGABRT, libc::SIGBUS, libc::SIGFPE, libc::SIGILL] {
             let mut act: libc::sigaction = std::mem::zeroed();
-            act.sa_sigaction = quartz_on_fatal_signal as usize;
-            act.sa_flags = libc::SA_RESTART;
+            act.sa_sigaction = quartz_on_fatal_signal as *const () as usize;
+            act.sa_flags = libc::SA_RESTART | libc::SA_SIGINFO;
             libc::sigaction(sig, &act, ptr::null_mut());
         }
     }
@@ -699,6 +800,36 @@ pub unsafe extern "C" fn Java_com_quartz_launcher_GameHost_gameProcessGone(
                         continue;
                     }
                     append_state_log(&format!("[logcat-crash] {line}"));
+                }
+            }
+            // v0.2.4 新增：回收 HotSpot hs_err（SIGABRT 家族崩溃时 JVM 先写完
+            // hs_err 再 abort，本拦截把进程转为干净退出 —— hs_err 是唯一含
+            // 完整崩溃现场（SIGSEGV pc=0 / 空函数指针调用帧）的证据文件）。
+            // 只取 15 分钟内新写的文件，避免混入历史运行的旧报告。
+            let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(15 * 60);
+            let mut best: Option<(std::time::SystemTime, std::path::PathBuf)> = None;
+            if let Ok(rd) = std::fs::read_dir(crate::paths::game_root().join("logs")) {
+                for e in rd.flatten() {
+                    let name = e.file_name().to_string_lossy().into_owned();
+                    if !(name.starts_with("hs_err_") && name.ends_with(".log")) {
+                        continue;
+                    }
+                    if let Ok(mt) = e.metadata().and_then(|m| m.modified()) {
+                        if mt < cutoff {
+                            continue;
+                        }
+                        if best.as_ref().map(|(t, _)| mt > *t).unwrap_or(true) {
+                            best = Some((mt, e.path()));
+                        }
+                    }
+                }
+            }
+            if let Some((_, p)) = best {
+                if let Ok(text) = std::fs::read_to_string(&p) {
+                    append_state_log(&format!("[hs_err] 来源：{}", p.display()));
+                    for line in text.lines().take(80) {
+                        append_state_log(&format!("[hs_err] {line}"));
+                    }
                 }
             }
         });
@@ -1648,6 +1779,64 @@ unsafe fn run_game_from_spec(
         }
         if (tbl.ExceptionCheck.unwrap())(env) != 0 {
             (tbl.ExceptionClear.unwrap())(env);
+        }
+    }
+
+    // v0.2.4 修复：-D 属性硬回写。实机诊断（2026-11-24 launch 日志）显示
+    // CreateJavaVM 后 System.getProperty(java.class.path/java.library.path)
+    // 返回 null —— 部分设备 OpenJDK 17 构建（"17-internal"）在 ART 并存场景
+    // 丢弃 -D 系统属性（JVM Flags 列表亦无 -D 项），但 AppClassLoader 已在
+    // 创建期缓存 classpath（主类能加载），于是只有「运行期才读属性」的库受害：
+    // LWJGL 解析 natives（java.library.path / org.lwjgl.librarypath）、
+    // JNA 引导库（jna.boot.library.path）、Netty workdir 全部落空 ——
+    // 设备日志的「Incompatible Java and native library versions」刷屏即此根因。
+    // 对策：调 main 前经 JNI 调 System.setProperty 把全部 -D 属性无条件落位
+    // （幂等；已生效时为无害重写）。
+    {
+        let tbl = &**env;
+        let sys_cls = (tbl.FindClass.unwrap())(env, c"java/lang/System".as_ptr());
+        if sys_cls.is_null() {
+            (tbl.ExceptionClear.unwrap())(env);
+        } else {
+            let mid = (tbl.GetStaticMethodID.unwrap())(
+                env,
+                sys_cls,
+                c"setProperty".as_ptr(),
+                c"(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;".as_ptr(),
+            );
+            if mid.is_null() {
+                (tbl.ExceptionClear.unwrap())(env);
+            } else {
+                let mut applied = 0usize;
+                for o in &options {
+                    if !o.starts_with("-D") {
+                        continue;
+                    }
+                    let Some(eq) = o.find('=') else { continue };
+                    let key = CString::new(&o[2..eq]).unwrap();
+                    let val = CString::new(&o[eq + 1..]).unwrap();
+                    let jk = (tbl.NewStringUTF.unwrap())(env, key.as_ptr());
+                    let jv = (tbl.NewStringUTF.unwrap())(env, val.as_ptr());
+                    if jk.is_null() || jv.is_null() {
+                        (tbl.ExceptionClear.unwrap())(env);
+                        continue;
+                    }
+                    let jargs = [
+                        jni_sys::jvalue { l: jk },
+                        jni_sys::jvalue { l: jv },
+                    ];
+                    (tbl.CallStaticObjectMethodA.unwrap())(env, sys_cls, mid, jargs.as_ptr());
+                    if (tbl.ExceptionCheck.unwrap())(env) != 0 {
+                        (tbl.ExceptionClear.unwrap())(env);
+                    } else {
+                        applied += 1;
+                    }
+                }
+                eprintln!("[quartz] JVM 属性硬回写完成：{applied} 项 -D 落位（对抗 CreateJavaVM 丢属性）");
+            }
+            if (tbl.ExceptionCheck.unwrap())(env) != 0 {
+                (tbl.ExceptionClear.unwrap())(env);
+            }
         }
     }
 

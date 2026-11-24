@@ -175,13 +175,18 @@ pub fn install_dir(id: &str) -> PathBuf {
     paths::runtime_dir().join("renderers").join(id)
 }
 
-/// 安装完整性：EGL 库与 GL 库均存在。
+/// 安装完整性：EGL 库、GL 库与全部预载依赖（preload 清单）均存在。
+/// v0.2.4 修复：旧版只查 egl/gl 两库 —— zink 白名单后补的 libc++_shared.so
+/// 在旧设备残缺包上探测不到，预载链断裂（EGL 初始化 0x3001）→ 启动即崩 255。
+/// 预载清单任一缺失即判未安装，ensure_renderer 会在启动前自动重装。
 pub fn is_installed(id: &str) -> bool {
     let Some(spec) = spec_for(id) else {
         return false;
     };
     let dir = install_dir(id);
-    dir.join(spec.egl_lib).exists() && dir.join(spec.gl_lib).exists()
+    dir.join(spec.egl_lib).exists()
+        && dir.join(spec.gl_lib).exists()
+        && spec.preload.iter().all(|p| dir.join(p).exists())
 }
 
 /// 当前选中的渲染器 id（进程级；落盘于 game_root()/renderer.json）。
