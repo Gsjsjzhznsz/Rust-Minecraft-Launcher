@@ -2,8 +2,26 @@
 # Quartz v9 打包收尾：strip 壳层 so -> repack -> zipalign -> apksigner -> 验证
 set -e
 . /home/z/my-project/scripts/setup-env.sh
-BT=/home/z/my-project/.toolchain/android-sdk/build-tools/36.0.0
-NDKBIN=/home/z/my-project/.toolchain/android-sdk/ndk/27.0.12077973/toolchains/llvm/prebuilt/linux-x86_64/bin
+NDKBIN=$NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin
+# 工具链自适应：优先 build-tools 36，回退 34；strip 优先 NDK llvm-strip，回退 binutils-aarch64
+detect_bt() {
+  for d in $(ls -dv /home/z/my-project/.toolchain/android-sdk/build-tools/*/ 2>/dev/null); do
+    [ -x "$d/zipalign" ] && [ -x "$d/apksigner" ] && { echo "${d%/}"; return; }
+  done
+  echo ""
+}
+BT=$(detect_bt)
+[ -n "$BT" ] || { echo "[pack] ERROR: no build-tools with zipalign/apksigner found"; exit 1; }
+echo "[pack] build-tools: $BT"
+STRIP_BIN=""
+if [ -x "$NDKBIN/llvm-strip" ]; then
+  STRIP_BIN="$NDKBIN/llvm-strip"
+elif [ -x /tmp/apkwork/btbin/usr/bin/aarch64-linux-gnu-strip ]; then
+  STRIP_BIN=/tmp/apkwork/btbin/usr/bin/aarch64-linux-gnu-strip
+  export LD_LIBRARY_PATH=/tmp/apkwork/btbin/usr/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+fi
+[ -n "$STRIP_BIN" ] || { echo "[pack] ERROR: no aarch64 strip tool found"; exit 1; }
+echo "[pack] strip tool: $STRIP_BIN"
 SRC_APK=${QUARTZ_RAW_APK:-/home/z/my-project/apps/shell-tauri/src-tauri/gen/android/app/build/outputs/apk/universal/debug/app-universal-debug.apk}
 OUT_APK=/home/z/my-project/download/Quartz.apk
 KS=/home/z/my-project/keystore/quartz-debug.keystore
@@ -18,7 +36,7 @@ with zipfile.ZipFile(sys.argv[1]) as z:
         o.write(f.read())
 print("[pack] so extracted")
 EOF
-"$NDKBIN/llvm-strip" -o /tmp/apkwork/libquartz_shell_lib-final.so /tmp/apkwork/libquartz_shell_lib.so
+$STRIP_BIN -o /tmp/apkwork/libquartz_shell_lib-final.so /tmp/apkwork/libquartz_shell_lib.so
 echo "[pack] stripped: $(stat -c%s /tmp/apkwork/libquartz_shell_lib-final.so) bytes"
 
 # 2) repack（保留 STORED / external_attr / META-INF services）
