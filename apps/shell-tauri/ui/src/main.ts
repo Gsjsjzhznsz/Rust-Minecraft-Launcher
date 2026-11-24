@@ -1155,8 +1155,11 @@ async function copyLogTail() {
 async function doLaunch(versionId: string) {
   try {
     setLaunchBadge("启动中…", "warn");
+    if (selectedInstanceId) {
+      appendLog("quartz", `[quartz] 实例隔离模式：${selectedInstanceId}`);
+    }
     appendLog("quartz", `[quartz] 启动 Minecraft ${versionId}…`);
-    await invoke("launch_game", { versionId });
+    await invoke("launch_game", { versionId, instanceId: selectedInstanceId || null });
     setLaunchBadge("运行中", "ok");
     show("stop-btn");
   } catch (e) {
@@ -1219,11 +1222,387 @@ async function launch() {
   }
 }
 
+/* ---------- 实例体系 / 内容管理 / 设置扩展 / 账号扩展（v0.2 对标 FCL/ZL2） ---------- */
+type LoaderEntry = { version: string; stable: boolean };
+type InstanceEntry = {
+  id: string;
+  name: string;
+  mcVersion: string;
+  loaderDesc: string;
+  javaMajor: number;
+  memoryMb: number;
+  renderer: string | null;
+  createdAt: string;
+  selected: boolean;
+};
+type ContentEntry = {
+  name: string;
+  kind: string;
+  sizeBytes: number;
+  isDir: boolean;
+  modifiedAt: number;
+};
+type SettingsInfo = {
+  extraJvmArgs: string[];
+  azureClientIdSet: boolean;
+  azureClientId: string | null;
+  selectedInstance: string | null;
+};
+
+let selectedInstanceId: string | null = null;
+let loaderKind = "fabric";
+let loaderVersions: LoaderEntry[] = [];
+let contentKind = "mods";
+
+async function loadSettings() {
+  try {
+    const s = await invoke<SettingsInfo>("get_settings");
+    selectedInstanceId = s.selectedInstance ?? null;
+    el<HTMLTextAreaElement>("jvm-args-input").value = (s.extraJvmArgs ?? []).join("\n");
+    el<HTMLInputElement>("azure-client-id-input").value = s.azureClientId ?? "";
+    setText(
+      "azure-state",
+      s.azureClientIdSet ? "已配置" : "未配置（微软登录不可用）"
+    );
+  } catch (e) {
+    toast(String(e), "err");
+  }
+}
+
+/* ---------- 实例 ---------- */
+async function refreshInstances() {
+  const box = el<HTMLElement>("instance-list");
+  try {
+    const list = await invoke<InstanceEntry[]>("list_instances");
+    box.innerHTML = "";
+    if (list.length === 0) {
+      box.innerHTML = `<div class="list-note">还没有实例：在上方创建，或直接使用全局 .minecraft</div>`;
+      return;
+    }
+    for (const inst of list) {
+      const card = document.createElement("div");
+      card.className = "account-card";
+      const selCls = inst.selected ? " badge-ok" : " badge-dim";
+      card.innerHTML = `
+        <span class="avatar">${inst.name.slice(0, 1).toUpperCase()}</span>
+        <div class="account-info">
+          <div class="account-name">${escapeHtml(inst.name)} <span class="badge${selCls}">${inst.selected ? "当前" : ""}</span></div>
+          <div class="account-sub">${escapeHtml(inst.mcVersion)} · ${escapeHtml(inst.loaderDesc)} · Java ${inst.javaMajor} · ${inst.memoryMb}MB</div>
+        </div>
+        <div class="account-actions">
+          ${inst.selected ? "" : `<button class="btn btn-sm btn-primary" data-act="select" data-id="${inst.id}">选用</button>`}
+          ${inst.selected ? "" : `<button class="btn btn-sm" data-act="unselect" data-id="${inst.id}">取消隔离</button>`}
+          <button class="btn btn-sm btn-danger" data-act="delete" data-id="${inst.id}">删除</button>
+        </div>`;
+      box.appendChild(card);
+    }
+  } catch (e) {
+    box.innerHTML = `<div class="list-note">实例加载失败：${escapeHtml(String(e))}</div>`;
+  }
+}
+
+async function createInstance() {
+  const name = el<HTMLInputElement>("new-instance-name").value.trim();
+  const mc = el<HTMLInputElement>("new-instance-mc").value.trim();
+  const loader = el<HTMLSelectElement>("new-instance-loader").value;
+  let loaderVer = el<HTMLInputElement>("new-instance-loader-ver").value.trim();
+  const err = el<HTMLElement>("instance-error");
+  err.classList.add("hidden");
+  if (!name || !mc) {
+    err.textContent = "实例名称与 MC 版本均为必填";
+    err.classList.remove("hidden");
+    return;
+  }
+  try {
+    if (loader && !loaderVer) {
+      // 留空自动选最新稳定版
+      const list = await invoke<LoaderEntry[]>("list_loader_versions", { loader, mc });
+      const stable = list.find((v) => v.stable) ?? list[0];
+      if (!stable) throw new Error(`没有可用的 ${loader} 版本`);
+      loaderVer = stable.version;
+    }
+    await invoke("create_instance_cmd", {
+      name,
+      mcVersion: mc,
+      loader: loader || null,
+      loaderVersion: loaderVer || null,
+    });
+    toast("实例已创建", "ok");
+    el<HTMLInputElement>("new-instance-name").value = "";
+    el<HTMLInputElement>("new-instance-mc").value = "";
+    el<HTMLInputElement>("new-instance-loader-ver").value = "";
+    await refreshInstances();
+    await loadSettings();
+  } catch (e) {
+    err.textContent = String(e);
+    err.classList.remove("hidden");
+  }
+}
+
+async function onInstanceAction(act: string, id: string) {
+  try {
+    if (act === "select") {
+      await invoke("select_instance", { id });
+      toast("已切换实例", "ok");
+    } else if (act === "unselect") {
+      await invoke("select_instance", { id: null });
+      toast("已回到全局 .minecraft", "ok");
+    } else if (act === "delete") {
+      if (!confirm(`删除实例 ${id}（含游戏目录）？`)) return;
+      await invoke("delete_instance_cmd", { id });
+      toast("实例已删除", "ok");
+    }
+    await refreshInstances();
+    await loadSettings();
+  } catch (e) {
+    toast(String(e), "err");
+  }
+}
+
+/* ---------- 内容管理 ---------- */
+async function refreshContent() {
+  const box = el<HTMLElement>("content-list");
+  setText(
+    "content-scope-val",
+    selectedInstanceId ? `实例 ${selectedInstanceId}` : "全局 .minecraft"
+  );
+  try {
+    const list = await invoke<ContentEntry[]>("list_content_cmd", {
+      kind: contentKind,
+      instanceId: selectedInstanceId,
+    });
+    box.innerHTML = "";
+    if (list.length === 0) {
+      box.innerHTML = `<div class="list-note">暂无内容（${contentKind}）</div>`;
+      return;
+    }
+    for (const item of list) {
+      const card = document.createElement("div");
+      card.className = "account-card";
+      const d = item.modifiedAt ? new Date(item.modifiedAt * 1000).toLocaleDateString() : "";
+      card.innerHTML = `
+        <span class="avatar">${item.isDir ? "D" : "F"}</span>
+        <div class="account-info">
+          <div class="account-name">${escapeHtml(item.name)}</div>
+          <div class="account-sub">${bytes(item.sizeBytes)}${d ? ` · ${d}` : ""}</div>
+        </div>
+        <div class="account-actions">
+          <button class="btn btn-sm btn-danger" data-name="${escapeHtml(item.name)}">删除</button>
+        </div>`;
+      box.appendChild(card);
+    }
+  } catch (e) {
+    box.innerHTML = `<div class="list-note">加载失败：${escapeHtml(String(e))}</div>`;
+  }
+}
+
+async function deleteContent(name: string) {
+  if (!confirm(`删除 ${name}？`)) return;
+  try {
+    await invoke("delete_content_cmd", {
+      kind: contentKind,
+      name,
+      instanceId: selectedInstanceId,
+    });
+    toast("已删除", "ok");
+    await refreshContent();
+  } catch (e) {
+    toast(String(e), "err");
+  }
+}
+
+function escapeHtml(s: string): string {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+/* ---------- Modloader 安装面板 ---------- */
+function renderLoaderVersions() {
+  const box = el<HTMLElement>("loader-version-list");
+  box.innerHTML = "";
+  if (loaderVersions.length === 0) {
+    box.innerHTML = `<div class="list-note">没有可用版本</div>`;
+    return;
+  }
+  for (const v of loaderVersions.slice(0, 40)) {
+    const row = document.createElement("div");
+    row.className = "account-card";
+    row.innerHTML = `
+      <span class="avatar">${loaderKind.slice(0, 1).toUpperCase()}</span>
+      <div class="account-info">
+        <div class="account-name">${escapeHtml(v.version)}</div>
+        <div class="account-sub">${v.stable ? "稳定版" : "测试版"}</div>
+      </div>
+      <div class="account-actions">
+        <button class="btn btn-sm btn-primary" data-ver="${escapeHtml(v.version)}">安装</button>
+      </div>`;
+    box.appendChild(row);
+  }
+  if (loaderVersions.length > 40) {
+    const note = document.createElement("div");
+    note.className = "list-note";
+    note.textContent = `仅显示前 40 条（共 ${loaderVersions.length} 条）`;
+    box.appendChild(note);
+  }
+}
+
+async function loadLoaderVersions() {
+  const mc = el<HTMLInputElement>("loader-mc-version").value.trim();
+  const err = el<HTMLElement>("loader-error");
+  err.classList.add("hidden");
+  if (!mc) {
+    err.textContent = "请先输入 MC 版本";
+    err.classList.remove("hidden");
+    return;
+  }
+  const box = el<HTMLElement>("loader-version-list");
+  box.innerHTML = `<div class="list-note">查询中…</div>`;
+  try {
+    loaderVersions = await invoke<LoaderEntry[]>("list_loader_versions", {
+      loader: loaderKind,
+      mc,
+    });
+    renderLoaderVersions();
+  } catch (e) {
+    loaderVersions = [];
+    box.innerHTML = "";
+    err.textContent = String(e);
+    err.classList.remove("hidden");
+  }
+}
+
+async function installLoader(version: string) {
+  const mc = el<HTMLInputElement>("loader-mc-version").value.trim();
+  if (!mc) {
+    toast("请先输入 MC 版本", "err");
+    return;
+  }
+  show("loader-progress");
+  setText("loader-progress-stage", loaderKind);
+  setText("loader-progress-text", "0%");
+  el<HTMLElement>("loader-progress-status").classList.add("hidden");
+  try {
+    await invoke("install_loader_cmd", { mc, loader: loaderKind, loaderVersion: version });
+    toast("安装任务已开始，进度实时更新", "ok");
+  } catch (e) {
+    hide("loader-progress");
+    toast(String(e), "err");
+  }
+}
+
+function onLoaderProgress(p: DownloadProgress) {
+  show("loader-progress");
+  setText("loader-progress-stage", p.stage);
+  setText("loader-progress-text", `${Math.round(p.percent)}%`);
+  el<HTMLElement>("loader-progress-fill").style.width = `${p.percent}%`;
+  setText("loader-progress-file", p.file || "");
+  if (p.error) {
+    alertIn("loader-progress-status", "alert-error", p.error);
+  } else if (p.done) {
+    alertIn("loader-progress-status", "alert-ok", "安装完成，可在主页版本选择中找到新版本");
+    installed.add(String(p.file || ""));
+    void refreshInstalled();
+  }
+}
+
+/* ---------- 微软设备码登录 ---------- */
+function onMsPrompt(dc: { userCode: string; verificationUri: string; message?: string | null }) {
+  const prompt = el<HTMLElement>("ms-prompt");
+  prompt.innerHTML = `请在浏览器打开 <b>${escapeHtml(dc.verificationUri)}</b> 并输入代码 <b>${escapeHtml(dc.userCode)}</b>，等待授权完成…`;
+  prompt.classList.remove("hidden");
+  el<HTMLElement>("ms-result").classList.add("hidden");
+}
+
+function onMsResult(r: { ok: boolean; error?: string | null; account?: Account | null }) {
+  const node = el<HTMLElement>("ms-result");
+  if (r.ok && r.account) {
+    node.className = "alert alert-ok";
+    node.textContent = `微软登录成功：${r.account.username}`;
+    void loadAccounts();
+    void renderAccountChips();
+  } else {
+    node.className = "alert alert-error";
+    node.textContent = `微软登录失败：${r.error ?? "未知错误"}`;
+  }
+  node.classList.remove("hidden");
+}
+
+/* ---------- authlib 外置登录 ---------- */
+async function refreshAuthlib() {
+  try {
+    const s = await invoke<{ installed: boolean; version: string | null }>("authlib_status");
+    setText("authlib-state", s.installed ? `已安装 ${s.version ?? ""}` : "未安装");
+  } catch {
+    setText("authlib-state", "-");
+  }
+}
+
+async function downloadAuthlibAgent() {
+  try {
+    await invoke("download_authlib");
+    toast("agent 下载任务已开始", "ok");
+  } catch (e) {
+    toast(String(e), "err");
+  }
+}
+
+async function authlibLogin() {
+  const server = el<HTMLInputElement>("authlib-server").value.trim();
+  const user = el<HTMLInputElement>("authlib-user").value.trim();
+  const pass = el<HTMLInputElement>("authlib-pass").value;
+  const err = el<HTMLElement>("authlib-error");
+  err.classList.add("hidden");
+  if (!server || !user || !pass) {
+    err.textContent = "服务器地址、账号、密码均为必填";
+    err.classList.remove("hidden");
+    return;
+  }
+  try {
+    const acc = await invoke<Account>("authlib_login", { server, username: user, password: pass });
+    toast(`外置登录成功：${acc.username}`, "ok");
+    await loadAccounts();
+    await renderAccountChips();
+  } catch (e) {
+    err.textContent = String(e);
+    err.classList.remove("hidden");
+  }
+}
+
+/* ---------- 设置保存 ---------- */
+async function saveJvmArgs() {
+  const text = el<HTMLTextAreaElement>("jvm-args-input").value;
+  const args = text
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter((l) => l.length > 0);
+  try {
+    await invoke("set_jvm_args_cmd", { args });
+    alertIn("settings-msg", "alert-ok", "JVM 参数已保存");
+    toast("JVM 参数已保存", "ok");
+  } catch (e) {
+    alertIn("settings-msg", "alert-error", String(e));
+  }
+}
+
+async function saveAzureClientId() {
+  const v = el<HTMLInputElement>("azure-client-id-input").value.trim();
+  try {
+    await invoke("set_azure_client_id", { id: v || null });
+    setText("azure-state", v ? "已配置" : "未配置（微软登录不可用）");
+    toast("已保存 client_id", "ok");
+  } catch (e) {
+    toast(String(e), "err");
+  }
+}
+
 /* ---------- 页面切换 ---------- */
 let activePage = "home";
 function showPage(page: string) {
   activePage = page;
-  for (const p of ["home", "download", "account", "settings"]) {
+  for (const p of ["home", "download", "instances", "content", "account", "settings"]) {
     const sec = el<HTMLElement>(`page-${p}`);
     sec.classList.toggle("hidden", p !== page);
   }
@@ -1232,6 +1611,11 @@ function showPage(page: string) {
       item.classList.toggle("active", item.dataset.page === page);
     }
   }
+  // 懒加载：切到对应页面时刷新数据
+  if (page === "instances") void refreshInstances();
+  if (page === "content") void refreshContent();
+  if (page === "settings") void loadSettings();
+  if (page === "account") void refreshAuthlib();
 }
 
 /* ---------- 进入主界面 ---------- */
@@ -1250,6 +1634,10 @@ function enterApp() {
   refreshMemorySetting();
   refreshAssetsStatus();
   refreshLogList();
+  loadSettings();
+  refreshInstances();
+  refreshAuthlib();
+  void bindExtraEvents();
 }
 
 /* ---------- 事件绑定 ---------- */
@@ -1371,6 +1759,91 @@ function bindEvents() {
   el<HTMLSelectElement>("version-select").addEventListener("change", () => {
     refreshAssetsStatus();
   });
+}
+
+/** 新增事件绑定（v0.2 FCL/ZL2 对标）：实例 / 内容 / loader / 微软 / authlib / 设置 */
+let extraEventsBound = false;
+async function bindExtraEvents() {
+  if (extraEventsBound) return;
+  extraEventsBound = true;
+  // 事件通道
+  await listen<DownloadProgress>("loader://progress", (ev) => onLoaderProgress(ev.payload));
+  await listen<{ userCode: string; verificationUri: string }>("ms://prompt", (ev) => onMsPrompt(ev.payload));
+  await listen<{ ok: boolean; error?: string | null; account?: Account | null }>("ms://result", (ev) => onMsResult(ev.payload));
+  await listen<{ done: boolean; version?: string | null; error?: string | null }>("authlib://progress", (ev) => {
+    if (ev.payload.error) {
+      toast(`agent 下载失败：${ev.payload.error}`, "err");
+    } else {
+      toast(`agent 已安装：${ev.payload.version ?? ""}`, "ok");
+    }
+    void refreshAuthlib();
+  });
+  await listen<DownloadProgress>("mrpack://progress", (ev) => {
+    const p = ev.payload;
+    if (p.error) {
+      toast(`整合包导入失败：${p.error}`, "err");
+      appendLog("quartz", `[quartz] 整合包导入失败：${p.error}`);
+    } else if (p.done) {
+      toast("整合包导入完成", "ok");
+      appendLog("quartz", "[quartz] 整合包导入完成");
+      void refreshInstances();
+    } else {
+      appendLog("quartz", `[quartz] 整合包导入 ${Math.round(p.percent)}%：${p.file || p.stage}`);
+    }
+  });
+
+  // 下载页 loader 面板
+  el<HTMLElement>("loader-kind-chips").addEventListener("click", (e) => {
+    const chip = (e.target as HTMLElement).closest<HTMLButtonElement>(".chip");
+    if (!chip?.dataset.loader) return;
+    loaderKind = chip.dataset.loader;
+    for (const c of el<HTMLElement>("loader-kind-chips").querySelectorAll<HTMLButtonElement>(".chip")) {
+      c.classList.toggle("active", c === chip);
+    }
+    if (loaderVersions.length > 0) void loadLoaderVersions();
+  });
+  el<HTMLButtonElement>("loader-load-btn").addEventListener("click", loadLoaderVersions);
+  el<HTMLElement>("loader-version-list").addEventListener("click", (e) => {
+    const btn = (e.target as HTMLElement).closest<HTMLButtonElement>("button[data-ver]");
+    if (btn?.dataset.ver) void installLoader(btn.dataset.ver);
+  });
+
+  // 实例页
+  el<HTMLButtonElement>("create-instance-btn").addEventListener("click", createInstance);
+  el<HTMLElement>("instance-list").addEventListener("click", (e) => {
+    const btn = (e.target as HTMLElement).closest<HTMLButtonElement>("button[data-act]");
+    if (btn?.dataset.act && btn?.dataset.id) void onInstanceAction(btn.dataset.act, btn.dataset.id);
+  });
+
+  // 内容页
+  el<HTMLElement>("content-kind-chips").addEventListener("click", (e) => {
+    const chip = (e.target as HTMLElement).closest<HTMLButtonElement>(".chip");
+    if (!chip?.dataset.kind) return;
+    contentKind = chip.dataset.kind;
+    for (const c of el<HTMLElement>("content-kind-chips").querySelectorAll<HTMLButtonElement>(".chip")) {
+      c.classList.toggle("active", c === chip);
+    }
+    void refreshContent();
+  });
+  el<HTMLElement>("content-list").addEventListener("click", (e) => {
+    const btn = (e.target as HTMLElement).closest<HTMLButtonElement>("button[data-name]");
+    if (btn?.dataset.name) void deleteContent(btn.dataset.name);
+  });
+
+  // 账户页：微软 / authlib
+  el<HTMLButtonElement>("ms-login-btn").addEventListener("click", async () => {
+    try {
+      await invoke("ms_login");
+    } catch (e) {
+      toast(String(e), "err");
+    }
+  });
+  el<HTMLButtonElement>("authlib-dl-btn").addEventListener("click", downloadAuthlibAgent);
+  el<HTMLButtonElement>("authlib-login-btn").addEventListener("click", authlibLogin);
+
+  // 设置页：JVM 参数 / azure client id
+  el<HTMLButtonElement>("jvm-args-save-btn").addEventListener("click", saveJvmArgs);
+  el<HTMLButtonElement>("azure-client-id-save-btn").addEventListener("click", saveAzureClientId);
 }
 
 /* ---------- 启动 ---------- */

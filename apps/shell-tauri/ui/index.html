@@ -59,6 +59,14 @@
             <svg class="icon" viewBox="0 0 24 24"><path d="M12 3v12m0 0 5-5m-5 5-5-5M4 21h16"/></svg>
             <span>下载游戏</span>
           </button>
+          <button class="nav-item" data-page="instances">
+            <svg class="icon" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/></svg>
+            <span>实例</span>
+          </button>
+          <button class="nav-item" data-page="content">
+            <svg class="icon" viewBox="0 0 24 24"><path d="M12 2 2 7l10 5 10-5-10-5z"/><path d="m2 17 10 5 10-5M2 12l10 5 10-5"/></svg>
+            <span>内容</span>
+          </button>
           <button class="nav-item" data-page="account">
             <svg class="icon" viewBox="0 0 24 24"><circle cx="12" cy="8" r="4"/><path d="M4 21c0-4 3.6-6.5 8-6.5s8 2.5 8 6.5"/></svg>
             <span>账户</span>
@@ -212,13 +220,48 @@
           <div class="load-more-row">
             <button id="load-more-btn" class="btn btn-ghost hidden">加载更多</button>
           </div>
+
+          <!-- Modloader 安装（对标 FCL/ZL2 安装器） -->
+          <div class="card" style="margin-top:16px">
+            <div class="card-title-row">
+              <svg class="icon" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></svg>
+              <h3>安装 Modloader</h3>
+            </div>
+            <p class="page-sub">基版本未装时自动先装原版；进度在下方实时展示</p>
+            <div class="chip-row" id="loader-kind-chips">
+              <button class="chip active" data-loader="fabric">Fabric</button>
+              <button class="chip" data-loader="quilt">Quilt</button>
+              <button class="chip" data-loader="forge">Forge</button>
+              <button class="chip" data-loader="neoforge">NeoForge</button>
+              <button class="chip" data-loader="optifine">OptiFine</button>
+            </div>
+            <div class="add-row">
+              <input id="loader-mc-version" placeholder="MC 版本，如 1.20.4" autocomplete="off" />
+              <button id="loader-load-btn" class="btn btn-primary">查版本</button>
+            </div>
+            <div id="loader-version-list" class="version-list" style="max-height:220px">
+              <div class="list-note">选择 loader 类型并输入 MC 版本后查询</div>
+            </div>
+            <div id="loader-error" class="alert alert-error hidden"></div>
+          </div>
+
+          <div id="loader-progress" class="progress-card hidden">
+            <div class="progress-head">
+              <span class="progress-title">Modloader</span>
+              <span id="loader-progress-stage" class="progress-stage"></span>
+              <span id="loader-progress-text" class="progress-text">0%</span>
+            </div>
+            <div class="progress-bar"><div id="loader-progress-fill" class="progress-fill"></div></div>
+            <div id="loader-progress-file" class="progress-file"></div>
+            <div id="loader-progress-status" class="alert hidden"></div>
+          </div>
         </section>
 
         <!-- ====== 账户 ====== -->
         <section id="page-account" class="page hidden">
           <div class="page-head">
             <h2>账户</h2>
-            <p class="page-sub">离线账号管理，登录状态与下载完全解耦</p>
+            <p class="page-sub">离线 / 微软 / authlib 外置登录，登录状态与下载完全解耦</p>
           </div>
 
           <div class="card">
@@ -233,7 +276,94 @@
             <div id="account-error" class="alert alert-error hidden"></div>
           </div>
 
+          <div class="card">
+            <div class="card-title-row">
+              <svg class="icon" viewBox="0 0 24 24"><path d="M12 2l9 5v10l-9 5-9-5V7z"/></svg>
+              <h3>微软账号（设备码登录）</h3>
+            </div>
+            <p class="page-sub">需先在设置页配置项目自有 Azure client_id；登录后自动写入会话</p>
+            <button id="ms-login-btn" class="btn btn-primary">开始微软登录</button>
+            <div id="ms-prompt" class="alert alert-warn hidden" style="margin-top:10px"></div>
+            <div id="ms-result" class="alert hidden" style="margin-top:10px"></div>
+          </div>
+
+          <div class="card">
+            <div class="card-title-row">
+              <svg class="icon" viewBox="0 0 24 24"><path d="M12 2l9 5v10l-9 5-9-5V7z"/></svg>
+              <h3>外置登录（authlib-injector）</h3>
+            </div>
+            <p class="page-sub">Yggdrasil 协议；agent jar 首次使用前需下载一次</p>
+            <div class="kv"><span class="kv-key">Agent</span><span id="authlib-state" class="kv-val">-</span>
+              <button id="authlib-dl-btn" class="btn btn-sm btn-primary">下载 agent</button></div>
+            <div class="add-row" style="margin-top:8px">
+              <input id="authlib-server" placeholder="认证服务器地址，如 https://littleskin.cn/api/yggdrasil" autocomplete="off" />
+            </div>
+            <div class="add-row">
+              <input id="authlib-user" placeholder="邮箱或用户名" autocomplete="off" />
+              <input id="authlib-pass" type="password" placeholder="密码" autocomplete="off" />
+              <button id="authlib-login-btn" class="btn btn-primary">登录</button>
+            </div>
+            <div id="authlib-error" class="alert alert-error hidden"></div>
+          </div>
+
           <div id="account-list" class="account-list"></div>
+        </section>
+
+        <!-- ====== 实例 ====== -->
+        <section id="page-instances" class="page hidden">
+          <div class="page-head">
+            <h2>游戏实例</h2>
+            <p class="page-sub">版本隔离：saves / mods / config 独立，资源与库全局共享（FCL 同款语义）</p>
+          </div>
+
+          <div class="card">
+            <div class="card-title-row">
+              <svg class="icon" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/></svg>
+              <h3>新建实例</h3>
+            </div>
+            <div class="add-row">
+              <input id="new-instance-name" placeholder="实例名称，如 生存服整合" autocomplete="off" />
+            </div>
+            <div class="add-row">
+              <input id="new-instance-mc" placeholder="MC 版本，如 1.20.4" autocomplete="off" />
+            </div>
+            <div class="add-row">
+              <select id="new-instance-loader" style="flex:1">
+                <option value="">无（原版）</option>
+                <option value="fabric">Fabric</option>
+                <option value="quilt">Quilt</option>
+                <option value="forge">Forge</option>
+                <option value="neoforge">NeoForge</option>
+                <option value="optifine">OptiFine</option>
+              </select>
+              <input id="new-instance-loader-ver" placeholder="loader 版本（可留空自动选最新稳定）" autocomplete="off" />
+            </div>
+            <button id="create-instance-btn" class="btn btn-primary">创建实例</button>
+            <div id="instance-error" class="alert alert-error hidden"></div>
+          </div>
+
+          <div id="instance-list" class="account-list">
+            <div class="list-note">加载中…</div>
+          </div>
+        </section>
+
+        <!-- ====== 内容 ====== -->
+        <section id="page-content" class="page hidden">
+          <div class="page-head">
+            <h2>内容管理</h2>
+            <p class="page-sub">当前实例或全局目录下的 mods / 资源包 / 光影 / 存档</p>
+          </div>
+          <div class="chip-row" id="content-kind-chips">
+            <button class="chip active" data-kind="mods">Mods</button>
+            <button class="chip" data-kind="resourcepacks">资源包</button>
+            <button class="chip" data-kind="shaderpacks">光影</button>
+            <button class="chip" data-kind="saves">存档</button>
+            <button class="chip" data-kind="screenshots">截图</button>
+          </div>
+          <div id="content-scope" class="kv" style="margin-top:8px"><span class="kv-key">作用域</span><span id="content-scope-val" class="kv-val">全局 .minecraft</span></div>
+          <div id="content-list" class="version-list">
+            <div class="list-note">加载中…</div>
+          </div>
         </section>
 
         <!-- ====== 设置 ====== -->
@@ -292,6 +422,30 @@
             <input id="memory-slider" type="range" min="512" max="4096" step="256" value="1024" style="width:100%" />
             <div class="kv"><span class="kv-key">建议</span><span class="kv-val">2GB 内存设备 ≤1024MB；4GB 设备 1536–2048MB</span></div>
             <button id="memory-save-btn" class="btn btn-sm btn-primary">保存内存设置</button>
+          </div>
+
+          <div class="card">
+            <div class="card-title-row">
+              <svg class="icon" viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h10"/></svg>
+              <h3>启动参数</h3>
+            </div>
+            <p class="page-sub">自定义 JVM 参数（每行一条，追加到启动计划；-Xmx 由内存设置管理，无需重复填写）</p>
+            <textarea id="jvm-args-input" class="tree" rows="3" placeholder="-XX:+UseG1GC&#10;-Dfml.ignoreInvalidMinecraftCertificates=true" style="width:100%"></textarea>
+            <button id="jvm-args-save-btn" class="btn btn-sm btn-primary">保存 JVM 参数</button>
+            <div id="settings-msg" class="alert hidden"></div>
+          </div>
+
+          <div class="card">
+            <div class="card-title-row">
+              <svg class="icon" viewBox="0 0 24 24"><circle cx="12" cy="8" r="4"/><path d="M4 21c0-4 3.6-6.5 8-6.5s8 2.5 8 6.5"/></svg>
+              <h3>微软登录配置</h3>
+            </div>
+            <p class="page-sub">项目自有 Azure Public Client ID（Public Client 允许公开，不涉密钥）</p>
+            <div class="add-row">
+              <input id="azure-client-id-input" placeholder="Azure client_id（GUID）" autocomplete="off" />
+              <button id="azure-client-id-save-btn" class="btn btn-sm btn-primary">保存</button>
+            </div>
+            <div class="kv"><span class="kv-key">当前状态</span><span id="azure-state" class="kv-val">-</span></div>
           </div>
 
           <div class="card">
@@ -359,6 +513,14 @@
         <button class="nav-item" data-page="download">
           <svg class="icon" viewBox="0 0 24 24"><path d="M12 3v12m0 0 5-5m-5 5-5-5M4 21h16"/></svg>
           <span>下载</span>
+        </button>
+        <button class="nav-item" data-page="instances">
+          <svg class="icon" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/></svg>
+          <span>实例</span>
+        </button>
+        <button class="nav-item" data-page="content">
+          <svg class="icon" viewBox="0 0 24 24"><path d="M12 2 2 7l10 5 10-5-10-5z"/><path d="m2 17 10 5 10-5M2 12l10 5 10-5"/></svg>
+          <span>内容</span>
         </button>
         <button class="nav-item" data-page="account">
           <svg class="icon" viewBox="0 0 24 24"><circle cx="12" cy="8" r="4"/><path d="M4 21c0-4 3.6-6.5 8-6.5s8 2.5 8 6.5"/></svg>
