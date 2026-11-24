@@ -18,6 +18,8 @@ else
   fi
 fi
 export ANDROID_HOME=$TC/android-sdk
+# AGP 9 要求所有 SDK 路径变量一致（CI runner 预设 ANDROID_SDK_ROOT=/usr/local/lib/android/sdk 会冲突）
+export ANDROID_SDK_ROOT=$ANDROID_HOME
 export NDK_HOME=$ANDROID_HOME/ndk/27.0.12077973
 export ANDROID_NDK_ROOT=$NDK_HOME
 export GRADLE_USER_HOME=/tmp/my-project/.qz-gradle-home
