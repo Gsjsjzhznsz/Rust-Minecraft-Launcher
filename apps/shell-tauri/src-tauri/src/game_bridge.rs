@@ -756,130 +756,16 @@ fn install_fatal_signal_handlers() {
     }
 }
 
-/// SIGSEGV pc=0 专诊（v0.2.5）：调用空函数指针的崩溃指纹（设备两次闪退同现：
-/// pc=0、lr=匿名段+0x99a8、参数 (window,0,1,0)）。pc=0 时输出完整寄存器现场 +
-/// /proc/self/maps —— 匿名执行段按基址/大小即能判明身份（HotSpot 代码缓存 vs
-/// libffi 闭包池 vs ART JIT），并留 tombstone 级证据。pc!=0（HotSpot 隐式空检查、
-/// 栈守卫等）一律转发原处理器，JVM 语义不受影响。
-static SEGV_OLD_HANDLER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-/// 0=未安装；1=默认动作（SIG_DFL）；2=SA_SIGINFO 处理器
-static SEGV_OLD_KIND: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
-unsafe extern "C" fn quartz_on_segv_diag(
-    sig: c_int,
-    info: *mut libc::siginfo_t,
-    uctx: *mut c_void,
-) {
-    let uc = unsafe { &*(uctx as *const SigUContext) };
-    let pc = uc.uc_mcontext.pc;
-    if pc != 0 {
-        // 非「调用空指针」：转发原处理器（HotSpot 隐式空检查/守卫页路径）
-        match SEGV_OLD_KIND.load(Ordering::SeqCst) {
-            2 => {
-                let h = SEGV_OLD_HANDLER.load(Ordering::SeqCst);
-                if h != 0 {
-                    let f: extern "C" fn(c_int, *mut libc::siginfo_t, *mut c_void) =
-                        std::mem::transmute(h);
-                    unsafe { f(sig, info, uctx) };
-                    return;
-                }
-            }
-            _ => {}
-        }
-        // 无原处理器：恢复默认并重发（让 debuggerd 记录）
-        unsafe {
-            let mut dfl: libc::sigaction = std::mem::zeroed();
-            libc::sigemptyset(&mut dfl.sa_mask);
-            libc::sigaction(libc::SIGSEGV, &dfl, ptr::null_mut());
-            libc::raise(sig);
-            // 不可达
-            libc::_exit(128 + sig);
-        }
-    }
-    // pc == 0：调用空函数指针 —— 写全量现场后干净退出
-    const MSG: &[u8] =
-        b"==== [quartz] :game SIGSEGV pc=0 (null function pointer call) ====\n";
-    unsafe { libc::write(2, MSG.as_ptr() as *const c_void, MSG.len()) };
-    let mut buf = [0u8; 4096];
-    let mut n = 0usize;
-    fn push_str(buf: &mut [u8], n: &mut usize, s: &str) {
-        for b in s.as_bytes() {
-            if *n < buf.len() {
-                buf[*n] = *b;
-                *n += 1;
-            }
-        }
-    }
-    fn push_hex(buf: &mut [u8], n: &mut usize, v: u64) {
-        const HEX: &[u8; 16] = b"0123456789abcdef";
-        push_str(buf, n, "0x");
-        for shift in (0..64).step_by(4).rev() {
-            let d = ((v >> shift) & 0xf) as usize;
-            if *n < buf.len() {
-                buf[*n] = HEX[d];
-                *n += 1;
-            }
-        }
-    }
-    push_str(&mut buf, &mut n, "[quartz][segv0] ");
-    for (i, r) in uc.uc_mcontext.regs.iter().enumerate() {
-        push_str(&mut buf, &mut n, &format!("x{i}="));
-        push_hex(&mut buf, &mut n, *r);
-        if i % 4 == 3 {
-            push_str(&mut buf, &mut n, "\n");
-        } else {
-            push_str(&mut buf, &mut n, " ");
-        }
-    }
-    push_str(&mut buf, &mut n, "sp=");
-    push_hex(&mut buf, &mut n, uc.uc_mcontext.sp);
-    push_str(&mut buf, &mut n, " pc=");
-    push_hex(&mut buf, &mut n, pc);
-    push_str(&mut buf, &mut n, " fault=");
-    push_hex(&mut buf, &mut n, uc.uc_mcontext.fault_address);
-    push_str(&mut buf, &mut n, "\n");
-    push_str(&mut buf, &mut n, "[quartz][segv0] ---- /proc/self/maps ----\n");
-    unsafe { libc::write(2, buf.as_ptr() as *const c_void, n) };
-    // maps 全量转写（open/read/write 均为 async-signal-safe 系统调用）
-    unsafe {
-        let path = c"/proc/self/maps";
-        let fd = libc::open(path.as_ptr(), libc::O_RDONLY);
-        if fd >= 0 {
-            let mut rbuf = [0u8; 8192];
-            loop {
-                let r = libc::read(fd, rbuf.as_mut_ptr() as *mut c_void, rbuf.len());
-                if r <= 0 {
-                    break;
-                }
-                libc::write(2, rbuf.as_ptr() as *const c_void, r as usize);
-            }
-            libc::close(fd);
-        }
-    }
-    let tail = b"[quartz][segv0] ---- maps end ----\n";
-    unsafe { libc::write(2, tail.as_ptr() as *const c_void, tail.len()) };
-    libc::_exit(128 + sig);
-}
-
-fn install_segv_diag() {
-    unsafe {
-        let mut old: libc::sigaction = std::mem::zeroed();
-        libc::sigaction(libc::SIGSEGV, ptr::null_mut(), &mut old);
-        let (h, kind): (usize, usize) = if old.sa_sigaction == libc::SIG_DFL as usize {
-            (0, 1)
-        } else {
-            (old.sa_sigaction, 2)
-        };
-        SEGV_OLD_HANDLER.store(h, Ordering::SeqCst);
-        SEGV_OLD_KIND.store(kind, Ordering::SeqCst);
-        let mut act: libc::sigaction = std::mem::zeroed();
-        act.sa_sigaction = quartz_on_segv_diag as *const () as usize;
-        act.sa_flags = libc::SA_SIGINFO;
-        libc::sigemptyset(&mut act.sa_mask);
-        libc::sigaction(libc::SIGSEGV, &act, ptr::null_mut());
-        eprintln!("[quartz] SIGSEGV pc=0 专诊已装（pc!=0 转发原处理器：{kind}）");
-    }
-}
+// 【v0.2.6 已移除】SIGSEGV pc=0 专诊处理器（v0.2.5 引入，实机为害）：
+// 设计上 pc!=0 转发原处理器、pc==0 落盘现场，但设备实机（Android 15 / MTK，
+// ART sigchain 与 HotSpot 信号处理链并存）证明其 ucontext 读取不可信 ——
+// 两次独立启动的「寄存器现场」逐位一致（真实快照不可能），fault=0x80001204
+// 恰为 HotSpot 堆基址 0x800000000+offset 的隐式空检查指纹，却被按「pc=0
+// 调空指针」误杀 —— 游戏在 FindClass(主类) 的类加载期第一次隐式空检查处
+// 直接退出（「直接崩溃」，MC 未进 main）。结论：**SIGSEGV 一律不插桩**，
+// HotSpot/aarch64 的隐式空检查、栈守卫、安全点轮询依赖原生处理链
+// （sigchain → HotSpot javaSignalHandler）完整工作；真实 pc=0 崩溃的取证
+// 走 debuggerd tombstone（v0.2.3/v0.2.4 实测可靠，0x99a8 闭包指纹即由它定位）。
 
 /// 主进程回调：:game 进程正常结束（GameService 发 MSG_EXIT 后自杀）。
 #[no_mangle]
@@ -1384,8 +1270,14 @@ unsafe fn run_game_from_spec(
     );
     // 致命信号拦截：先装一次（覆盖 JVM dlopen/初始化期间的 abort）——
     // 让崩溃进程以干净退出码消失，避免部分 ROM 因 debuggerd 崩溃报告整组杀掉应用。
-    install_fatal_signal_handlers();
-    install_segv_diag();
+    // 注意：**绝不拦截 SIGSEGV**（v0.2.6 教训）——HotSpot/aarch64 依赖 SIGSEGV
+    // 做隐式空检查/栈守卫/安全点轮询（fault addr = 堆基址+offset 是正常指纹），
+    // 任何插桩都会与 sigchain/HotSpot 处理链抢道。v0.2.5 的 SIGSEGV pc=0 专诊
+    // 处理器在设备上读到坏 ucontext（两次启动寄存器现场逐位一致 = 非真实快照），
+    // 把类加载期第一次隐式空检查误判为「pc=0 调空指针」→ 直接 _exit →
+    // MC 连 main 都没进（2026-11-24 16:32 两份 launch 日志，崩溃点夹在
+    // 「属性硬回写完成」与「调用 main」之间）。真实 pc=0 崩溃的取证走
+    // debuggerd tombstone（v0.2.3 实测可靠）。
 
     // 1) 当前目录 + 环境变量
     let workdir = std::path::PathBuf::from(&spec.workdir);
@@ -1806,10 +1698,9 @@ unsafe fn run_game_from_spec(
 
     // JVM 初始化会覆盖 SIGABRT 处理器（HotSpot 崩溃报告用）：重装拦截 ——
     // HotSpot 写完 hs_err 后调用 abort()，仍落入本拦截（干净退出，不惊动系统）。
-    // SIGSEGV 专诊同步重装（此时捕获的「原处理器」即为 HotSpot 隐式空检查处理器，
-    // pc!=0 的 SIGSEGV 转发回它，语义不变）。
+    // SIGSEGV 不装任何处理器：HotSpot 的隐式空检查/安全点/栈守卫全靠它，
+    // 插桩即破坏（v0.2.5 实机「直接崩溃」根因，见上方 run_game_from_spec 注释）。
     install_fatal_signal_handlers();
-    install_segv_diag();
 
     // 7.5) 显式注入 runtime VM：统一桥路径后，壳层先 dlopen 了桥库，libart
     //      的 System.loadLibrary 发现库已载会跳过 JNI_OnLoad —— rt_vm/GLFW
