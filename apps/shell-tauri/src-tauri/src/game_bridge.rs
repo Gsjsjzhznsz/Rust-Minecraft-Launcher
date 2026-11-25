@@ -204,6 +204,37 @@ pub fn ensure_zink_cutils_shim() -> Result<(), String> {
 /// 渲染层（见 fallback_renderer_after_exit）。预检与后续 load_api 的二次
 /// dlopen/eglInitialize 幂等（句柄复用，EGL 对已初始化 display 返回 TRUE）。
 fn probe_renderer_egl(id: &str) -> Result<(), String> {
+    // v0.2.9 诊断环境：Mesa 的失败原因行（驱动加载/设备创建）输出到 stderr，
+    // 经游戏日志直读根因。仅 zink 注入（其他渲染层无 Mesa 诊断路径）。
+    if id == "zink" {
+        std::env::set_var("MESA_DEBUG", "1");
+        std::env::set_var("LIBGL_DEBUG", "verbose");
+    }
+
+    // v0.2.9 诊断：/dev/dri/renderD* 可访问性 —— Mesa surfaceless/android 平台
+    // 都要拿 DRM render node 建 GPU 设备；内核未暴露（老 kbase 只有 /dev/mali0）
+    // 或 SELinux 拒绝时 eglInitialize 必返 EGL_NOT_INITIALIZED。先探后试，
+    // 日志直读根因（无论 EGL 成败都打印）。
+    let mut node_report: Vec<String> = Vec::new();
+    for i in 0..8u32 {
+        let p = std::path::PathBuf::from(format!("/dev/dri/renderD{i}"));
+        if !p.exists() {
+            continue;
+        }
+        match std::fs::OpenOptions::new().read(true).write(true).open(&p) {
+            Ok(_) => node_report.push(format!("{}=可访问", p.display())),
+            Err(e) => node_report.push(format!("{}={}", p.display(), e)),
+        }
+    }
+    if node_report.is_empty() {
+        eprintln!(
+            "[quartz] EGL 预检诊断：/dev/dri/renderD* 均不存在（内核未暴露 DRM render node，\
+             zink/Mesa 无法拿 GPU 设备 —— 该设备 zink 不可用的典型原因）"
+        );
+    } else {
+        eprintln!("[quartz] EGL 预检诊断：render node -> {}", node_report.join(", "));
+    }
+
     let dir = crate::renderers::install_dir(id);
     let egl_lib = crate::renderers::spec_for(id)
         .map(|s| s.egl_lib)
@@ -228,6 +259,8 @@ fn probe_renderer_egl(id: &str) -> Result<(), String> {
         type Initialize =
             unsafe extern "system" fn(*mut c_void, *mut i32, *mut i32) -> u32;
         type GetError = unsafe extern "system" fn() -> i32;
+        type GetPlatformDisplay =
+            unsafe extern "system" fn(u32, *mut c_void, *const c_void) -> *mut c_void;
         let mut fns: Vec<(*mut c_void, &str)> = Vec::new();
         for sym in ["eglGetDisplay", "eglInitialize", "eglGetError"] {
             let cs = CString::new(sym).unwrap();
@@ -237,20 +270,81 @@ fn probe_renderer_egl(id: &str) -> Result<(), String> {
             }
             fns.push((p, sym));
         }
+        // EGL_MESA_platform_surfaceless（0x31DD）：Mesa Android 构建的
+        // eglGetDisplay(NULL) 可能落在 android 平台（需要本地窗口语义），
+        // surfaceless 才是 FCL/Zalith2 系 zink 的实际工作面 —— 默认显示
+        // 初始化失败后用它重试一次。
+        let gpd: Option<GetPlatformDisplay> = {
+            let cs = CString::new("eglGetPlatformDisplayEXT").unwrap();
+            let p = dlsym(h, cs.as_ptr());
+            if p.is_null() {
+                let cs = CString::new("eglGetPlatformDisplay").unwrap();
+                let p = dlsym(h, cs.as_ptr());
+                if p.is_null() { None } else { Some(std::mem::transmute(p)) }
+            } else {
+                Some(std::mem::transmute(p))
+            }
+        };
         let get_display: GetDisplay = std::mem::transmute(fns[0].0);
         let initialize: Initialize = std::mem::transmute(fns[1].0);
         let get_error: GetError = std::mem::transmute(fns[2].0);
-        let dpy = get_display(ptr::null_mut());
-        if dpy.is_null() {
-            return fail(format!("eglGetDisplay=NULL err={:#06x}", get_error()));
+        const EGL_PLATFORM_SURFACELESS_MESA: u32 = 0x31DD;
+
+        let mut last_err = 0i32;
+        let mut ok: Option<(i32, i32)> = None;
+        let mut via_surfaceless = false;
+        // 尝试一：eglGetDisplay(EGL_DEFAULT_DISPLAY)（与桥接层同款语义）
+        let dpy1 = get_display(ptr::null_mut());
+        if dpy1.is_null() {
+            last_err = get_error();
+        } else {
+            let (mut mj, mut mn) = (0i32, 0i32);
+            if initialize(dpy1, &mut mj, &mut mn) == 1 {
+                ok = Some((mj, mn));
+            } else {
+                last_err = get_error();
+            }
         }
-        let (mut major, mut minor) = (0i32, 0i32);
-        if initialize(dpy, &mut major, &mut minor) != 1 {
-            let err = get_error();
-            return fail(format!("eglInitialize={err:#06x}"));
+        // 尝试二：surfaceless 平台重试（仅默认显示失败时）
+        if ok.is_none() {
+            if let Some(gpd) = gpd {
+                let dpy2 = gpd(EGL_PLATFORM_SURFACELESS_MESA, ptr::null_mut(), ptr::null());
+                if !dpy2.is_null() {
+                    let (mut mj, mut mn) = (0i32, 0i32);
+                    if initialize(dpy2, &mut mj, &mut mn) == 1 {
+                        ok = Some((mj, mn));
+                        via_surfaceless = true;
+                    } else {
+                        last_err = get_error();
+                    }
+                } else {
+                    last_err = get_error();
+                }
+            }
         }
-        eprintln!("[quartz] 渲染层 EGL 预检通过：{id}（EGL {major}.{minor}）");
-        Ok(())
+        match ok {
+            Some((mj, mn)) => {
+                if !via_surfaceless && id != "zink" {
+                    std::env::remove_var("MESA_DEBUG");
+                    std::env::remove_var("LIBGL_DEBUG");
+                }
+                eprintln!(
+                    "[quartz] 渲染层 EGL 预检通过：{id}（EGL {mj}.{mn}{}）",
+                    if via_surfaceless { "，surfaceless 平台" } else { "" }
+                );
+                Ok(())
+            }
+            None => {
+                let nodes = if node_report.is_empty() {
+                    "无 renderD 节点".to_string()
+                } else {
+                    node_report.join(", ")
+                };
+                fail(format!(
+                    "eglInitialize={last_err:#06x}（含 surfaceless 重试；render node: {nodes}）"
+                ))
+            }
+        }
     }
 }
 
@@ -554,6 +648,19 @@ static STATE_MAIN_LOG_PATH: Mutex<Option<PathBuf>> = Mutex::new(None);
 /// 几乎同时写入，tail 线程来不及读）。
 static GAME_LOG_POS: Mutex<u64> = Mutex::new(0);
 
+/// 最近一次用户发起的启动参数（v0.2.9 渲染层失败即时重试用：
+/// 回退渲染层后直接用同一 LaunchPlan 重跑本次启动，用户无需再点一次）。
+#[derive(Clone)]
+struct LastLaunch {
+    version_id: String,
+    plan: crate::jvmops::LaunchPlan,
+    major: u32,
+    log_path: PathBuf,
+}
+static LAST_LAUNCH: Mutex<Option<LastLaunch>> = Mutex::new(None);
+/// 渲染层失败重试已用（每次用户启动重置；防重试循环）。
+static RENDER_RETRY_USED: AtomicBool = AtomicBool::new(false);
+
 pub fn game_running() -> bool {
     GAME_RUNNING.load(Ordering::SeqCst)
 }
@@ -642,7 +749,56 @@ pub fn finish_game_exit(code: i32) {
     drain_game_log_to_console();
     // v0.2.7 渲染层自动回退（扫描 EGL 失败标记，见函数注释）—— 在 emit 退出
     // 事件前执行，让 UI 日志带上回退说明。
-    maybe_fallback_renderer_after_exit();
+    let fell_back = maybe_fallback_renderer_after_exit();
+    // v0.2.9 渲染层失败即时重试：预检失败（EGL_FAIL）触发回退时，直接用
+    // 回退后的渲染层重跑本次启动 —— 用户不必退出后再点一次「开始」。
+    // 限制：每次用户启动至多重试一次（RENDER_RETRY_USED），主动停止不重试。
+    if fell_back
+        && !STOP_REQUESTED.load(Ordering::SeqCst)
+        && !RENDER_RETRY_USED.swap(true, Ordering::SeqCst)
+    {
+        let retry = LAST_LAUNCH.lock().ok().and_then(|g| g.clone());
+        if let (Some(app), Some(launch)) = (APP_HANDLE.get().cloned(), retry) {
+            append_state_log("[quartz] 正在用 MobileGlues 重试本次启动（约 1 秒后自动开始，无需手动操作）……");
+            // 先摘除旧 :game 绑定（进程已死，不发 MSG_STOP）：屏蔽迟到的
+            // onServiceDisconnected / binder death 回调打断重试新会话。
+            let _ = call_activity_static("unbindGameServiceStatic", "()V", &[]);
+            std::thread::spawn(move || {
+                // 800ms 延迟：窗口内 EXIT_EMITTED 保持 true，旧进程迟到的
+                // MSG_EXIT / 断连回调全部被幂等守卫吞掉，之后重置状态开新会话。
+                std::thread::sleep(std::time::Duration::from_millis(800));
+                if STOP_REQUESTED.load(Ordering::SeqCst) {
+                    // 窗口期内用户主动停止：本线程是退出上报的唯一 owner，
+                    // 放行守卫后走正常退出流程。
+                    EXIT_EMITTED.store(false, Ordering::SeqCst);
+                    finish_game_exit(137);
+                    return;
+                }
+                let log_file = STATE_LOG_FILE
+                    .lock()
+                    .ok()
+                    .and_then(|g| g.clone())
+                    .unwrap_or_else(|| Arc::new(Mutex::new(None)));
+                if let Err(e) = launch_via_game_process(
+                    launch.version_id,
+                    launch.plan,
+                    launch.major,
+                    app,
+                    log_file,
+                    &launch.log_path,
+                ) {
+                    append_state_log(&format!(
+                        "[quartz] 重试启动失败：{e}（已回退 MobileGlues，下次启动生效）"
+                    ));
+                    EXIT_EMITTED.store(false, Ordering::SeqCst);
+                    finish_game_exit(252);
+                }
+            });
+            // 重试线程接管本次启动的收尾：不 hide / 不 emit，游戏画面保持。
+            return;
+        }
+        append_state_log("[quartz] 已回退到 MobileGlues，下次启动生效");
+    }
     GAME_RUNNING.store(false, Ordering::SeqCst);
     TAIL_ACTIVE.store(false, Ordering::SeqCst);
     hide_game_surface();
@@ -687,13 +843,14 @@ fn append_state_log(line: &str) {
     }
 }
 
-/// v0.2.7 渲染层自动回退：检测 :game 退出日志中的渲染层 EGL 失败标记
-/// （QUARTZ_RENDERER_EGL_FAIL 来自 :game 内预检 probe_renderer_egl；兼容桥接层
-/// 迟败路径的「EGL 初始化失败」行），自动把选中渲染层回退到 MobileGlues
-///（1.17+ 唯一完整 GLES3 转译层）并在 UI 日志写明原因。
-/// zink/Mesa 在部分设备 eglInitialize 0x3001（2026-11-24 实机）——没有这一步
-/// 用户就陷入「选 Zink → 直接崩溃」的闪退循环。幂等：已是 MobileGlues 则不动作。
-fn maybe_fallback_renderer_after_exit() {
+// v0.2.7 渲染层自动回退：检测 :game 退出日志中的渲染层 EGL 失败标记
+// （QUARTZ_RENDERER_EGL_FAIL 来自 :game 内预检 probe_renderer_egl；兼容桥接层
+// 迟败路径的「EGL 初始化失败」行），自动把选中渲染层回退到 MobileGlues
+//（1.17+ 唯一完整 GLES3 转译层）并在 UI 日志写明原因。
+// zink/Mesa 在部分设备 eglInitialize 0x3001（2026-11-24/25 实机）——没有这一步
+// 用户就陷入「选 Zink → 直接崩溃」的闪退循环。幂等：已是 MobileGlues 则不动作。
+// 返回：是否真的切换了渲染层（v0.2.9 即时重试依据）。
+fn maybe_fallback_renderer_after_exit() -> bool {
     let Some(path) = STATE_GAME_LOG_PATH
         .lock()
         .ok()
@@ -716,22 +873,26 @@ fn maybe_fallback_renderer_after_exit() {
         .join("\n");
     let hit = tail.contains("QUARTZ_RENDERER_EGL_FAIL") || tail.contains("EGL 初始化失败");
     if !hit {
-        return;
+        return false;
     }
     let active = crate::renderers::active();
     if active == "mobileglues" {
         append_state_log("[quartz] 渲染层 EGL 初始化失败且当前已是 MobileGlues：无可回退目标，保持不变");
-        return;
+        return false;
     }
     match crate::renderers::set_active("mobileglues") {
         Ok(()) => {
             let line = format!(
-                "[quartz] 渲染层「{active}」在该设备 EGL 初始化失败（详见上方错误），已自动回退到 MobileGlues —— 下次启动生效"
+                "[quartz] 渲染层「{active}」在该设备 EGL 初始化失败（详见上方错误），已自动回退到 MobileGlues"
             );
             eprintln!("{line}");
             append_state_log(&line);
+            true
         }
-        Err(e) => append_state_log(&format!("[quartz] 渲染层自动回退失败：{e}")),
+        Err(e) => {
+            append_state_log(&format!("[quartz] 渲染层自动回退失败：{e}"));
+            false
+        }
     }
 }
 
@@ -912,6 +1073,16 @@ pub fn launch_via_game_process(
     STOP_REQUESTED.store(false, Ordering::SeqCst);
     TAIL_ACTIVE.store(true, Ordering::SeqCst);
     GAME_RUNNING.store(true, Ordering::SeqCst);
+    // v0.2.9：记录本次启动参数（渲染层失败即时重试用）+ 重置重试标记
+    RENDER_RETRY_USED.store(false, Ordering::SeqCst);
+    if let Ok(mut g) = LAST_LAUNCH.lock() {
+        *g = Some(LastLaunch {
+            version_id: version_id.clone(),
+            plan: plan.clone(),
+            major,
+            log_path: log_path.to_path_buf(),
+        });
+    }
     if let Ok(mut g) = STATE_VERSION.lock() {
         *g = version_id.clone();
     }

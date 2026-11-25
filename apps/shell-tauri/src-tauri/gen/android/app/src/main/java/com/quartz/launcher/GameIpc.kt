@@ -16,6 +16,11 @@ object GameIpc {
     /** 连接前收到的 Surface（GameView.surfaceCreated 先于服务连接时暂存）。 */
     private var pendingSurface: Surface? = null
 
+    /** 最近一次有效 Surface/尺寸（v0.2.9 渲染层失败重试：GameView 不重建，
+     *  新 :game 进程连接时用它补发 —— 否则新进程永远等不到窗口而挂死）。 */
+    private var latestSurface: Surface? = null
+    private var latestSize: IntArray? = null
+
     /** 服务已连接（onServiceConnected）：记录 messenger，补发 MSG_INIT 与暂存 Surface。 */
     fun connected(messenger: android.os.Messenger) {
         GameService.serviceMessenger = messenger
@@ -34,6 +39,13 @@ object GameIpc {
             pendingSurface = null
             sendSurface(s)
         }
+        // v0.2.9 重试会话：GameView 未重建（无 surfaceCreated 回调），
+        // 用最近有效 Surface/尺寸补发，新 :game 进程才能挂上窗口。
+        val s = latestSurface
+        if (pendingSurface == null && s != null && s.isValid) {
+            sendSurface(s)
+            latestSize?.let { (w, h) -> size(w, h) }
+        }
     }
 
     /** 服务断开（binder death / unbind）。 */
@@ -44,6 +56,7 @@ object GameIpc {
     /** Surface 创建（GameView.surfaceCreated）。 */
     fun sendSurface(s: Surface) {
         android.util.Log.i("QuartzGame", "sendSurface: valid=${s.isValid} messenger=${GameService.serviceMessenger != null}")
+        if (s.isValid) latestSurface = s
         if (GameService.serviceMessenger == null) {
             pendingSurface = s
             return
@@ -78,6 +91,7 @@ object GameIpc {
         input(GameService.IN_SCROLL) { putDouble("dx", dx); putDouble("dy", dy) }
 
     fun size(w: Int, h: Int) {
+        latestSize = intArrayOf(w, h)
         if (GameService.serviceMessenger == null) return
         val m = Message.obtain(null, GameService.MSG_SIZE)
         val b = Bundle()

@@ -24,6 +24,9 @@ import android.widget.FrameLayout
 import androidx.activity.enableEdgeToEdge
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 
 class MainActivity : TauriActivity() {
   companion object {
@@ -120,6 +123,23 @@ class MainActivity : TauriActivity() {
       }
     }
 
+    /**
+     * Rust 侧经 JNI 调用（v0.2.9 渲染层失败重试前）：仅摘除旧 ：game 绑定，
+     * 不发 MSG_STOP、不 stopService —— 旧进程已死，摘绑是为了屏蔽迟到的
+     * binder death / onServiceDisconnected 回调打断重试新会话。
+     */
+    @JvmStatic
+    fun unbindGameServiceStatic() {
+      val act = instance ?: return
+      act.runOnUiThread {
+        try {
+          act.unbindService(act.gameServiceConnection)
+        } catch (_: Throwable) {
+        }
+        GameIpc.disconnected()
+      }
+    }
+
     /** Rust 侧经 JNI 调用：停止游戏（向 :game 服务发 MSG_STOP，进程自杀）。 */
     @JvmStatic
     fun stopGameServiceStatic() {
@@ -158,6 +178,45 @@ class MainActivity : TauriActivity() {
     super.onDestroy()
     if (instance === this) {
       instance = null
+    }
+  }
+
+  // ------------------------------------------------------------------
+  // 游戏层沉浸模式（v0.2.9）
+  // ------------------------------------------------------------------
+
+  /**
+   * 游戏层沉浸全屏：隐藏状态栏/导航栏 + 刘海短边穿透。
+   *
+   * v0.2.9 实机根因：状态栏/导航栏常驻游戏上层（截图顶部可见 17:47/电量），
+   * GameControls 被 insets 打了 padding —— 顶部功能键被推下、左缘挖孔把系统
+   * 键列右推、热键横排在「padding 内容区」居中整体右偏。沉浸后 insets 归零，
+   * 控件回到真实屏幕边缘（类 FCL 全屏体验），退出游戏恢复系统栏。
+   */
+  private fun enterGameImmersive() {
+    try {
+      WindowCompat.setDecorFitsSystemWindows(window, false)
+      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+        window.attributes = window.attributes.apply {
+          layoutInDisplayCutoutMode =
+            WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+        }
+      }
+      WindowCompat.getInsetsController(window, window.decorView).apply {
+        systemBarsBehavior =
+          WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        hide(WindowInsetsCompat.Type.statusBars() or WindowInsetsCompat.Type.navigationBars())
+      }
+    } catch (_: Throwable) {
+    }
+  }
+
+  /** 退出游戏层：恢复状态栏/导航栏（启动器 WebView UI 需要常规系统栏）。 */
+  private fun exitGameImmersive() {
+    try {
+      WindowCompat.getInsetsController(window, window.decorView)
+        .show(WindowInsetsCompat.Type.statusBars() or WindowInsetsCompat.Type.navigationBars())
+    } catch (_: Throwable) {
     }
   }
 
@@ -209,6 +268,7 @@ class MainActivity : TauriActivity() {
       webViewVisibleBeforeGame = webView?.visibility == View.VISIBLE
       webView?.visibility = View.GONE
       window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+      enterGameImmersive()
       val gv = GameView(this)
       val controls = GameControls(this, gv)
       gv.controls = controls
@@ -247,6 +307,7 @@ class MainActivity : TauriActivity() {
     try {
       val content = findViewById<ViewGroup>(android.R.id.content) ?: return
       window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+      exitGameImmersive()
       gameControls?.let {
         (it.parent as? ViewGroup)?.removeView(it)
       }
@@ -324,7 +385,8 @@ class MainActivity : TauriActivity() {
     }
 
     override fun onServiceDisconnected(name: ComponentName?) {
-      // :game 进程死亡（崩溃 / 自杀）：binder death 通知 -> Rust 恢复 UI
+      // :game 进程死亡（崩溃 / 自杀）：binder death 通知 -> Rust 恢复 UI。
+      // v0.2.9：主动摘绑（unbindGameServiceStatic）后旧连接不会再回调到这里。
       GameIpc.disconnected()
       try {
         GameHost.gameProcessGone()

@@ -50,6 +50,8 @@ class GameControls(
 
     /** 虚拟光标视图（未 grab 菜单模式显示）。 */
     private val cursorView: View
+    /** 光标是否已跟随过触摸（跟随过就不再被 insets 变化重新居中）。 */
+    private var cursorFollowed = false
     /** 底部中央热键横排（1-9 + 滚轮 ▲▼，仅 grab 模式显示）。 */
     private val hotbarRow: LinearLayout
     /** 移动键（W/A/S/D，仅 grab 模式显示）。 */
@@ -58,6 +60,10 @@ class GameControls(
     private val actions: LinearLayout
 
     init {
+        // v0.2.9：光标允许画进 padding 区（状态栏/手势条上层），边缘触摸不裁剪
+        clipChildren = false
+        clipToPadding = false
+
         // ---- 隐藏输入框（软键盘文本 -> sendChar）----
         hiddenInput = EditText(context).apply {
             layoutParams = LayoutParams(1, 1)
@@ -104,6 +110,9 @@ class GameControls(
                     insets.systemWindowInsetBottom
                 )
             }
+            // v0.2.9：padding 变化会平移光标（子视图位置 = padding + translation），
+            // 用户尚未触摸时重新居中一次；已跟随触摸则不扰动
+            if (!cursorFollowed && cursorView.visibility == View.VISIBLE) centerCursor()
             insets
         }
 
@@ -149,7 +158,18 @@ class GameControls(
             )
             setPadding(dp(10), 0, 0, dp(12))
         }
-        dpad.addView(row().apply { addView(wButton()) })
+        // v0.2.9：W 行宽度 MATCH_PARENT + 行内居中 —— 修复 W 左对齐在 A 正上方
+        //（十字散架，实机截图确认），现在 W 居中在 S 正上方（FCL 同款十字）
+        dpad.addView(
+            row().apply {
+                gravity = Gravity.CENTER_HORIZONTAL
+                addView(wButton())
+            },
+            LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            )
+        )
         dpad.addView(row().apply {
             addView(button("A", KeyEvent.KEYCODE_A))
             addView(button("S", KeyEvent.KEYCODE_S))
@@ -208,10 +228,13 @@ class GameControls(
     override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
         super.onSizeChanged(w, h, oldw, oldh)
         // 光标初始居中（横屏旋转后也随新尺寸重算）
-        if (cursorView.visibility == View.VISIBLE) {
-            cursorView.translationX = (w - cursorView.layoutParams.width) / 2f
-            cursorView.translationY = (h - cursorView.layoutParams.height) / 2f
-        }
+        if (cursorView.visibility == View.VISIBLE) centerCursor()
+    }
+
+    /** 光标居中于容器 bounds：子视图位置 = padding + translation，须扣 padding。 */
+    private fun centerCursor() {
+        cursorView.translationX = (width - cursorView.layoutParams.width) / 2f - paddingLeft
+        cursorView.translationY = (height - cursorView.layoutParams.height) / 2f - paddingTop
     }
 
     /** grab 状态切换：菜单模式显示光标（隐藏移动/动作/热键），游戏内反之。 */
@@ -223,11 +246,20 @@ class GameControls(
         alpha = if (grabbed) 1f else 0.85f
     }
 
-    /** GameView 未 grab 触摸 -> 光标位置（触摸即指针）。 */
+    /**
+     * GameView 未 grab 触摸 -> 光标位置（触摸即指针）。
+     *
+     * v0.2.9 修复（实机：下半屏/右缘光标消失）：x/y 是 GameView 全屏坐标，
+     * 而 cursorView 挂在本容器的 insets padding 内容区 —— FrameLayout 子视图
+     * 位置 = padding + translation，不扣 padding 则指针被状态栏/挖孔/手势条
+     * insets 整体偏移，触摸越靠下/靠右越偏，到底部直接越界出屏（叠加默认
+     * clipChildren 裁剪 = 指针消失）。扣除 padding 后坐标 1:1 对齐触摸点。
+     */
     fun moveCursor(x: Float, y: Float) {
         if (GameHost.grabbed) return
-        cursorView.translationX = x - dp(28) / 2f
-        cursorView.translationY = y - dp(2)
+        cursorFollowed = true
+        cursorView.translationX = x - dp(28) / 2f - paddingLeft
+        cursorView.translationY = y - dp(2) - paddingTop
     }
 
     private fun row(): LinearLayout = LinearLayout(context).apply {
