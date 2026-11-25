@@ -194,6 +194,7 @@ fn run(cmd: Cmd) -> quartz_core::Result<()> {
                 java_path: None,
                 window: None,
                 lwjgl_classes_jar: None,
+                client_jar_path: None,
             })?;
 
             println!("{}", serde_json::to_string_pretty(&plan)?);

@@ -132,6 +132,7 @@ pub extern "C" fn qz_plan_summary(input: *const c_char) -> *mut c_char {
             java_path: None,
             window: None,
             lwjgl_classes_jar: None,
+            client_jar_path: None,
         }) {
             Ok(p) => p,
             Err(_) => return std::ptr::null_mut(),
