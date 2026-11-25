@@ -856,10 +856,10 @@ fn maybe_fallback_renderer_after_exit() -> bool {
         .ok()
         .and_then(|g| g.clone())
     else {
-        return;
+        return false;
     };
     let Ok(text) = std::fs::read_to_string(&path) else {
-        return;
+        return false;
     };
     // 只扫退出前的尾部（预检标记在末尾；桥接层迟败标记距尾部 ≤100 行）。
     let tail: String = text
