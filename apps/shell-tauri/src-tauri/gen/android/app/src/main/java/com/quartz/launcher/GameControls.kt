@@ -265,9 +265,9 @@ class GameControls(
         val cw = cursorView.layoutParams.width
         val ch = cursorView.layoutParams.height
         val minTX = -paddingLeft.toFloat()
-        val maxTX = (width - cw - paddingLeft).coerceAtLeast(minTX).toFloat()
+        val maxTX = (width - cw - paddingLeft).toFloat().coerceAtLeast(minTX)
         val minTY = -paddingTop.toFloat()
-        val maxTY = (height - ch - paddingTop).coerceAtLeast(minTY).toFloat()
+        val maxTY = (height - ch - paddingTop).toFloat().coerceAtLeast(minTY)
         cursorView.translationX = cursorView.translationX.coerceIn(minTX, maxTX)
         cursorView.translationY = cursorView.translationY.coerceIn(minTY, maxTY)
     }
