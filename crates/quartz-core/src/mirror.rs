@@ -19,7 +19,11 @@ use crate::error::{Error, Result};
 /// GitHub 加速代理（镜像优先；前缀拼接原始完整 URL）。
 /// 2026-11 实测可用性：ghfast.top / gh-proxy.com / ghproxy.net 均 206；
 /// mirror.ghproxy.com、github.moeyy.xyz 已失效故不收录。
-const GH_PROXIES: &[&str] = &["https://ghfast.top", "https://gh-proxy.com", "https://ghproxy.net"];
+const GH_PROXIES: &[&str] = &[
+    "https://ghfast.top",
+    "https://gh-proxy.com",
+    "https://ghproxy.net",
+];
 
 /// Mojang 官方源国内镜像（BMCLAPI）。
 const BMCLAPI_BASE: &str = "https://bmclapi2.bangbang93.com";
@@ -165,7 +169,8 @@ mod tests {
             "https://bmclapi2.bangbang93.com/maven/com/mojang/brigadier/1.1.8/brigadier-1.1.8.jar"
         );
 
-        let r = "https://resources.download.minecraft.net/b6/b62ca8ec10d07e6bf5ac8dae0c8c1d2e6a1e3356";
+        let r =
+            "https://resources.download.minecraft.net/b6/b62ca8ec10d07e6bf5ac8dae0c8c1d2e6a1e3356";
         assert_eq!(
             candidates(r)[0],
             "https://bmclapi2.bangbang93.com/assets/b6/b62ca8ec10d07e6bf5ac8dae0c8c1d2e6a1e3356"

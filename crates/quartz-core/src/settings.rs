@@ -66,7 +66,11 @@ pub fn add_jvm_args(args: Vec<String>) -> Result<Settings> {
 
 pub fn set_jvm_args(args: Vec<String>) -> Result<Settings> {
     let mut s = load();
-    s.extra_jvm_args = args.into_iter().map(|a| a.trim().to_string()).filter(|a| !a.is_empty()).collect();
+    s.extra_jvm_args = args
+        .into_iter()
+        .map(|a| a.trim().to_string())
+        .filter(|a| !a.is_empty())
+        .collect();
     save(&s)?;
     Ok(s)
 }

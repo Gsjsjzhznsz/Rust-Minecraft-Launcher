@@ -133,12 +133,8 @@ pub async fn download_and_install(
 
     // 存储空间前置检查：pack 下载 + 解包副本（xz 展开约 2 倍 + 余量）。
     // 空间不足当场报可行动错误，避免下到一半 ENOSPC（v8 加固）。
-    crate::space::ensure_free(
-        &jres,
-        spec.size * 2 + 100 * 1024 * 1024,
-        "下载 Java 运行时",
-    )
-    .map_err(crate::error::Error::Other)?;
+    crate::space::ensure_free(&jres, spec.size * 2 + 100 * 1024 * 1024, "下载 Java 运行时")
+        .map_err(crate::error::Error::Other)?;
 
     // ---- ① 下载（.qz-part 临时名，完成后改名；镜像回退见 mirror 模块） ----
     let part = jres.join(format!("{}.qz-part", spec.file));
@@ -161,16 +157,15 @@ pub async fn download_and_install(
             } else {
                 0.0
             };
-            let _ = progress
-                .try_send(DownloadProgress {
-                    stage: "runtime-download".into(),
-                    current: downloaded,
-                    total,
-                    percent,
-                    file: spec.file.into(),
-                    done: false,
-                    error: None,
-                });
+            let _ = progress.try_send(DownloadProgress {
+                stage: "runtime-download".into(),
+                current: downloaded,
+                total,
+                percent,
+                file: spec.file.into(),
+                done: false,
+                error: None,
+            });
         }
     }
     std::io::Write::flush(&mut file)?;

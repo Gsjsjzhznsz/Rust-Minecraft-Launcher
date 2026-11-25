@@ -30,26 +30,33 @@ extern "C" {
     fn XDefaultScreen(d: *mut Display) -> c_int;
     fn XRootWindow(d: *mut Display, screen: c_int) -> u64;
     fn XCreateSimpleWindow(
-        d: *mut Display, parent: u64, x: c_int, y: c_int, w: u32, h: u32,
-        border: u32, border_px: u64, bg: u64,
+        d: *mut Display,
+        parent: u64,
+        x: c_int,
+        y: c_int,
+        w: u32,
+        h: u32,
+        border: u32,
+        border_px: u64,
+        bg: u64,
     ) -> u64;
     fn XMapWindow(d: *mut Display, w: u64) -> c_int;
     fn glXChooseFBConfig(
-        d: *mut Display, screen: c_int, attrs: *const c_int, nitems: *mut c_int,
+        d: *mut Display,
+        screen: c_int,
+        attrs: *const c_int,
+        nitems: *mut c_int,
     ) -> *mut *mut c_void;
     fn glXCreateNewContext(
-        d: *mut Display, config: *mut c_void, render_type: c_int,
-        share: *mut c_void, direct: c_int,
+        d: *mut Display,
+        config: *mut c_void,
+        render_type: c_int,
+        share: *mut c_void,
+        direct: c_int,
     ) -> *mut c_void;
-    fn glXCreateWindow(
-        d: *mut Display, config: *mut c_void, win: u64, attrs: *const c_int,
-    ) -> u64;
-    fn glXCreatePbuffer(
-        d: *mut Display, config: *mut c_void, attrs: *const c_int,
-    ) -> u64;
-    fn glXMakeContextCurrent(
-        d: *mut Display, draw: u64, read: u64, ctx: *mut c_void,
-    ) -> c_int;
+    fn glXCreateWindow(d: *mut Display, config: *mut c_void, win: u64, attrs: *const c_int) -> u64;
+    fn glXCreatePbuffer(d: *mut Display, config: *mut c_void, attrs: *const c_int) -> u64;
+    fn glXMakeContextCurrent(d: *mut Display, draw: u64, read: u64, ctx: *mut c_void) -> c_int;
     fn glXSwapBuffers(d: *mut Display, drawable: u64) -> ();
     fn glXDestroyPbuffer(d: *mut Display, pbuf: u64) -> ();
     fn glXDestroyWindow(d: *mut Display, win: u64) -> ();
@@ -99,8 +106,14 @@ fn ensure_display() -> *mut Display {
         let screen = XDefaultScreen(d);
         SCREEN.store(screen as u32, Ordering::Release);
         // 自建一个 1280x720 的 X 窗口（QUARTZ_SIM_W/H 可覆盖）
-        let w = std::env::var("QUARTZ_SIM_W").ok().and_then(|v| v.parse().ok()).unwrap_or(1280u32);
-        let h = std::env::var("QUARTZ_SIM_H").ok().and_then(|v| v.parse().ok()).unwrap_or(720u32);
+        let w = std::env::var("QUARTZ_SIM_W")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1280u32);
+        let h = std::env::var("QUARTZ_SIM_H")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(720u32);
         let win = XCreateSimpleWindow(d, XRootWindow(d, screen), 0, 0, w, h, 0, 0, 0xff000000);
         XMapWindow(d, win);
         XWIN.store(win as u32, Ordering::Release);
@@ -128,16 +141,17 @@ unsafe extern "C" fn sim_initialize(d: *mut c_void, maj: *mut i32, mnr: *mut i32
 }
 
 unsafe extern "C" fn sim_choose_config(
-    d: *mut c_void, _attrs: *const c_int, configs: *mut *mut c_void, _size: c_int, n: *mut c_int,
+    d: *mut c_void,
+    _attrs: *const c_int,
+    configs: *mut *mut c_void,
+    _size: c_int,
+    n: *mut c_int,
 ) -> u32 {
     if d.is_null() {
         return 0;
     }
     let screen = SCREEN.load(Ordering::Acquire) as c_int;
-    let fbattrs = [
-        GLX_DOUBLEBUFFER, 1,
-        GLX_NONE, 0,
-    ];
+    let fbattrs = [GLX_DOUBLEBUFFER, 1, GLX_NONE, 0];
     let mut count: c_int = 0;
     let list = glXChooseFBConfig(d as *mut Display, screen, fbattrs.as_ptr(), &mut count);
     if list.is_null() || count <= 0 {
@@ -169,19 +183,22 @@ fn config_to_fbconfig(cfg: *mut c_void) -> Option<*mut c_void> {
 }
 
 unsafe extern "C" fn sim_get_config_attrib(
-    _d: *mut c_void, _cfg: *mut c_void, attr: c_int, val: *mut i32,
+    _d: *mut c_void,
+    _cfg: *mut c_void,
+    attr: c_int,
+    val: *mut i32,
 ) -> u32 {
     // RENDERABLE_TYPE=ES3|OpenGL(0x2)|WINDOW|PBUFFER 等，宽泛给值满足桥的判断
     if val.is_null() {
         return 0;
     }
     *val = match attr {
-        0x1240 => 0x2 | 0x0040,            // RENDERABLE_TYPE: OpenGL bit | ES3 bit
-        0x1233 => 0x0004 | 0x0001,         // SURFACE_TYPE: WINDOW | PBUFFER
-        0x302E => 0,                        // NATIVE_VISUAL_ID
-        0x3025 => 1,                        // BUFFER_SIZE
-        0x3028 => 1,                        // DEPTH_SIZE
-        0x302B => 0,                        // ALPHA_SIZE
+        0x1240 => 0x2 | 0x0040,    // RENDERABLE_TYPE: OpenGL bit | ES3 bit
+        0x1233 => 0x0004 | 0x0001, // SURFACE_TYPE: WINDOW | PBUFFER
+        0x302E => 0,               // NATIVE_VISUAL_ID
+        0x3025 => 1,               // BUFFER_SIZE
+        0x3028 => 1,               // DEPTH_SIZE
+        0x302B => 0,               // ALPHA_SIZE
         _ => 1,
     };
     EGL_TRUE
@@ -192,7 +209,10 @@ unsafe extern "C" fn sim_bind_api(_api: u32) -> u32 {
 }
 
 unsafe extern "C" fn sim_create_context(
-    _d: *mut c_void, cfg: *mut c_void, _share: *mut c_void, _attrs: *const c_int,
+    _d: *mut c_void,
+    cfg: *mut c_void,
+    _share: *mut c_void,
+    _attrs: *const c_int,
 ) -> *mut c_void {
     let d = ensure_display();
     if d.is_null() {
@@ -201,7 +221,13 @@ unsafe extern "C" fn sim_create_context(
     let Some(fb) = config_to_fbconfig(cfg) else {
         return std::ptr::null_mut();
     };
-    let ctx = glXCreateNewContext(d as *mut Display, fb, GLX_RGBA_TYPE, std::ptr::null_mut(), 1);
+    let ctx = glXCreateNewContext(
+        d as *mut Display,
+        fb,
+        GLX_RGBA_TYPE,
+        std::ptr::null_mut(),
+        1,
+    );
     if !ctx.is_null() {
         CONTEXTS.lock().unwrap().push(ctx as usize);
     }
@@ -209,7 +235,10 @@ unsafe extern "C" fn sim_create_context(
 }
 
 unsafe extern "C" fn sim_create_window_surface(
-    _d: *mut c_void, cfg: *mut c_void, _native: *mut c_void, _attrs: *const c_int,
+    _d: *mut c_void,
+    cfg: *mut c_void,
+    _native: *mut c_void,
+    _attrs: *const c_int,
 ) -> *mut c_void {
     let d = ensure_display();
     if d.is_null() {
@@ -226,15 +255,31 @@ unsafe extern "C" fn sim_create_window_surface(
     if glxwin == 0 {
         return std::ptr::null_mut();
     }
-    let w = std::env::var("QUARTZ_SIM_W").ok().and_then(|v| v.parse().ok()).unwrap_or(1280i32);
-    let h = std::env::var("QUARTZ_SIM_H").ok().and_then(|v| v.parse().ok()).unwrap_or(720i32);
+    let w = std::env::var("QUARTZ_SIM_W")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1280i32);
+    let h = std::env::var("QUARTZ_SIM_H")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(720i32);
     let handle = glxwin as usize;
-    SURFACES.lock().unwrap().push((handle, SimSurface { drawable: glxwin, width: w, height: h, pbuffer: false }));
+    SURFACES.lock().unwrap().push((
+        handle,
+        SimSurface {
+            drawable: glxwin,
+            width: w,
+            height: h,
+            pbuffer: false,
+        },
+    ));
     handle as *mut c_void
 }
 
 unsafe extern "C" fn sim_create_pbuffer_surface(
-    _d: *mut c_void, cfg: *mut c_void, attrs: *const c_int,
+    _d: *mut c_void,
+    cfg: *mut c_void,
+    attrs: *const c_int,
 ) -> *mut c_void {
     let d = ensure_display();
     if d.is_null() {
@@ -263,28 +308,48 @@ unsafe extern "C" fn sim_create_pbuffer_surface(
         }
     }
     let pbattrs = [
-        GLX_PBUFFER_WIDTH, width,
-        GLX_PBUFFER_HEIGHT, height,
-        GLX_PBUFFER_LARGEST, 0,
-        GLX_NONE, 0,
+        GLX_PBUFFER_WIDTH,
+        width,
+        GLX_PBUFFER_HEIGHT,
+        height,
+        GLX_PBUFFER_LARGEST,
+        0,
+        GLX_NONE,
+        0,
     ];
     let pbuf = glXCreatePbuffer(d as *mut Display, fb, pbattrs.as_ptr());
     if pbuf == 0 {
         return std::ptr::null_mut();
     }
     let handle = pbuf as usize;
-    SURFACES.lock().unwrap().push((handle, SimSurface { drawable: pbuf, width, height, pbuffer: true }));
+    SURFACES.lock().unwrap().push((
+        handle,
+        SimSurface {
+            drawable: pbuf,
+            width,
+            height,
+            pbuffer: true,
+        },
+    ));
     eprintln!("[egl-sim] pbuffer surface {width}x{height} 就绪");
     handle as *mut c_void
 }
 
 fn surface_info(surface: *mut c_void) -> Option<SimSurface> {
     let handle = surface as usize;
-    SURFACES.lock().unwrap().iter().find(|(h, _)| *h == handle).map(|(_, s)| SimSurface { ..s.clone() })
+    SURFACES
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(h, _)| *h == handle)
+        .map(|(_, s)| SimSurface { ..s.clone() })
 }
 
 unsafe extern "C" fn sim_make_current(
-    _d: *mut c_void, draw: *mut c_void, read: *mut c_void, ctx: *mut c_void,
+    _d: *mut c_void,
+    draw: *mut c_void,
+    read: *mut c_void,
+    ctx: *mut c_void,
 ) -> u32 {
     let d = ensure_display();
     if d.is_null() {
@@ -294,7 +359,10 @@ unsafe extern "C" fn sim_make_current(
     let read_id = surface_info(read).map(|s| s.drawable).unwrap_or(0);
     let rc = glXMakeContextCurrent(d as *mut Display, draw_id, read_id, ctx);
     if rc != 0 {
-        eprintln!("[egl-sim] make_current drawable={draw_id:#x} ctx={:#x}", ctx as usize);
+        eprintln!(
+            "[egl-sim] make_current drawable={draw_id:#x} ctx={:#x}",
+            ctx as usize
+        );
     } else {
         eprintln!("[egl-sim] make_current 失败 drawable={draw_id:#x}");
     }
@@ -307,7 +375,9 @@ unsafe extern "C" fn sim_make_current(
 
 unsafe extern "C" fn sim_swap_buffers(_d: *mut c_void, surface: *mut c_void) -> u32 {
     let d = ensure_display();
-    let Some(s) = surface_info(surface) else { return EGL_TRUE };
+    let Some(s) = surface_info(surface) else {
+        return EGL_TRUE;
+    };
     if !s.pbuffer {
         glXSwapBuffers(d as *mut Display, s.drawable);
     }
@@ -319,16 +389,21 @@ unsafe extern "C" fn sim_swap_interval(_d: *mut c_void, _i: i32) -> u32 {
 }
 
 unsafe extern "C" fn sim_query_surface(
-    _d: *mut c_void, surface: *mut c_void, attr: i32, val: *mut i32,
+    _d: *mut c_void,
+    surface: *mut c_void,
+    attr: i32,
+    val: *mut i32,
 ) -> u32 {
-    let Some(s) = surface_info(surface) else { return 0 };
+    let Some(s) = surface_info(surface) else {
+        return 0;
+    };
     if val.is_null() {
         return 0;
     }
     *val = match attr {
-        0x3057 => s.width,   // EGL_WIDTH
-        0x3056 => s.height,  // EGL_HEIGHT
-        0x3099 => 1,         // EGL_LATCHED? -> generic ok
+        0x3057 => s.width,  // EGL_WIDTH
+        0x3056 => s.height, // EGL_HEIGHT
+        0x3099 => 1,        // EGL_LATCHED? -> generic ok
         _ => 0,
     };
     EGL_TRUE
@@ -388,8 +463,12 @@ pub fn api() -> super::egl::EglApi {
             get_config_attrib: Some(std::mem::transmute(sim_get_config_attrib as *const c_void)),
             bind_api: Some(std::mem::transmute(sim_bind_api as *const c_void)),
             create_context: Some(std::mem::transmute(sim_create_context as *const c_void)),
-            create_window_surface: Some(std::mem::transmute(sim_create_window_surface as *const c_void)),
-            create_pbuffer_surface: Some(std::mem::transmute(sim_create_pbuffer_surface as *const c_void)),
+            create_window_surface: Some(std::mem::transmute(
+                sim_create_window_surface as *const c_void,
+            )),
+            create_pbuffer_surface: Some(std::mem::transmute(
+                sim_create_pbuffer_surface as *const c_void,
+            )),
             swap_buffers: Some(std::mem::transmute(sim_swap_buffers as *const c_void)),
             swap_interval: Some(std::mem::transmute(sim_swap_interval as *const c_void)),
             query_surface: Some(std::mem::transmute(sim_query_surface as *const c_void)),

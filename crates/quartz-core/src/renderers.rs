@@ -358,13 +358,7 @@ pub async fn download_and_install(
                         .await
                         .map_err(|e| Error::Other(crate::error::io_context(&e, &part)))?;
                     cur += chunk.len() as u64;
-                    report(
-                        "renderer-download",
-                        cur,
-                        total,
-                        format!("{id} APK"),
-                        false,
-                    );
+                    report("renderer-download", cur, total, format!("{id} APK"), false);
                 }
                 file.flush().await?;
             }
@@ -494,7 +488,9 @@ mod tests {
         assert!(zink
             .iter()
             .any(|(k, v)| k == "MESA_LOADER_DRIVER_OVERRIDE" && v == "zink"));
-        assert!(zink.iter().any(|(k, v)| k == "GALLIUM_DRIVER" && v == "zink"));
+        assert!(zink
+            .iter()
+            .any(|(k, v)| k == "GALLIUM_DRIVER" && v == "zink"));
         assert!(zink
             .iter()
             .any(|(k, v)| k == "MESA_GL_VERSION_OVERRIDE" && v == "4.6"));

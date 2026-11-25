@@ -48,33 +48,24 @@ static RUNTIME_JRES_ROOT: Mutex<Option<PathBuf>> = Mutex::new(None);
 
 /// 注入运行时游戏根目录（覆盖旧值；壳层在 ensure_layout 之前调用）。
 pub fn set_runtime_root(root: PathBuf) -> bool {
-    *RUNTIME_ROOT
-        .lock()
-        .expect("RUNTIME_ROOT 锁中毒") = Some(root);
+    *RUNTIME_ROOT.lock().expect("RUNTIME_ROOT 锁中毒") = Some(root);
     true
 }
 
 /// 运行时注入的根目录（未注入返回 None）。
 pub fn runtime_root() -> Option<PathBuf> {
-    RUNTIME_ROOT
-        .lock()
-        .expect("RUNTIME_ROOT 锁中毒")
-        .clone()
+    RUNTIME_ROOT.lock().expect("RUNTIME_ROOT 锁中毒").clone()
 }
 
 /// 注入可 exec 的 JVM pack 根目录（Android 壳层注入内部私有目录）。
 pub fn set_runtime_jres_root(root: PathBuf) {
-    *RUNTIME_JRES_ROOT
-        .lock()
-        .expect("RUNTIME_JRES_ROOT 锁中毒") = Some(root);
+    *RUNTIME_JRES_ROOT.lock().expect("RUNTIME_JRES_ROOT 锁中毒") = Some(root);
 }
 
 /// 清除 JVM pack 根目录注入（仅测试用：验证回退行为）。
 #[cfg(test)]
 pub(crate) fn clear_runtime_jres_root() {
-    *RUNTIME_JRES_ROOT
-        .lock()
-        .expect("RUNTIME_JRES_ROOT 锁中毒") = None;
+    *RUNTIME_JRES_ROOT.lock().expect("RUNTIME_JRES_ROOT 锁中毒") = None;
 }
 
 /// JVM pack 安装根目录（exec 必须可用）：注入值优先，回退游戏根 jres/。
@@ -249,8 +240,14 @@ mod tests {
         // —— 默认布局：全部派生路径相对同一根 —— //
         let root = game_root();
         assert!(root.ends_with(".minecraft") || root.join(".minecraft").is_absolute());
-        assert_eq!(version_jar("1.20.4"), versions_dir().join("1.20.4/1.20.4.jar"));
-        assert_eq!(asset_object_path("abcdef12"), asset_objects_dir().join("ab/abcdef12"));
+        assert_eq!(
+            version_jar("1.20.4"),
+            versions_dir().join("1.20.4/1.20.4.jar")
+        );
+        assert_eq!(
+            asset_object_path("abcdef12"),
+            asset_objects_dir().join("ab/abcdef12")
+        );
         assert_eq!(
             library_path("org/lwjgl/lwjgl/3.3.1/lwjgl-3.3.1.jar"),
             libraries_dir().join("org/lwjgl/lwjgl/3.3.1/lwjgl-3.3.1.jar")

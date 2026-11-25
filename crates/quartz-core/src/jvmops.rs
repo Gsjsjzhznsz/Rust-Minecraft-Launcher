@@ -127,7 +127,10 @@ pub fn build_launch_plan(input: &PlanInputs) -> Result<LaunchPlan> {
     }
     let client_jar = match &input.client_jar_path {
         Some(p) => p.clone(),
-        None => input.versions_root.join(&version.id).join(format!("{}.jar", version.id)),
+        None => input
+            .versions_root
+            .join(&version.id)
+            .join(format!("{}.jar", version.id)),
     };
     classpath.push(client_jar);
 

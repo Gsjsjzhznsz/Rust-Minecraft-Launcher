@@ -56,7 +56,9 @@ async fn profile_json(url: &str) -> Result<String> {
     // 基本校验：profile 必须声明 inheritsFrom 与 mainClass，否则安装后无法启动
     let v: serde_json::Value = serde_json::from_str(&text)?;
     if v.get("inheritsFrom").is_none() || v.get("mainClass").is_none() {
-        return Err(Error::Other(format!("loader profile 不完整（缺少 inheritsFrom/mainClass）：{url}")));
+        return Err(Error::Other(format!(
+            "loader profile 不完整（缺少 inheritsFrom/mainClass）：{url}"
+        )));
     }
     Ok(text)
 }
@@ -78,9 +80,7 @@ pub async fn list_neoforge_versions(mc_version: &str) -> Result<Vec<String>> {
     let major_prefix = mc_major(mc_version);
     let out: Vec<String> = all
         .into_iter()
-        .filter(|v| {
-            v.starts_with(&major_prefix) || v.starts_with(mc_version)
-        })
+        .filter(|v| v.starts_with(&major_prefix) || v.starts_with(mc_version))
         .collect();
     if out.is_empty() {
         return Err(Error::Other(format!(
@@ -163,13 +163,13 @@ async fn fetch_text(url: &str) -> Result<String> {
 /// BMCLAPI OptiFine 版本列表：GET /optifine/{mcVersion}
 /// 返回 [{ name, mcVersion, type, patch, ... }]。
 pub async fn list_optifine_versions(mc_version: &str) -> Result<Vec<OptifineEntry>> {
-    let url = format!(
-        "https://bmclapi2.bangbang93.com/optifine/{mc_version}"
-    );
+    let url = format!("https://bmclapi2.bangbang93.com/optifine/{mc_version}");
     let text = fetch_text(&url).await?;
     let list: Vec<OptifineEntry> = serde_json::from_str(&text)?;
     if list.is_empty() {
-        return Err(Error::Other(format!("BMCLAPI 没有 {mc_version} 的 OptiFine 构建")));
+        return Err(Error::Other(format!(
+            "BMCLAPI 没有 {mc_version} 的 OptiFine 构建"
+        )));
     }
     Ok(list)
 }
@@ -222,7 +222,9 @@ mod tests {
         );
         assert_eq!(
             neoforge_installer_url("21.4.47"),
-            format!("{NEOFORGE_MAVEN}/net/neoforged/neoforge/21.4.47/neoforge-21.4.47-installer.jar")
+            format!(
+                "{NEOFORGE_MAVEN}/net/neoforged/neoforge/21.4.47/neoforge-21.4.47-installer.jar"
+            )
         );
     }
 

@@ -257,7 +257,14 @@ pub fn standard_rules_ctx() -> RuntimeCtx {
     RuntimeCtx::new("linux", crate::host_arch())
 }
 
-fn download_progress(stage: &str, file: &str, current: u64, total: u64, done: bool, error: Option<String>) -> DownloadProgress {
+fn download_progress(
+    stage: &str,
+    file: &str,
+    current: u64,
+    total: u64,
+    done: bool,
+    error: Option<String>,
+) -> DownloadProgress {
     let percent = if total > 0 && !done {
         ((current as f64 / total as f64) * 100.0).clamp(0.0, 100.0)
     } else if done {
@@ -340,7 +347,14 @@ pub async fn install_standard(
     // ② 版本 JSON（SHA-1 校验） -> versions/<v>/<v>.json
     send_progress(
         &progress,
-        download_progress("version-json", &format!("{version_id}.json"), 0, 0, false, None),
+        download_progress(
+            "version-json",
+            &format!("{version_id}.json"),
+            0,
+            0,
+            false,
+            None,
+        ),
     )
     .await;
     let json_text = fetch_text_verified(client, &entry.url, Some(&entry.sha1)).await?;
@@ -364,7 +378,9 @@ pub async fn install_standard(
 
     for task in crate::meta::collect_library_tasks(&version, &ctx, &libs_root)
         .into_iter()
-        .chain(crate::meta::collect_native_tasks(&version, &ctx, &libs_root))
+        .chain(crate::meta::collect_native_tasks(
+            &version, &ctx, &libs_root,
+        ))
     {
         if seen_dest.insert(task.dest.clone()) {
             tasks.push(task);
@@ -375,7 +391,14 @@ pub async fn install_standard(
     if let Some(idx) = &version.asset_index {
         send_progress(
             &progress,
-            download_progress("asset-index", &format!("{}.json", idx.id), 0, 0, false, None),
+            download_progress(
+                "asset-index",
+                &format!("{}.json", idx.id),
+                0,
+                0,
+                false,
+                None,
+            ),
         )
         .await;
         let index_text = fetch_text_verified(client, &idx.url, idx.sha1.as_deref()).await?;
@@ -424,11 +447,7 @@ pub async fn execute_download_plan(
     for t in &tasks {
         meta_by_label.insert(
             t.label.clone(),
-            (
-                label_stage(&t.label),
-                t.size.unwrap_or(0),
-                t.dest.clone(),
-            ),
+            (label_stage(&t.label), t.size.unwrap_or(0), t.dest.clone()),
         );
     }
 
@@ -469,7 +488,11 @@ pub async fn execute_download_plan(
             return;
         }
         *last_emit = now;
-        send_progress(tx, download_progress(stage, file, done_bytes, total, false, None)).await;
+        send_progress(
+            tx,
+            download_progress(stage, file, done_bytes, total, false, None),
+        )
+        .await;
     }
 
     while let Some(ev) = rx.recv().await {
@@ -479,22 +502,47 @@ pub async fn execute_download_plan(
                     stage = s.to_string();
                 }
                 file = label;
-                push_progress(&progress, true, &stage, &file, done_bytes, total, &mut last_emit).await;
+                push_progress(
+                    &progress,
+                    true,
+                    &stage,
+                    &file,
+                    done_bytes,
+                    total,
+                    &mut last_emit,
+                )
+                .await;
             }
             crate::download::ProgressEvent::TaskDone { bytes, .. } => {
                 done_bytes += bytes;
-                push_progress(&progress, false, &stage, &file, done_bytes, total, &mut last_emit).await;
+                push_progress(
+                    &progress,
+                    false,
+                    &stage,
+                    &file,
+                    done_bytes,
+                    total,
+                    &mut last_emit,
+                )
+                .await;
             }
             crate::download::ProgressEvent::TaskSkipped { label } => {
                 let size = match meta_by_label.get(&label) {
                     Some((_, sz, dest)) if *sz > 0 => *sz,
-                    Some((_, _, dest)) => {
-                        std::fs::metadata(dest).map(|m| m.len()).unwrap_or(0)
-                    }
+                    Some((_, _, dest)) => std::fs::metadata(dest).map(|m| m.len()).unwrap_or(0),
                     None => 0,
                 };
                 done_bytes += size;
-                push_progress(&progress, false, &stage, &file, done_bytes, total, &mut last_emit).await;
+                push_progress(
+                    &progress,
+                    false,
+                    &stage,
+                    &file,
+                    done_bytes,
+                    total,
+                    &mut last_emit,
+                )
+                .await;
             }
             crate::download::ProgressEvent::TaskFailed { label, error } => {
                 failure = Some(format!("{label}: {error}"));
@@ -557,10 +605,22 @@ pub async fn install_loader(
             install_meta_loader(client, mc_version, spec, loader_version, progress).await
         }
         LoaderSpec::Forge { version } => {
-            install_forge_like(client, mc_version, &crate::modkit::loaders::forge_installer_url(mc_version, version), progress).await
+            install_forge_like(
+                client,
+                mc_version,
+                &crate::modkit::loaders::forge_installer_url(mc_version, version),
+                progress,
+            )
+            .await
         }
         LoaderSpec::NeoForge { version } => {
-            install_forge_like(client, mc_version, &crate::modkit::loaders::neoforge_installer_url(version), progress).await
+            install_forge_like(
+                client,
+                mc_version,
+                &crate::modkit::loaders::neoforge_installer_url(version),
+                progress,
+            )
+            .await
         }
         LoaderSpec::OptiFine { version } => {
             install_optifine(client, mc_version, version, progress).await
@@ -580,7 +640,14 @@ async fn install_meta_loader(
     if !crate::paths::version_json(mc_version).exists() {
         send_progress(
             &progress,
-            download_progress("prepare", &format!("基版本 {mc_version} 未安装，自动先安装"), 0, 0, false, None),
+            download_progress(
+                "prepare",
+                &format!("基版本 {mc_version} 未安装，自动先安装"),
+                0,
+                0,
+                false,
+                None,
+            ),
         )
         .await;
         install_standard(client, mc_version, progress.clone()).await?;
@@ -652,7 +719,14 @@ async fn install_forge_like(
     if !crate::paths::version_json(mc_version).exists() {
         send_progress(
             &progress,
-            download_progress("prepare", &format!("基版本 {mc_version} 未安装，自动先安装"), 0, 0, false, None),
+            download_progress(
+                "prepare",
+                &format!("基版本 {mc_version} 未安装，自动先安装"),
+                0,
+                0,
+                false,
+                None,
+            ),
         )
         .await;
         install_standard(client, mc_version, progress.clone()).await?;
@@ -683,12 +757,11 @@ async fn install_forge_like(
         data.extend_from_slice(&chunk);
     }
     if data.is_empty() {
-        return Err(crate::error::Error::Other(format!("installer 下载为空：{installer_url}")));
+        return Err(crate::error::Error::Other(format!(
+            "installer 下载为空：{installer_url}"
+        )));
     }
-    let tmp = std::env::temp_dir().join(format!(
-        "qz-loader-installer-{}.jar",
-        std::process::id()
-    ));
+    let tmp = std::env::temp_dir().join(format!("qz-loader-installer-{}.jar", std::process::id()));
     std::fs::write(&tmp, &data)?;
 
     // ④ 版本目录快照（安装后 diff 得到 installer 写入的版本 id）
@@ -742,11 +815,7 @@ async fn install_forge_like(
             )))
         }
     };
-    send_progress(
-        &progress,
-        download_progress("done", &vid, 1, 1, true, None),
-    )
-    .await;
+    send_progress(&progress, download_progress("done", &vid, 1, 1, true, None)).await;
     Ok(vid)
 }
 
@@ -803,7 +872,9 @@ async fn install_optifine(
         data.extend_from_slice(&chunk);
     }
     if data.is_empty() {
-        return Err(crate::error::Error::Other(format!("OptiFine 下载为空：{url}")));
+        return Err(crate::error::Error::Other(format!(
+            "OptiFine 下载为空：{url}"
+        )));
     }
 
     // jar 落位：本地 maven 布局 optifine:OptiFine:{ver}，供 classpath 引用
@@ -928,11 +999,7 @@ pub async fn repair_assets(
         all.into_iter().filter(|t| !t.dest.exists()).collect();
     let missing = tasks.len();
     if missing == 0 {
-        send_progress(
-            &progress,
-            download_progress("done", "", 1, 1, true, None),
-        )
-        .await;
+        send_progress(&progress, download_progress("done", "", 1, 1, true, None)).await;
         return Ok(0);
     }
     let total: u64 = tasks.iter().filter_map(|t| t.size).sum();

@@ -309,9 +309,8 @@ pub fn load_version(version_id: &str) -> Result<crate::model::VersionJson> {
             path.display()
         ))
     })?;
-    serde_json::from_str(&text).map_err(|e| {
-        Error::Other(format!("版本 {version_id} JSON 解析失败：{e}"))
-    })
+    serde_json::from_str(&text)
+        .map_err(|e| Error::Other(format!("版本 {version_id} JSON 解析失败：{e}")))
 }
 
 /// 解析 inheritsFrom 链并合并为可启动版本。
@@ -371,12 +370,24 @@ fn merge_parent_child(acc: &mut Value, child: &crate::model::VersionJson) -> Res
     let field_overrides: Vec<(&str, Option<Value>)> = vec![
         (
             "assetIndex",
-            child.asset_index.as_ref().and_then(|v| serde_json::to_value(v).ok()),
+            child
+                .asset_index
+                .as_ref()
+                .and_then(|v| serde_json::to_value(v).ok()),
         ),
-        ("assets", child.assets.as_ref().and_then(|v| serde_json::to_value(v).ok())),
+        (
+            "assets",
+            child
+                .assets
+                .as_ref()
+                .and_then(|v| serde_json::to_value(v).ok()),
+        ),
         (
             "javaVersion",
-            child.java_version.as_ref().and_then(|v| serde_json::to_value(v).ok()),
+            child
+                .java_version
+                .as_ref()
+                .and_then(|v| serde_json::to_value(v).ok()),
         ),
         (
             "downloads",
@@ -434,22 +445,31 @@ fn merge_parent_child(acc: &mut Value, child: &crate::model::VersionJson) -> Res
     // - libraries：child 在前（优先），parent 补齐；按 name 去重
     let mut libs: Vec<Value> = Vec::new();
     let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    let push_libs = |items: &Value, seen: &mut std::collections::BTreeSet<String>, libs: &mut Vec<Value>| {
-        if let Some(arr) = items.as_array() {
-            for item in arr {
-                let name = item
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string();
-                if name.is_empty() || seen.insert(name) {
-                    libs.push(item.clone());
+    let push_libs =
+        |items: &Value, seen: &mut std::collections::BTreeSet<String>, libs: &mut Vec<Value>| {
+            if let Some(arr) = items.as_array() {
+                for item in arr {
+                    let name = item
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    if name.is_empty() || seen.insert(name) {
+                        libs.push(item.clone());
+                    }
                 }
             }
-        }
-    };
-    push_libs(&serde_json::to_value(&child.libraries)?, &mut seen, &mut libs);
-    push_libs(acc.get("libraries").unwrap_or(&Value::Null), &mut seen, &mut libs);
+        };
+    push_libs(
+        &serde_json::to_value(&child.libraries)?,
+        &mut seen,
+        &mut libs,
+    );
+    push_libs(
+        acc.get("libraries").unwrap_or(&Value::Null),
+        &mut seen,
+        &mut libs,
+    );
     acc["libraries"] = Value::Array(libs);
     Ok(())
 }

@@ -100,17 +100,11 @@ pub fn list_content(kind: ContentKind, instance_dir: Option<&Path>) -> Result<Ve
 }
 
 /// 删除内容项（文件或目录递归）；返回是否真正删除。
-pub fn delete_content(
-    kind: ContentKind,
-    name: &str,
-    instance_dir: Option<&Path>,
-) -> Result<bool> {
+pub fn delete_content(kind: ContentKind, name: &str, instance_dir: Option<&Path>) -> Result<bool> {
     let dir = content_dir(kind, instance_dir);
     // name 安全校验：拒绝路径穿越（../、绝对路径、分隔符）
     if name.contains('/') || name.contains('\\') || name == ".." || name.is_empty() {
-        return Err(crate::error::Error::Other(format!(
-            "非法内容名：{name}"
-        )));
+        return Err(crate::error::Error::Other(format!("非法内容名：{name}")));
     }
     let path = dir.join(name);
     if !path.exists() {

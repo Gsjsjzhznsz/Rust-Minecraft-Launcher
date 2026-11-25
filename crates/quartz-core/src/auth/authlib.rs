@@ -33,11 +33,15 @@ pub struct InjectorAsset {
 
 /// agent jar 落位（libraries/authlib-injector/authlib-injector.jar，固定名便于 jvmops 引用）。
 pub fn injector_jar() -> PathBuf {
-    paths::libraries_dir().join("authlib-injector").join("authlib-injector.jar")
+    paths::libraries_dir()
+        .join("authlib-injector")
+        .join("authlib-injector.jar")
 }
 
 fn injector_meta() -> PathBuf {
-    paths::libraries_dir().join("authlib-injector").join("meta.json")
+    paths::libraries_dir()
+        .join("authlib-injector")
+        .join("meta.json")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -52,7 +56,9 @@ pub fn installed_version() -> Option<String> {
         return None;
     }
     let text = std::fs::read_to_string(injector_meta()).ok()?;
-    serde_json::from_str::<InjectorMeta>(&text).ok().map(|m| m.version)
+    serde_json::from_str::<InjectorMeta>(&text)
+        .ok()
+        .map(|m| m.version)
 }
 
 /// 拉取最新 release 元数据。
@@ -180,9 +186,7 @@ pub async fn login(
     } else if parsed.available_profiles.len() == 1 {
         parsed.available_profiles[0].clone()
     } else if parsed.available_profiles.is_empty() {
-        return Err(Error::Other(
-            "该账号在认证服务器上没有可用角色档案".into(),
-        ));
+        return Err(Error::Other("该账号在认证服务器上没有可用角色档案".into()));
     } else {
         let names: Vec<String> = parsed
             .available_profiles

@@ -73,11 +73,6 @@ jobs:
           ls site
           test -f site/index.html && test -f site/demo/index.html
 
-      - name: 配置 Pages（首次自动启用）
-        uses: actions/configure-pages@v5
-        with:
-          enablement: true
-
       - name: 上传 Pages 产物
         uses: actions/upload-pages-artifact@v3
         with:

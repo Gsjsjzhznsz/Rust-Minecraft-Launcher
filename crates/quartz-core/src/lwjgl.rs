@@ -46,12 +46,21 @@ const APK_FILES: &[(&str, &str)] = &[
         "lwjgl-glfw-classes.jar",
     ),
     ("lib/arm64-v8a/liblwjgl.so", "natives/liblwjgl.so"),
-    ("lib/arm64-v8a/liblwjgl_opengl.so", "natives/liblwjgl_opengl.so"),
+    (
+        "lib/arm64-v8a/liblwjgl_opengl.so",
+        "natives/liblwjgl_opengl.so",
+    ),
     ("lib/arm64-v8a/liblwjgl_stb.so", "natives/liblwjgl_stb.so"),
-    ("lib/arm64-v8a/liblwjgl_tinyfd.so", "natives/liblwjgl_tinyfd.so"),
+    (
+        "lib/arm64-v8a/liblwjgl_tinyfd.so",
+        "natives/liblwjgl_tinyfd.so",
+    ),
     ("lib/arm64-v8a/libopenal.so", "natives/libopenal.so"),
     ("lib/arm64-v8a/libfreetype.so", "natives/libfreetype.so"),
-    ("lib/arm64-v8a/libjnidispatch.so", "natives/libjnidispatch.so"),
+    (
+        "lib/arm64-v8a/libjnidispatch.so",
+        "natives/libjnidispatch.so",
+    ),
 ];
 
 /// 安装目录：runtime_dir()/lwjgl3/（classes.jar 与 natives/）。
@@ -237,10 +246,9 @@ fn strip_sha1_entries(jar: &std::path::Path) -> Result<usize> {
             dropped += 1;
             continue;
         }
-        let mut opts: zip::write::SimpleFileOptions =
-            zip::write::SimpleFileOptions::default()
-                .compression_method(entry.compression())
-                .unix_permissions(entry.unix_mode().unwrap_or(0o644));
+        let mut opts: zip::write::SimpleFileOptions = zip::write::SimpleFileOptions::default()
+            .compression_method(entry.compression())
+            .unix_permissions(entry.unix_mode().unwrap_or(0o644));
         if entry.is_dir() {
             opts = opts.unix_permissions(0o755);
             writer.add_directory(name, opts)?;
@@ -266,10 +274,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("qz-lw-{}", std::process::id()));
         paths::set_runtime_jres_root(root.clone());
         assert_eq!(classes_jar(), root.join("lwjgl3/lwjgl-glfw-classes.jar"));
-        assert_eq!(
-            natives_dir(),
-            root.join("lwjgl3/natives")
-        );
+        assert_eq!(natives_dir(), root.join("lwjgl3/natives"));
         assert!(!is_installed());
         paths::set_runtime_jres_root(std::env::temp_dir().join("quartz-test-jres"));
     }
@@ -279,10 +284,18 @@ mod tests {
         // 关键回归：pojavexec 符号位必须有人提供 —— v0.1.5 起不再从 Pojav APK
         // 提取（旧 C 桥 RegisterNatives 版本错位致 255），改由 Rust 显示桥落位。
         // 此处断言：提取清单不再包含 pojavexec，但 jar 必须在（桥的接口契约来源）。
-        assert!(APK_FILES.iter().all(|(p, _)| !p.ends_with("libpojavexec.so")));
-        assert!(APK_FILES.iter().any(|(p, _)| p.ends_with("libjnidispatch.so")));
-        assert!(APK_FILES.iter().any(|(p, _)| p.ends_with("liblwjgl_stb.so")));
-        assert!(APK_FILES.iter().any(|(p, _)| p.ends_with("lwjgl-glfw-classes.jar")));
+        assert!(APK_FILES
+            .iter()
+            .all(|(p, _)| !p.ends_with("libpojavexec.so")));
+        assert!(APK_FILES
+            .iter()
+            .any(|(p, _)| p.ends_with("libjnidispatch.so")));
+        assert!(APK_FILES
+            .iter()
+            .any(|(p, _)| p.ends_with("liblwjgl_stb.so")));
+        assert!(APK_FILES
+            .iter()
+            .any(|(p, _)| p.ends_with("lwjgl-glfw-classes.jar")));
     }
 
     #[test]

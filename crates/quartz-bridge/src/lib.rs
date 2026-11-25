@@ -45,14 +45,22 @@ pub mod host_stubs {
     use std::ffi::{c_int, c_void};
 
     fn env_u32(key: &str, def: u32) -> u32 {
-        std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(def)
+        std::env::var(key)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(def)
     }
 
     /// 返回 QUARTZ_SIM_XWINDOW 指定的 X11 Window（无则 0 = 无窗口路径）。
     #[no_mangle]
-    pub extern "C" fn ANativeWindow_fromSurface(_env: *mut c_void, _surface: *mut c_void) -> *mut c_void {
+    pub extern "C" fn ANativeWindow_fromSurface(
+        _env: *mut c_void,
+        _surface: *mut c_void,
+    ) -> *mut c_void {
         let xid = env_u32("QUARTZ_SIM_XWINDOW", 0);
-        if xid != 0 { eprintln!("[host-stub] ANativeWindow_fromSurface -> XID {xid}"); }
+        if xid != 0 {
+            eprintln!("[host-stub] ANativeWindow_fromSurface -> XID {xid}");
+        }
         xid as *mut c_void
     }
 

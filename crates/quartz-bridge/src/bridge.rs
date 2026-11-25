@@ -55,9 +55,7 @@ fn log(line: &str) {
 /// 宏体内整体 unsafe：这些导出函数本质全是 FFI 边界，unsafe 是默认语境。
 macro_rules! guard {
     ($body:block) => {
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
-            $body
-        }));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { $body }));
     };
 }
 
@@ -112,7 +110,11 @@ unsafe fn runtime_env() -> Option<EnvPtr> {
     }
     let iface = vm_tbl(vm);
     let mut env: EnvPtr = ptr::null_mut();
-    let rc = (iface.GetEnv.unwrap())(vm, &mut env as *mut EnvPtr as *mut *mut c_void, JNI_VERSION_1_4);
+    let rc = (iface.GetEnv.unwrap())(
+        vm,
+        &mut env as *mut EnvPtr as *mut *mut c_void,
+        JNI_VERSION_1_4,
+    );
     if rc == JNI_OK && !env.is_null() {
         return Some(env);
     }
@@ -138,7 +140,11 @@ unsafe fn art_env() -> Option<EnvPtr> {
     }
     let iface = vm_tbl(vm);
     let mut env: EnvPtr = ptr::null_mut();
-    let rc = (iface.GetEnv.unwrap())(vm, &mut env as *mut EnvPtr as *mut *mut c_void, JNI_VERSION_1_4);
+    let rc = (iface.GetEnv.unwrap())(
+        vm,
+        &mut env as *mut EnvPtr as *mut *mut c_void,
+        JNI_VERSION_1_4,
+    );
     if rc == JNI_OK && !env.is_null() {
         return Some(env);
     }
@@ -172,7 +178,15 @@ pub struct Event {
 
 impl Event {
     fn ints(typ: i32, i1: i32, i2: i32, i3: i32, i4: i32) -> Self {
-        Event { typ, i1, i2, i3, i4, dx: 0.0, dy: 0.0 }
+        Event {
+            typ,
+            i1,
+            i2,
+            i3,
+            i4,
+            dx: 0.0,
+            dy: 0.0,
+        }
     }
 }
 
@@ -398,7 +412,8 @@ pub mod egl {
     type EglTerminateFn = unsafe extern "system" fn(EGLDisplay) -> u32;
     type EglSwapBuffersFn = unsafe extern "system" fn(EGLDisplay, EGLSurface) -> u32;
     type EglSwapIntervalFn = unsafe extern "system" fn(EGLDisplay, i32) -> u32;
-    type EglQuerySurfaceFn = unsafe extern "system" fn(EGLDisplay, EGLSurface, i32, *mut i32) -> u32;
+    type EglQuerySurfaceFn =
+        unsafe extern "system" fn(EGLDisplay, EGLSurface, i32, *mut i32) -> u32;
     type EglGetErrorFn = unsafe extern "system" fn() -> i32;
 
     #[derive(Clone, Copy)]
@@ -444,7 +459,11 @@ pub mod egl {
         const RTLD_LOCAL: c_int = 0;
 
         let configured = std::env::var("POJAVEXEC_EGL").unwrap_or_default();
-        let path = if configured.is_empty() { "libEGL.so".to_string() } else { configured };
+        let path = if configured.is_empty() {
+            "libEGL.so".to_string()
+        } else {
+            configured
+        };
         let cpath = CString::new(path.clone()).ok()?;
         let handle = unsafe { dlopen(cpath.as_ptr(), RTLD_LAZY | RTLD_LOCAL) };
         if handle.is_null() {
@@ -501,8 +520,16 @@ pub mod egl {
         get!(get_config_attrib, "eglGetConfigAttrib", EglConfigAttribFn);
         get!(bind_api, "eglBindAPI", EglBindApiFn);
         get!(create_context, "eglCreateContext", EglCreateContextFn);
-        get!(create_window_surface, "eglCreateWindowSurface", EglCreateWindowSurfaceFn);
-        get!(create_pbuffer_surface, "eglCreatePbufferSurface", EglCreatePbufferSurfaceFn);
+        get!(
+            create_window_surface,
+            "eglCreateWindowSurface",
+            EglCreateWindowSurfaceFn
+        );
+        get!(
+            create_pbuffer_surface,
+            "eglCreatePbufferSurface",
+            EglCreatePbufferSurfaceFn
+        );
         get!(swap_buffers, "eglSwapBuffers", EglSwapBuffersFn);
         get!(swap_interval, "eglSwapInterval", EglSwapIntervalFn);
         get!(query_surface, "eglQuerySurface", EglQuerySurfaceFn);
@@ -540,7 +567,9 @@ static EGL_STATE: Mutex<Option<(egl::EglApi, usize)>> = Mutex::new(None);
 // ---------------------------------------------------------------------------
 
 unsafe fn call_glfw_void(method_slot: &AtomicPtr<c_void>, label: &str, args: &[jvalue]) {
-    let Some(env) = (unsafe { runtime_env() }) else { return };
+    let Some(env) = (unsafe { runtime_env() }) else {
+        return;
+    };
     unsafe {
         let cls = state().rt_glfw_class.load(Ordering::Acquire) as jclass;
         let mid = method_slot.load(Ordering::Acquire) as jmethodID;
@@ -548,7 +577,9 @@ unsafe fn call_glfw_void(method_slot: &AtomicPtr<c_void>, label: &str, args: &[j
             return;
         }
         let tbl = env_tbl(env);
-        let Some(call) = tbl.CallStaticVoidMethodA else { return };
+        let Some(call) = tbl.CallStaticVoidMethodA else {
+            return;
+        };
         if tbl.ExceptionCheck.unwrap()(env) != 0 {
             tbl.ExceptionClear.unwrap()(env);
         }
@@ -645,7 +676,8 @@ pub extern "C" fn pojav_init() -> c_int {
         if let Some(api) = egl::load_api() {
             let display = (api.get_display.unwrap())(egl::EGL_DEFAULT_DISPLAY);
             if display != egl::EGL_NO_DISPLAY
-                && (api.initialize.unwrap())(display, ptr::null_mut(), ptr::null_mut()) == egl::EGL_TRUE
+                && (api.initialize.unwrap())(display, ptr::null_mut(), ptr::null_mut())
+                    == egl::EGL_TRUE
             {
                 *EGL_STATE.lock().unwrap() = Some((api, display as usize));
                 log("EGL 桥就绪（渲染层实现库）");
@@ -657,7 +689,11 @@ pub extern "C" fn pojav_init() -> c_int {
         }
         log(&format!("pojavInit：窗口 {w}x{h}"));
     });
-    if ok { 1 } else { 1 } // 与 Pojav 一致恒返 1（失败细节已写日志，MC 会再报错）
+    if ok {
+        1
+    } else {
+        1
+    } // 与 Pojav 一致恒返 1（失败细节已写日志，MC 会再报错）
 }
 
 /// `void* pojavCreateContext(void* share)` —— nglfwCreateContext。
@@ -691,98 +727,154 @@ pub extern "C" fn pojav_create_context(share: *mut c_void) -> *mut c_void {
             // #0 ES2 完整需求：RGBA8888 + 深度 24 + WINDOW|PBUFFER
             Ladder {
                 attrs: [
-                    egl::EGL_BLUE_SIZE, 8,
-                    egl::EGL_GREEN_SIZE, 8,
-                    egl::EGL_RED_SIZE, 8,
-                    egl::EGL_ALPHA_SIZE, 8,
-                    egl::EGL_DEPTH_SIZE, 24,
-                    egl::EGL_SURFACE_TYPE, egl::EGL_WINDOW_BIT | egl::EGL_PBUFFER_BIT,
-                    egl::EGL_RENDERABLE_TYPE, A_ES2,
-                    egl::EGL_NONE, 0,
+                    egl::EGL_BLUE_SIZE,
+                    8,
+                    egl::EGL_GREEN_SIZE,
+                    8,
+                    egl::EGL_RED_SIZE,
+                    8,
+                    egl::EGL_ALPHA_SIZE,
+                    8,
+                    egl::EGL_DEPTH_SIZE,
+                    24,
+                    egl::EGL_SURFACE_TYPE,
+                    egl::EGL_WINDOW_BIT | egl::EGL_PBUFFER_BIT,
+                    egl::EGL_RENDERABLE_TYPE,
+                    A_ES2,
+                    egl::EGL_NONE,
+                    0,
                 ],
                 es_bit: A_ES2,
             },
             // #1 ES2 去 PBUFFER 位（窗口渲染主路径）
             Ladder {
                 attrs: [
-                    egl::EGL_BLUE_SIZE, 8,
-                    egl::EGL_GREEN_SIZE, 8,
-                    egl::EGL_RED_SIZE, 8,
-                    egl::EGL_ALPHA_SIZE, 8,
-                    egl::EGL_DEPTH_SIZE, 24,
-                    egl::EGL_SURFACE_TYPE, egl::EGL_WINDOW_BIT,
-                    egl::EGL_RENDERABLE_TYPE, A_ES2,
-                    egl::EGL_NONE, 0,
+                    egl::EGL_BLUE_SIZE,
+                    8,
+                    egl::EGL_GREEN_SIZE,
+                    8,
+                    egl::EGL_RED_SIZE,
+                    8,
+                    egl::EGL_ALPHA_SIZE,
+                    8,
+                    egl::EGL_DEPTH_SIZE,
+                    24,
+                    egl::EGL_SURFACE_TYPE,
+                    egl::EGL_WINDOW_BIT,
+                    egl::EGL_RENDERABLE_TYPE,
+                    A_ES2,
+                    egl::EGL_NONE,
+                    0,
                 ],
                 es_bit: A_ES2,
             },
             // #2 ES2 深度降为 16
             Ladder {
                 attrs: [
-                    egl::EGL_BLUE_SIZE, 8,
-                    egl::EGL_GREEN_SIZE, 8,
-                    egl::EGL_RED_SIZE, 8,
-                    egl::EGL_ALPHA_SIZE, 8,
-                    egl::EGL_DEPTH_SIZE, 16,
-                    egl::EGL_SURFACE_TYPE, egl::EGL_WINDOW_BIT,
-                    egl::EGL_RENDERABLE_TYPE, A_ES2,
-                    egl::EGL_NONE, 0,
+                    egl::EGL_BLUE_SIZE,
+                    8,
+                    egl::EGL_GREEN_SIZE,
+                    8,
+                    egl::EGL_RED_SIZE,
+                    8,
+                    egl::EGL_ALPHA_SIZE,
+                    8,
+                    egl::EGL_DEPTH_SIZE,
+                    16,
+                    egl::EGL_SURFACE_TYPE,
+                    egl::EGL_WINDOW_BIT,
+                    egl::EGL_RENDERABLE_TYPE,
+                    A_ES2,
+                    egl::EGL_NONE,
+                    0,
                 ],
                 es_bit: A_ES2,
             },
             // #3 ES2 仅要求可渲染 + 窗口位（颜色/深度交给 EGL 默认值）
             Ladder {
                 attrs: [
-                    egl::EGL_SURFACE_TYPE, egl::EGL_WINDOW_BIT,
-                    egl::EGL_RENDERABLE_TYPE, A_ES2,
-                    egl::EGL_NONE, 0,
-                    egl::EGL_NONE, 0,
-                    egl::EGL_NONE, 0,
-                    egl::EGL_NONE, 0,
-                    egl::EGL_NONE, 0,
-                    egl::EGL_NONE, 0,
+                    egl::EGL_SURFACE_TYPE,
+                    egl::EGL_WINDOW_BIT,
+                    egl::EGL_RENDERABLE_TYPE,
+                    A_ES2,
+                    egl::EGL_NONE,
+                    0,
+                    egl::EGL_NONE,
+                    0,
+                    egl::EGL_NONE,
+                    0,
+                    egl::EGL_NONE,
+                    0,
+                    egl::EGL_NONE,
+                    0,
+                    egl::EGL_NONE,
+                    0,
                 ],
                 es_bit: A_ES2,
             },
             // #4 ES3 完整需求（MobileGlues 主路径）
             Ladder {
                 attrs: [
-                    egl::EGL_BLUE_SIZE, 8,
-                    egl::EGL_GREEN_SIZE, 8,
-                    egl::EGL_RED_SIZE, 8,
-                    egl::EGL_ALPHA_SIZE, 8,
-                    egl::EGL_DEPTH_SIZE, 24,
-                    egl::EGL_SURFACE_TYPE, egl::EGL_WINDOW_BIT | egl::EGL_PBUFFER_BIT,
-                    egl::EGL_RENDERABLE_TYPE, A_ES3,
-                    egl::EGL_NONE, 0,
+                    egl::EGL_BLUE_SIZE,
+                    8,
+                    egl::EGL_GREEN_SIZE,
+                    8,
+                    egl::EGL_RED_SIZE,
+                    8,
+                    egl::EGL_ALPHA_SIZE,
+                    8,
+                    egl::EGL_DEPTH_SIZE,
+                    24,
+                    egl::EGL_SURFACE_TYPE,
+                    egl::EGL_WINDOW_BIT | egl::EGL_PBUFFER_BIT,
+                    egl::EGL_RENDERABLE_TYPE,
+                    A_ES3,
+                    egl::EGL_NONE,
+                    0,
                 ],
                 es_bit: A_ES3,
             },
             // #5 ES3 去 PBUFFER 位
             Ladder {
                 attrs: [
-                    egl::EGL_BLUE_SIZE, 8,
-                    egl::EGL_GREEN_SIZE, 8,
-                    egl::EGL_RED_SIZE, 8,
-                    egl::EGL_ALPHA_SIZE, 8,
-                    egl::EGL_DEPTH_SIZE, 24,
-                    egl::EGL_SURFACE_TYPE, egl::EGL_WINDOW_BIT,
-                    egl::EGL_RENDERABLE_TYPE, A_ES3,
-                    egl::EGL_NONE, 0,
+                    egl::EGL_BLUE_SIZE,
+                    8,
+                    egl::EGL_GREEN_SIZE,
+                    8,
+                    egl::EGL_RED_SIZE,
+                    8,
+                    egl::EGL_ALPHA_SIZE,
+                    8,
+                    egl::EGL_DEPTH_SIZE,
+                    24,
+                    egl::EGL_SURFACE_TYPE,
+                    egl::EGL_WINDOW_BIT,
+                    egl::EGL_RENDERABLE_TYPE,
+                    A_ES3,
+                    egl::EGL_NONE,
+                    0,
                 ],
                 es_bit: A_ES3,
             },
             // #6 ES3 仅可渲染 + 窗口位
             Ladder {
                 attrs: [
-                    egl::EGL_SURFACE_TYPE, egl::EGL_WINDOW_BIT,
-                    egl::EGL_RENDERABLE_TYPE, A_ES3,
-                    egl::EGL_NONE, 0,
-                    egl::EGL_NONE, 0,
-                    egl::EGL_NONE, 0,
-                    egl::EGL_NONE, 0,
-                    egl::EGL_NONE, 0,
-                    egl::EGL_NONE, 0,
+                    egl::EGL_SURFACE_TYPE,
+                    egl::EGL_WINDOW_BIT,
+                    egl::EGL_RENDERABLE_TYPE,
+                    A_ES3,
+                    egl::EGL_NONE,
+                    0,
+                    egl::EGL_NONE,
+                    0,
+                    egl::EGL_NONE,
+                    0,
+                    egl::EGL_NONE,
+                    0,
+                    egl::EGL_NONE,
+                    0,
+                    egl::EGL_NONE,
+                    0,
                 ],
                 es_bit: A_ES3,
             },
@@ -792,16 +884,7 @@ pub extern "C" fn pojav_create_context(share: *mut c_void) -> *mut c_void {
             // EGL_BAD_ATTRIBUTE(0x3004) 拒绝，此前直接跌入 eglGetConfigs 兜底
             // 拿到无语义项 config（renderable=0x0000）。空属性档优先于盲目兜底。
             Ladder {
-                attrs: [
-                    egl::EGL_NONE, 0,
-                    0, 0,
-                    0, 0,
-                    0, 0,
-                    0, 0,
-                    0, 0,
-                    0, 0,
-                    0, 0,
-                ],
+                attrs: [egl::EGL_NONE, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
                 es_bit: A_ES3,
             },
         ];
@@ -811,15 +894,28 @@ pub extern "C" fn pojav_create_context(share: *mut c_void) -> *mut c_void {
         let mut matched_tier: i32 = -1;
         for (tier, lad) in ladders.iter().enumerate() {
             let mut num_configs: i32 = 0;
-            let rc = (api.choose_config.unwrap())(display, lad.attrs.as_ptr(), ptr::null_mut(), 0, &mut num_configs);
+            let rc = (api.choose_config.unwrap())(
+                display,
+                lad.attrs.as_ptr(),
+                ptr::null_mut(),
+                0,
+                &mut num_configs,
+            );
             if rc == egl::EGL_TRUE && num_configs > 0 {
                 let mut got: i32 = 0;
                 (api.choose_config.unwrap())(display, lad.attrs.as_ptr(), &mut config, 1, &mut got);
-                (api.get_config_attrib.unwrap())(display, config, egl::EGL_NATIVE_VISUAL_ID, &mut format);
+                (api.get_config_attrib.unwrap())(
+                    display,
+                    config,
+                    egl::EGL_NATIVE_VISUAL_ID,
+                    &mut format,
+                );
                 matched_es_bit = lad.es_bit;
                 matched_tier = tier as i32;
                 if tier > 0 {
-                    log(&format!("eglChooseConfig：使用回退阶梯 #{tier}（configs={num_configs}）"));
+                    log(&format!(
+                        "eglChooseConfig：使用回退阶梯 #{tier}（configs={num_configs}）"
+                    ));
                 }
                 break;
             }
@@ -852,8 +948,18 @@ pub extern "C" fn pojav_create_context(share: *mut c_void) -> *mut c_void {
                     }
                     let mut renderable: i32 = 0;
                     let mut surface_bits: i32 = 0;
-                    (api.get_config_attrib.unwrap())(display, *cfg, egl::EGL_RENDERABLE_TYPE, &mut renderable);
-                    (api.get_config_attrib.unwrap())(display, *cfg, egl::EGL_SURFACE_TYPE, &mut surface_bits);
+                    (api.get_config_attrib.unwrap())(
+                        display,
+                        *cfg,
+                        egl::EGL_RENDERABLE_TYPE,
+                        &mut renderable,
+                    );
+                    (api.get_config_attrib.unwrap())(
+                        display,
+                        *cfg,
+                        egl::EGL_SURFACE_TYPE,
+                        &mut surface_bits,
+                    );
                     scanned.push(format!("{:#x}/{:#x}", renderable, surface_bits));
                     if renderable & (egl::EGL_OPENGL_ES3_BIT | egl::EGL_OPENGL_ES2_BIT) != 0
                         && surface_bits & egl::EGL_WINDOW_BIT != 0
@@ -874,7 +980,12 @@ pub extern "C" fn pojav_create_context(share: *mut c_void) -> *mut c_void {
                     }
                     None => {
                         config = buf[0];
-                        (api.get_config_attrib.unwrap())(display, config, egl::EGL_RENDERABLE_TYPE, &mut matched_es_bit);
+                        (api.get_config_attrib.unwrap())(
+                            display,
+                            config,
+                            egl::EGL_RENDERABLE_TYPE,
+                            &mut matched_es_bit,
+                        );
                         log(&format!(
                             "eglGetConfigs 兜底无可渲染 config，取第一个（共 {} 个：{}）",
                             scanned.len(),
@@ -882,13 +993,20 @@ pub extern "C" fn pojav_create_context(share: *mut c_void) -> *mut c_void {
                         ));
                     }
                 }
-                (api.get_config_attrib.unwrap())(display, config, egl::EGL_NATIVE_VISUAL_ID, &mut format);
+                (api.get_config_attrib.unwrap())(
+                    display,
+                    config,
+                    egl::EGL_NATIVE_VISUAL_ID,
+                    &mut format,
+                );
                 matched_tier = -2;
             }
         }
         if config.is_null() {
             let err = (api.get_error.unwrap())();
-            log(&format!("eglChooseConfig 失败：{err:#06x}（含 eglGetConfigs 兜底仍无 config）"));
+            log(&format!(
+                "eglChooseConfig 失败：{err:#06x}（含 eglGetConfigs 兜底仍无 config）"
+            ));
             return;
         }
 
@@ -937,14 +1055,17 @@ pub extern "C" fn pojav_create_context(share: *mut c_void) -> *mut c_void {
                         egl::EGL_NONE,
                         0,
                     ];
-                    let ctx = (api.create_context.unwrap())(display, config, share_ctx, attrs.as_ptr());
+                    let ctx =
+                        (api.create_context.unwrap())(display, config, share_ctx, attrs.as_ptr());
                     if ctx != egl::EGL_NO_CONTEXT {
                         got = ctx;
                         label = format!("GL{major}.{minor} core");
                         break;
                     }
                     let err = (api.get_error.unwrap())();
-                    log(&format!("桌面 GL {major}.{minor} 上下文创建失败：{err:#06x}，降档重试"));
+                    log(&format!(
+                        "桌面 GL {major}.{minor} 上下文创建失败：{err:#06x}，降档重试"
+                    ));
                 }
             }
             if got == egl::EGL_NO_CONTEXT {
@@ -955,13 +1076,19 @@ pub extern "C" fn pojav_create_context(share: *mut c_void) -> *mut c_void {
                     .ok()
                     .and_then(|v| v.trim().parse::<i32>().ok())
                     .filter(|v| (1..=3).contains(v))
-                    .unwrap_or(if matched_es_bit & egl::EGL_OPENGL_ES3_BIT != 0 { 3 } else { 2 });
+                    .unwrap_or(if matched_es_bit & egl::EGL_OPENGL_ES3_BIT != 0 {
+                        3
+                    } else {
+                        2
+                    });
                 let ctx_attrs = [egl::EGL_CONTEXT_CLIENT_VERSION, es, egl::EGL_NONE];
                 let context =
                     (api.create_context.unwrap())(display, config, share_ctx, ctx_attrs.as_ptr());
                 if context == egl::EGL_NO_CONTEXT {
                     let err = (api.get_error.unwrap())();
-                    log(&format!("eglCreateContext 失败：{err:#06x}（client_version={es}）"));
+                    log(&format!(
+                        "eglCreateContext 失败：{err:#06x}（client_version={es}）"
+                    ));
                     return;
                 }
                 (context, format!("GLES{es}"))
@@ -996,7 +1123,11 @@ thread_local! {
 #[export_name = "pojavGetCurrentContext"]
 pub extern "C" fn pojav_get_current_context() -> *mut c_void {
     let cur = CURRENT_WINDOW.with(|c| c.get());
-    if cur == 0 { ptr::null_mut() } else { cur as *mut c_void }
+    if cur == 0 {
+        ptr::null_mut()
+    } else {
+        cur as *mut c_void
+    }
 }
 
 /// Pojav gl_bridge.c gl_swap_surface：换绑新 Surface 或 1x1 pbuffer 兜底。
@@ -1016,8 +1147,12 @@ unsafe fn gl_swap_surface(bundle: &Arc<RenderWindow>, display: egl::EGLDisplay, 
         bundle.native_surface.set(new_native);
         ANativeWindow_acquire(new_native);
         ANativeWindow_setBuffersGeometry(new_native, 0, 0, bundle.format.get());
-        let surface =
-            (api.create_window_surface.unwrap())(display, bundle.config.get(), new_native as *mut c_void, ptr::null());
+        let surface = (api.create_window_surface.unwrap())(
+            display,
+            bundle.config.get(),
+            new_native as *mut c_void,
+            ptr::null(),
+        );
         bundle.surface.set(surface);
         if surface.is_null() {
             let err = (api.get_error.unwrap())();
@@ -1026,9 +1161,11 @@ unsafe fn gl_swap_surface(bundle: &Arc<RenderWindow>, display: egl::EGLDisplay, 
     } else {
         log("无新 Surface，切 1x1 pbuffer 兜底");
         let pbuf_attrs = [egl::EGL_WIDTH, 1, egl::EGL_HEIGHT, 1, egl::EGL_NONE];
-        bundle
-            .surface
-            .set((api.create_pbuffer_surface.unwrap())(display, bundle.config.get(), pbuf_attrs.as_ptr()));
+        bundle.surface.set((api.create_pbuffer_surface.unwrap())(
+            display,
+            bundle.config.get(),
+            pbuf_attrs.as_ptr(),
+        ));
     }
 }
 
@@ -1042,14 +1179,23 @@ pub extern "C" fn pojav_make_current(window: *mut c_void) {
             let guard = EGL_STATE.lock().unwrap();
             if let Some((api, display)) = guard.as_ref() {
                 let display = *display as egl::EGLDisplay;
-                (api.make_current.unwrap())(display, egl::EGL_NO_SURFACE, egl::EGL_NO_SURFACE, egl::EGL_NO_CONTEXT);
+                (api.make_current.unwrap())(
+                    display,
+                    egl::EGL_NO_SURFACE,
+                    egl::EGL_NO_SURFACE,
+                    egl::EGL_NO_CONTEXT,
+                );
             }
             CURRENT_WINDOW.with(|c| c.set(0));
             return;
         }
-        let Some(bundle) = s.windows.lock().unwrap().get(&handle).cloned() else { return };
+        let Some(bundle) = s.windows.lock().unwrap().get(&handle).cloned() else {
+            return;
+        };
         let guard = EGL_STATE.lock().unwrap();
-        let Some((api, display)) = guard.as_ref() else { return };
+        let Some((api, display)) = guard.as_ref() else {
+            return;
+        };
         let display = *display as egl::EGLDisplay;
         let mut first_main = false;
         {
@@ -1057,20 +1203,28 @@ pub extern "C" fn pojav_make_current(window: *mut c_void) {
             if main_slot.is_none() {
                 *main_slot = Some(handle);
                 first_main = true;
-                bundle.new_native_surface.set(s.window.load(Ordering::Acquire));
+                bundle
+                    .new_native_surface
+                    .set(s.window.load(Ordering::Acquire));
                 log(&format!("主窗口 bundle = {handle:#x}"));
             }
         }
         if bundle.surface.get().is_null() {
             gl_swap_surface(&bundle, display, api);
         }
-        if (api.make_current.unwrap())(display, bundle.surface.get(), bundle.surface.get(), bundle.context.get())
-            == egl::EGL_TRUE
+        if (api.make_current.unwrap())(
+            display,
+            bundle.surface.get(),
+            bundle.surface.get(),
+            bundle.context.get(),
+        ) == egl::EGL_TRUE
         {
             CURRENT_WINDOW.with(|c| c.set(handle));
         } else {
             let err = (api.get_error.unwrap())();
-            log(&format!("eglMakeCurrent 失败：{err:#06x}（首帧={first_main}）"));
+            log(&format!(
+                "eglMakeCurrent 失败：{err:#06x}（首帧={first_main}）"
+            ));
             if first_main {
                 bundle.new_native_surface.set(ptr::null_mut());
                 gl_swap_surface(&bundle, display, api);
@@ -1085,17 +1239,31 @@ pub extern "C" fn pojav_make_current(window: *mut c_void) {
 pub extern "C" fn pojav_swap_buffers(_window: *mut c_void) {
     guard!({
         let guard = EGL_STATE.lock().unwrap();
-        let Some((api, display)) = guard.as_ref() else { return };
+        let Some((api, display)) = guard.as_ref() else {
+            return;
+        };
         let display = *display as egl::EGLDisplay;
         let handle = CURRENT_WINDOW.with(|c| c.get());
         if handle == 0 {
             return;
         }
-        let Some(bundle) = state().windows.lock().unwrap().get(&handle).cloned() else { return };
+        let Some(bundle) = state().windows.lock().unwrap().get(&handle).cloned() else {
+            return;
+        };
         if bundle.state.get() == egl::STATE_NEW_WINDOW {
-            (api.make_current.unwrap())(display, egl::EGL_NO_SURFACE, egl::EGL_NO_SURFACE, egl::EGL_NO_CONTEXT);
+            (api.make_current.unwrap())(
+                display,
+                egl::EGL_NO_SURFACE,
+                egl::EGL_NO_SURFACE,
+                egl::EGL_NO_CONTEXT,
+            );
             gl_swap_surface(&bundle, display, api);
-            (api.make_current.unwrap())(display, bundle.surface.get(), bundle.surface.get(), bundle.context.get());
+            (api.make_current.unwrap())(
+                display,
+                bundle.surface.get(),
+                bundle.surface.get(),
+                bundle.context.get(),
+            );
             bundle.state.set(egl::STATE_ALIVE);
         }
         if !bundle.surface.get().is_null()
@@ -1103,10 +1271,20 @@ pub extern "C" fn pojav_swap_buffers(_window: *mut c_void) {
             && (api.get_error.unwrap())() == egl::EGL_BAD_SURFACE
         {
             log("EGL surface 失效（surfaceChanged），等待新窗口");
-            (api.make_current.unwrap())(display, egl::EGL_NO_SURFACE, egl::EGL_NO_SURFACE, egl::EGL_NO_CONTEXT);
+            (api.make_current.unwrap())(
+                display,
+                egl::EGL_NO_SURFACE,
+                egl::EGL_NO_SURFACE,
+                egl::EGL_NO_CONTEXT,
+            );
             bundle.new_native_surface.set(ptr::null_mut());
             gl_swap_surface(&bundle, display, api);
-            (api.make_current.unwrap())(display, bundle.surface.get(), bundle.surface.get(), bundle.context.get());
+            (api.make_current.unwrap())(
+                display,
+                bundle.surface.get(),
+                bundle.surface.get(),
+                bundle.context.get(),
+            );
         }
     });
 }
@@ -1116,7 +1294,10 @@ pub extern "C" fn pojav_swap_buffers(_window: *mut c_void) {
 pub extern "C" fn pojav_swap_interval(interval: c_int) {
     guard!({
         let mut interval = interval;
-        if std::env::var("FORCE_VSYNC").map(|v| v == "true").unwrap_or(false) {
+        if std::env::var("FORCE_VSYNC")
+            .map(|v| v == "true")
+            .unwrap_or(false)
+        {
             interval = 1;
         }
         let guard = EGL_STATE.lock().unwrap();
@@ -1140,7 +1321,12 @@ pub extern "C" fn pojav_terminate() {
         let guard = EGL_STATE.lock().unwrap();
         if let Some((api, display)) = guard.as_ref() {
             let display = *display as egl::EGLDisplay;
-            (api.make_current.unwrap())(display, egl::EGL_NO_SURFACE, egl::EGL_NO_SURFACE, egl::EGL_NO_CONTEXT);
+            (api.make_current.unwrap())(
+                display,
+                egl::EGL_NO_SURFACE,
+                egl::EGL_NO_SURFACE,
+                egl::EGL_NO_CONTEXT,
+            );
             let mut windows = s.windows.lock().unwrap();
             for (_, bundle) in windows.iter() {
                 if !bundle.surface.get().is_null() {
@@ -1196,7 +1382,11 @@ pub extern "C" fn pojav_pump_events(window: *mut c_void) {
             if n < 3 || n % 600 == 0 {
                 log(&format!(
                     "[diag] pump#{n} cb_slot: char={} curpos={} key={} mouse={} scroll={}",
-                    s2_cb("char"), s2_cb("curpos"), s2_cb("key"), s2_cb("mouse"), s2_cb("scroll")
+                    s2_cb("char"),
+                    s2_cb("curpos"),
+                    s2_cb("key"),
+                    s2_cb("mouse"),
+                    s2_cb("scroll")
                 ));
             }
         }
@@ -1210,7 +1400,11 @@ pub extern "C" fn pojav_pump_events(window: *mut c_void) {
                     &s.cb_cursor_pos_obj,
                     &s.mid_cursor_pos,
                     &s.cb_cursor_pos,
-                    &[jvalue { j: window as jlong }, jvalue { d: cursor.0 }, jvalue { d: cursor.1 }],
+                    &[
+                        jvalue { j: window as jlong },
+                        jvalue { d: cursor.0 },
+                        jvalue { d: cursor.1 },
+                    ],
                     |cb| {
                         let f: unsafe extern "system" fn(*mut c_void, f64, f64) =
                             std::mem::transmute(cb);
@@ -1225,113 +1419,109 @@ pub extern "C" fn pojav_pump_events(window: *mut c_void) {
         let events: Vec<Event> = std::mem::take(&mut *s.pump_buf.lock().unwrap());
         for ev in events {
             match ev.typ {
-                EVENT_TYPE_CHAR => {
-                    unsafe {
-                        pump_dispatch(
-                            "char",
-                            &s.cb_char_obj,
-                            &s.mid_char,
-                            &s.cb_char,
-                            &[jvalue { j: window as jlong }, jvalue { i: ev.i1 }],
-                            |cb| {
-                                let f: unsafe extern "system" fn(*mut c_void, u32) =
-                                    std::mem::transmute(cb);
-                                unsafe { f(window, ev.i1 as u32) };
-                            },
-                        );
-                    }
-                }
-                EVENT_TYPE_CHAR_MODS => {
-                    unsafe {
-                        pump_dispatch(
-                            "char-mods",
-                            &s.cb_char_mods_obj,
-                            &s.mid_char_mods,
-                            &s.cb_char_mods,
-                            &[jvalue { j: window as jlong }, jvalue { i: ev.i1 }, jvalue { i: ev.i2 }],
-                            |cb| {
-                                let f: unsafe extern "system" fn(*mut c_void, u32, i32) =
-                                    std::mem::transmute(cb);
-                                unsafe { f(window, ev.i1 as u32, ev.i2) };
-                            },
-                        );
-                    }
-                }
-                EVENT_TYPE_CURSOR_ENTER => {
-                    unsafe {
-                        pump_dispatch(
-                            "cursor-enter",
-                            &s.cb_cursor_enter_obj,
-                            &s.mid_cursor_enter,
-                            &s.cb_cursor_enter,
-                            &[jvalue { j: window as jlong }, jvalue { z: ev.i1 as u8 }],
-                            |cb| {
-                                let f: unsafe extern "system" fn(*mut c_void, i32) =
-                                    std::mem::transmute(cb);
-                                unsafe { f(window, ev.i1) };
-                            },
-                        );
-                    }
-                }
-                EVENT_TYPE_KEY => {
-                    unsafe {
-                        pump_dispatch(
-                            "key",
-                            &s.cb_key_obj,
-                            &s.mid_key,
-                            &s.cb_key,
-                            &[
-                                jvalue { j: window as jlong },
-                                jvalue { i: ev.i1 },
-                                jvalue { i: ev.i2 },
-                                jvalue { i: ev.i3 },
-                                jvalue { i: ev.i4 },
-                            ],
-                            |cb| {
-                                let f: unsafe extern "system" fn(*mut c_void, i32, i32, i32, i32) =
-                                    std::mem::transmute(cb);
-                                unsafe { f(window, ev.i1, ev.i2, ev.i3, ev.i4) };
-                            },
-                        );
-                    }
-                }
-                EVENT_TYPE_MOUSE_BUTTON => {
-                    unsafe {
-                        pump_dispatch(
-                            "mouse-button",
-                            &s.cb_mouse_obj,
-                            &s.mid_mouse,
-                            &s.cb_mouse,
-                            &[
-                                jvalue { j: window as jlong },
-                                jvalue { i: ev.i1 },
-                                jvalue { i: ev.i2 },
-                                jvalue { i: ev.i3 },
-                            ],
-                            |cb| {
-                                let f: unsafe extern "system" fn(*mut c_void, i32, i32, i32) =
-                                    std::mem::transmute(cb);
-                                unsafe { f(window, ev.i1, ev.i2, ev.i3) };
-                            },
-                        );
-                    }
-                }
-                EVENT_TYPE_SCROLL => {
-                    unsafe {
-                        pump_dispatch(
-                            "scroll",
-                            &s.cb_scroll_obj,
-                            &s.mid_scroll,
-                            &s.cb_scroll,
-                            &[jvalue { j: window as jlong }, jvalue { d: ev.dx }, jvalue { d: ev.dy }],
-                            |cb| {
-                                let f: unsafe extern "system" fn(*mut c_void, f64, f64) =
-                                    std::mem::transmute(cb);
-                                unsafe { f(window, ev.dx, ev.dy) };
-                            },
-                        );
-                    }
-                }
+                EVENT_TYPE_CHAR => unsafe {
+                    pump_dispatch(
+                        "char",
+                        &s.cb_char_obj,
+                        &s.mid_char,
+                        &s.cb_char,
+                        &[jvalue { j: window as jlong }, jvalue { i: ev.i1 }],
+                        |cb| {
+                            let f: unsafe extern "system" fn(*mut c_void, u32) =
+                                std::mem::transmute(cb);
+                            unsafe { f(window, ev.i1 as u32) };
+                        },
+                    );
+                },
+                EVENT_TYPE_CHAR_MODS => unsafe {
+                    pump_dispatch(
+                        "char-mods",
+                        &s.cb_char_mods_obj,
+                        &s.mid_char_mods,
+                        &s.cb_char_mods,
+                        &[
+                            jvalue { j: window as jlong },
+                            jvalue { i: ev.i1 },
+                            jvalue { i: ev.i2 },
+                        ],
+                        |cb| {
+                            let f: unsafe extern "system" fn(*mut c_void, u32, i32) =
+                                std::mem::transmute(cb);
+                            unsafe { f(window, ev.i1 as u32, ev.i2) };
+                        },
+                    );
+                },
+                EVENT_TYPE_CURSOR_ENTER => unsafe {
+                    pump_dispatch(
+                        "cursor-enter",
+                        &s.cb_cursor_enter_obj,
+                        &s.mid_cursor_enter,
+                        &s.cb_cursor_enter,
+                        &[jvalue { j: window as jlong }, jvalue { z: ev.i1 as u8 }],
+                        |cb| {
+                            let f: unsafe extern "system" fn(*mut c_void, i32) =
+                                std::mem::transmute(cb);
+                            unsafe { f(window, ev.i1) };
+                        },
+                    );
+                },
+                EVENT_TYPE_KEY => unsafe {
+                    pump_dispatch(
+                        "key",
+                        &s.cb_key_obj,
+                        &s.mid_key,
+                        &s.cb_key,
+                        &[
+                            jvalue { j: window as jlong },
+                            jvalue { i: ev.i1 },
+                            jvalue { i: ev.i2 },
+                            jvalue { i: ev.i3 },
+                            jvalue { i: ev.i4 },
+                        ],
+                        |cb| {
+                            let f: unsafe extern "system" fn(*mut c_void, i32, i32, i32, i32) =
+                                std::mem::transmute(cb);
+                            unsafe { f(window, ev.i1, ev.i2, ev.i3, ev.i4) };
+                        },
+                    );
+                },
+                EVENT_TYPE_MOUSE_BUTTON => unsafe {
+                    pump_dispatch(
+                        "mouse-button",
+                        &s.cb_mouse_obj,
+                        &s.mid_mouse,
+                        &s.cb_mouse,
+                        &[
+                            jvalue { j: window as jlong },
+                            jvalue { i: ev.i1 },
+                            jvalue { i: ev.i2 },
+                            jvalue { i: ev.i3 },
+                        ],
+                        |cb| {
+                            let f: unsafe extern "system" fn(*mut c_void, i32, i32, i32) =
+                                std::mem::transmute(cb);
+                            unsafe { f(window, ev.i1, ev.i2, ev.i3) };
+                        },
+                    );
+                },
+                EVENT_TYPE_SCROLL => unsafe {
+                    pump_dispatch(
+                        "scroll",
+                        &s.cb_scroll_obj,
+                        &s.mid_scroll,
+                        &s.cb_scroll,
+                        &[
+                            jvalue { j: window as jlong },
+                            jvalue { d: ev.dx },
+                            jvalue { d: ev.dy },
+                        ],
+                        |cb| {
+                            let f: unsafe extern "system" fn(*mut c_void, f64, f64) =
+                                std::mem::transmute(cb);
+                            unsafe { f(window, ev.dx, ev.dy) };
+                        },
+                    );
+                },
                 _ => {}
             }
         }
@@ -1409,10 +1599,18 @@ fn dispatch_event(ev: Event) {
 /// 空格分隔 token，整型/浮点按事件类型解析。
 fn parse_send_data(typ: i32, data: &str) -> Option<Event> {
     let mut it = data.split_whitespace();
-    let mut next_i = |it: &mut std::str::SplitWhitespace| it.next().and_then(|t| t.parse::<i64>().ok());
-    let mut next_f = |it: &mut std::str::SplitWhitespace| it.next().and_then(|t| t.parse::<f64>().ok());
+    let mut next_i =
+        |it: &mut std::str::SplitWhitespace| it.next().and_then(|t| t.parse::<i64>().ok());
+    let mut next_f =
+        |it: &mut std::str::SplitWhitespace| it.next().and_then(|t| t.parse::<f64>().ok());
     match typ {
-        EVENT_TYPE_CHAR => Some(Event::ints(EVENT_TYPE_CHAR, next_i(&mut it)? as i32, 0, 0, 0)),
+        EVENT_TYPE_CHAR => Some(Event::ints(
+            EVENT_TYPE_CHAR,
+            next_i(&mut it)? as i32,
+            0,
+            0,
+            0,
+        )),
         EVENT_TYPE_CHAR_MODS => Some(Event::ints(
             EVENT_TYPE_CHAR_MODS,
             next_i(&mut it)? as i32,
@@ -1420,11 +1618,25 @@ fn parse_send_data(typ: i32, data: &str) -> Option<Event> {
             0,
             0,
         )),
-        EVENT_TYPE_CURSOR_ENTER => Some(Event::ints(EVENT_TYPE_CURSOR_ENTER, next_i(&mut it)? as i32, 0, 0, 0)),
+        EVENT_TYPE_CURSOR_ENTER => Some(Event::ints(
+            EVENT_TYPE_CURSOR_ENTER,
+            next_i(&mut it)? as i32,
+            0,
+            0,
+            0,
+        )),
         EVENT_TYPE_CURSOR_POS => {
             let dx = next_f(&mut it)?;
             let dy = next_f(&mut it)?;
-            Some(Event { typ: EVENT_TYPE_CURSOR_POS, i1: 0, i2: 0, i3: 0, i4: 0, dx, dy })
+            Some(Event {
+                typ: EVENT_TYPE_CURSOR_POS,
+                i1: 0,
+                i2: 0,
+                i3: 0,
+                i4: 0,
+                dx,
+                dy,
+            })
         }
         EVENT_TYPE_KEY => Some(Event::ints(
             EVENT_TYPE_KEY,
@@ -1443,7 +1655,15 @@ fn parse_send_data(typ: i32, data: &str) -> Option<Event> {
         EVENT_TYPE_SCROLL => {
             let dx = next_f(&mut it)?;
             let dy = next_f(&mut it)?;
-            Some(Event { typ: EVENT_TYPE_SCROLL, i1: 0, i2: 0, i3: 0, i4: 0, dx, dy })
+            Some(Event {
+                typ: EVENT_TYPE_SCROLL,
+                i1: 0,
+                i2: 0,
+                i3: 0,
+                i4: 0,
+                dx,
+                dy,
+            })
         }
         EVENT_TYPE_WINDOW_SIZE | EVENT_TYPE_FRAMEBUFFER_SIZE => Some(Event::ints(
             typ,
@@ -1525,7 +1745,9 @@ pub unsafe extern "system" fn Java_org_lwjgl_glfw_CallbackBridge_nativeClipboard
                     (tbl.ReleaseByteArrayElements.unwrap())(env, src, elems, 0);
                 }
             }
-            let args = [jvalue { l: payload as jobject }];
+            let args = [jvalue {
+                l: payload as jobject,
+            }];
             let out = (atbl.CallStaticObjectMethodA.unwrap())(art, art_cls, mid, args.as_ptr());
             if atbl.ExceptionCheck.unwrap()(art) != 0 {
                 atbl.ExceptionClear.unwrap()(art);
@@ -1687,7 +1909,9 @@ unsafe fn register_callback_object(
     }
     let mid = unsafe { ensure_invoke_mid(env, iface, sig, mid_slot) };
     if mid.is_null() {
-        log(&format!("invoke methodID 未解析（{iface}，回调走旧闭包路径）"));
+        log(&format!(
+            "invoke methodID 未解析（{iface}，回调走旧闭包路径）"
+        ));
         (tbl.DeleteGlobalRef.unwrap())(env, gref);
         return;
     }
@@ -1706,9 +1930,13 @@ unsafe fn invoke_direct(
     if obj.is_null() || mid.is_null() {
         return false;
     }
-    let Some(env) = (unsafe { runtime_env() }) else { return false };
+    let Some(env) = (unsafe { runtime_env() }) else {
+        return false;
+    };
     let tbl = unsafe { env_tbl(env) };
-    let Some(call) = tbl.CallVoidMethodA else { return false };
+    let Some(call) = tbl.CallVoidMethodA else {
+        return false;
+    };
     if tbl.ExceptionCheck.unwrap()(env) != 0 {
         tbl.ExceptionClear.unwrap()(env);
     }
@@ -1755,7 +1983,6 @@ unsafe fn pump_dispatch(
     }
 }
 
-
 /// 回调槽位写入 State.cb_*（pojav_pump_events 同源读取）。
 /// v0.2.3 修复：此前宏写入模块级 static、泵读 State 字段，两处存储互不连通，
 /// 游戏注册的全部 GLFW 回调（光标/按键/鼠标/滚轮）实际落空 —— 实机表现为
@@ -1790,38 +2017,59 @@ macro_rules! jni_callback_setter {
 
 jni_callback_setter!(
     Java_org_lwjgl_glfw_GLFW_nglfwSetCharCallback,
-    cb_char, cb_char_obj, mid_char,
-    "org/lwjgl/glfw/GLFWCharCallbackI", "(JI)V"
+    cb_char,
+    cb_char_obj,
+    mid_char,
+    "org/lwjgl/glfw/GLFWCharCallbackI",
+    "(JI)V"
 );
 jni_callback_setter!(
     Java_org_lwjgl_glfw_GLFW_nglfwSetCharModsCallback,
-    cb_char_mods, cb_char_mods_obj, mid_char_mods,
-    "org/lwjgl/glfw/GLFWCharModsCallbackI", "(JII)V"
+    cb_char_mods,
+    cb_char_mods_obj,
+    mid_char_mods,
+    "org/lwjgl/glfw/GLFWCharModsCallbackI",
+    "(JII)V"
 );
 jni_callback_setter!(
     Java_org_lwjgl_glfw_GLFW_nglfwSetCursorEnterCallback,
-    cb_cursor_enter, cb_cursor_enter_obj, mid_cursor_enter,
-    "org/lwjgl/glfw/GLFWCursorEnterCallbackI", "(JZ)V"
+    cb_cursor_enter,
+    cb_cursor_enter_obj,
+    mid_cursor_enter,
+    "org/lwjgl/glfw/GLFWCursorEnterCallbackI",
+    "(JZ)V"
 );
 jni_callback_setter!(
     Java_org_lwjgl_glfw_GLFW_nglfwSetCursorPosCallback,
-    cb_cursor_pos, cb_cursor_pos_obj, mid_cursor_pos,
-    "org/lwjgl/glfw/GLFWCursorPosCallbackI", "(JDD)V"
+    cb_cursor_pos,
+    cb_cursor_pos_obj,
+    mid_cursor_pos,
+    "org/lwjgl/glfw/GLFWCursorPosCallbackI",
+    "(JDD)V"
 );
 jni_callback_setter!(
     Java_org_lwjgl_glfw_GLFW_nglfwSetKeyCallback,
-    cb_key, cb_key_obj, mid_key,
-    "org/lwjgl/glfw/GLFWKeyCallbackI", "(JIIII)V"
+    cb_key,
+    cb_key_obj,
+    mid_key,
+    "org/lwjgl/glfw/GLFWKeyCallbackI",
+    "(JIIII)V"
 );
 jni_callback_setter!(
     Java_org_lwjgl_glfw_GLFW_nglfwSetMouseButtonCallback,
-    cb_mouse, cb_mouse_obj, mid_mouse,
-    "org/lwjgl/glfw/GLFWMouseButtonCallbackI", "(JIII)V"
+    cb_mouse,
+    cb_mouse_obj,
+    mid_mouse,
+    "org/lwjgl/glfw/GLFWMouseButtonCallbackI",
+    "(JIII)V"
 );
 jni_callback_setter!(
     Java_org_lwjgl_glfw_GLFW_nglfwSetScrollCallback,
-    cb_scroll, cb_scroll_obj, mid_scroll,
-    "org/lwjgl/glfw/GLFWScrollCallbackI", "(JDD)V"
+    cb_scroll,
+    cb_scroll_obj,
+    mid_scroll,
+    "org/lwjgl/glfw/GLFWScrollCallbackI",
+    "(JDD)V"
 );
 
 #[no_mangle]
@@ -1948,14 +2196,18 @@ unsafe fn notify_runtime_vm(vm: VmPtr) {
             if cls.is_null() {
                 tbl.ExceptionClear.unwrap()(env);
             } else {
-                s.rt_glfw_class
-                    .store((tbl.NewGlobalRef.unwrap())(env, cls) as *mut c_void, Ordering::Release);
+                s.rt_glfw_class.store(
+                    (tbl.NewGlobalRef.unwrap())(env, cls) as *mut c_void,
+                    Ordering::Release,
+                );
                 s.m_monitor_size.store(
-                    (tbl.GetStaticMethodID.unwrap())(env, cls, m1.as_ptr(), sig1.as_ptr()) as *mut c_void,
+                    (tbl.GetStaticMethodID.unwrap())(env, cls, m1.as_ptr(), sig1.as_ptr())
+                        as *mut c_void,
                     Ordering::Release,
                 );
                 s.m_window_size.store(
-                    (tbl.GetStaticMethodID.unwrap())(env, cls, m2.as_ptr(), sig2.as_ptr()) as *mut c_void,
+                    (tbl.GetStaticMethodID.unwrap())(env, cls, m2.as_ptr(), sig2.as_ptr())
+                        as *mut c_void,
                     Ordering::Release,
                 );
                 let key_fid =
@@ -2016,9 +2268,12 @@ pub unsafe extern "C" fn quartz_bridge_init(
 ) {
     let s = state();
     s.art_vm.store(vm, Ordering::Release);
-    s.art_class.store(bridge_class as *mut c_void, Ordering::Release);
-    s.m_on_grab.store(m_on_grab as *mut c_void, Ordering::Release);
-    s.m_clipboard.store(m_clipboard as *mut c_void, Ordering::Release);
+    s.art_class
+        .store(bridge_class as *mut c_void, Ordering::Release);
+    s.m_on_grab
+        .store(m_on_grab as *mut c_void, Ordering::Release);
+    s.m_clipboard
+        .store(m_clipboard as *mut c_void, Ordering::Release);
     log("quartz_bridge_init：ART 侧已注入");
 }
 
@@ -2053,7 +2308,9 @@ pub unsafe extern "C" fn quartz_bridge_setup_surface(env: EnvPtr, surface: jobje
             }
             log(&format!(
                 "setupSurface：窗口 {w}x{h} 已挂载（主窗口={})",
-                main_handle.map(|h| format!("{h:#x}")).unwrap_or_else(|| "无".into())
+                main_handle
+                    .map(|h| format!("{h:#x}"))
+                    .unwrap_or_else(|| "无".into())
             ));
             rc = 1;
         } else {
@@ -2078,7 +2335,11 @@ pub unsafe extern "C" fn quartz_bridge_release_surface() {
 
 #[no_mangle]
 pub extern "C" fn quartz_bridge_window_ready() -> c_int {
-    if state().window.load(Ordering::Acquire).is_null() { 0 } else { 1 }
+    if state().window.load(Ordering::Acquire).is_null() {
+        0
+    } else {
+        1
+    }
 }
 
 #[no_mangle]
@@ -2087,7 +2348,15 @@ pub extern "C" fn quartz_bridge_send_cursor_pos(x: f32, y: f32) {
     if !s.input_ready.load(Ordering::Acquire) {
         return;
     }
-    dispatch_event(Event { typ: EVENT_TYPE_CURSOR_POS, i1: 0, i2: 0, i3: 0, i4: 0, dx: x as f64, dy: y as f64 });
+    dispatch_event(Event {
+        typ: EVENT_TYPE_CURSOR_POS,
+        i1: 0,
+        i2: 0,
+        i3: 0,
+        i4: 0,
+        dx: x as f64,
+        dy: y as f64,
+    });
 }
 
 #[no_mangle]
@@ -2096,7 +2365,13 @@ pub extern "C" fn quartz_bridge_send_mouse_button(button: c_int, action: c_int, 
     if !s.input_ready.load(Ordering::Acquire) {
         return;
     }
-    dispatch_event(Event::ints(EVENT_TYPE_MOUSE_BUTTON, button, action, mods, 0));
+    dispatch_event(Event::ints(
+        EVENT_TYPE_MOUSE_BUTTON,
+        button,
+        action,
+        mods,
+        0,
+    ));
 }
 
 #[no_mangle]
@@ -2127,7 +2402,15 @@ pub extern "C" fn quartz_bridge_send_scroll(dx: f64, dy: f64) {
     if !s.input_ready.load(Ordering::Acquire) {
         return;
     }
-    dispatch_event(Event { typ: EVENT_TYPE_SCROLL, i1: 0, i2: 0, i3: 0, i4: 0, dx, dy });
+    dispatch_event(Event {
+        typ: EVENT_TYPE_SCROLL,
+        i1: 0,
+        i2: 0,
+        i3: 0,
+        i4: 0,
+        dx,
+        dy,
+    });
 }
 
 #[no_mangle]
@@ -2141,7 +2424,11 @@ pub extern "C" fn quartz_bridge_send_screen_size(w: c_int, h: c_int) {
 
 #[no_mangle]
 pub extern "C" fn quartz_bridge_is_grabbed() -> c_int {
-    if state().grabbing.load(Ordering::Acquire) { 1 } else { 0 }
+    if state().grabbing.load(Ordering::Acquire) {
+        1
+    } else {
+        0
+    }
 }
 
 #[no_mangle]
