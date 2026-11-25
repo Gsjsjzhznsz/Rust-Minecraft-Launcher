@@ -427,8 +427,8 @@ fn merge_parent_child(acc: &mut Value, child: &crate::model::VersionJson) -> Res
         .and_then(|a| a.get("game"))
         .cloned()
         .unwrap_or(Value::Array(vec![]));
-    let child_jvm = serde_json::to_value(&child.arguments.as_ref().map(|a| &a.jvm))?;
-    let child_game = serde_json::to_value(&child.arguments.as_ref().map(|a| &a.game))?;
+    let child_jvm = serde_json::to_value(child.arguments.as_ref().map(|a| &a.jvm))?;
+    let child_game = serde_json::to_value(child.arguments.as_ref().map(|a| &a.game))?;
     let mut jvm = as_array_or_empty(&acc_jvm);
     let mut game = as_array_or_empty(&acc_game);
     for v in as_array_or_empty(&child_jvm) {

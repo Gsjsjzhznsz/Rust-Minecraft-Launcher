@@ -14,6 +14,10 @@ use sha2::{Digest, Sha256, Sha512};
 use std::path::{Path, PathBuf};
 use tokio::sync::mpsc;
 
+/// 单任务执行结果：(label, bytes, skipped) 或 (label, 错误)。
+/// JoinSet 泛型参数较长，收敛为别名（clippy::type_complexity）。
+type TaskExecOutcome = std::result::Result<(String, u64, bool), (String, Error)>;
+
 /// 下载校验哈希算法。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HashAlgo {
@@ -190,7 +194,7 @@ async fn run_task(task: DownloadTask, client: reqwest::Client) -> Result<(u64, b
                     if let Some(parent) = task.dest.parent() {
                         tokio::fs::create_dir_all(parent)
                             .await
-                            .map_err(|e| Error::Other(crate::error::io_context(&e, &parent)))?;
+                            .map_err(|e| Error::Other(crate::error::io_context(&e, parent)))?;
                     }
                     let tmp = task.dest.with_extension("qz-part");
                     tokio::fs::write(&tmp, &data)
@@ -218,8 +222,7 @@ pub async fn execute(
     use tokio::task::JoinSet;
 
     let concurrency = concurrency.max(1);
-    let mut set: JoinSet<std::result::Result<(String, u64, bool), (String, Error)>> =
-        JoinSet::new();
+    let mut set: JoinSet<TaskExecOutcome> = JoinSet::new();
     let mut inflight = 0usize;
     let mut iter = plan.tasks.iter().cloned();
     let mut summary = ExecSummary::default();

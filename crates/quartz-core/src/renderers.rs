@@ -481,7 +481,7 @@ mod tests {
     #[test]
     fn launch_env_per_renderer() {
         assert!(launch_env("gl4es").iter().any(|(k, _)| k == "LIBGL_ES"));
-        assert!(launch_env("mobileglues").is_empty() == false);
+        assert!(!launch_env("mobileglues").is_empty());
         assert!(launch_env("angle").is_empty());
         // zink 注入配方与 FCL/Zalith2 一致
         let zink = launch_env("zink");

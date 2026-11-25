@@ -461,11 +461,7 @@ pub async fn execute_download_plan(
 
     let total: u64 = {
         // plan 已被 move，从元数据聚合总字节
-        meta_by_label
-            .values()
-            .map(|(_, sz, _)| *sz)
-            .sum::<u64>()
-            .max(0)
+        meta_by_label.values().map(|(_, sz, _)| *sz).sum::<u64>()
     };
 
     let mut done_bytes: u64 = 0;
@@ -503,7 +499,7 @@ pub async fn execute_download_plan(
                 }
                 file = label;
                 push_progress(
-                    &progress,
+                    progress,
                     true,
                     &stage,
                     &file,
@@ -516,7 +512,7 @@ pub async fn execute_download_plan(
             crate::download::ProgressEvent::TaskDone { bytes, .. } => {
                 done_bytes += bytes;
                 push_progress(
-                    &progress,
+                    progress,
                     false,
                     &stage,
                     &file,
@@ -534,7 +530,7 @@ pub async fn execute_download_plan(
                 };
                 done_bytes += size;
                 push_progress(
-                    &progress,
+                    progress,
                     false,
                     &stage,
                     &file,
@@ -810,9 +806,9 @@ async fn install_forge_like(
     let vid = match added.len() {
         1 => added[0].clone(),
         _ => {
-            return Err(crate::error::Error::Other(format!(
-                "installer 未写入新版本目录（退出成功但无新增版本），可能是不兼容的 Forge/NeoForge 组合"
-            )))
+            return Err(crate::error::Error::Other(
+                "installer 未写入新版本目录（退出成功但无新增版本），可能是不兼容的 Forge/NeoForge 组合".to_string(),
+            ))
         }
     };
     send_progress(&progress, download_progress("done", &vid, 1, 1, true, None)).await;

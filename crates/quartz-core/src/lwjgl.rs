@@ -87,13 +87,12 @@ pub fn is_installed() -> bool {
     if !classes_jar().exists() {
         return false;
     }
-    APK_FILES.iter().all(|(_, rel)| {
-        if rel.starts_with("natives/") {
-            natives_dir().join(&rel["natives/".len()..]).exists()
-        } else {
-            install_dir().join(rel).exists()
-        }
-    })
+    APK_FILES
+        .iter()
+        .all(|(_, rel)| match rel.strip_prefix("natives/") {
+            Some(sub) => natives_dir().join(sub).exists(),
+            None => install_dir().join(rel).exists(),
+        })
 }
 
 /// 下载 + 安装（幂等；重装先清空）。进度经 mpsc 上报。

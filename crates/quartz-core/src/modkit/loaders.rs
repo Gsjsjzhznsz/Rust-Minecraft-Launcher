@@ -46,7 +46,7 @@ async fn list_meta_loaders(url: &str) -> Result<Vec<LoaderVersion>> {
     let client = http_client();
     let resp = crate::mirror::get_text(&client, url).await?;
     let mut list: Vec<LoaderVersion> = serde_json::from_str(&resp)?;
-    list.sort_by(|a, b| b.stable.cmp(&a.stable));
+    list.sort_by_key(|a| std::cmp::Reverse(a.stable));
     Ok(list)
 }
 
