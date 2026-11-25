@@ -1,6 +1,7 @@
 # Quartz Launcher
 
 [![CI](https://github.com/Gsjsjzhznsz/Rust-Minecraft-Launcher/actions/workflows/ci.yml/badge.svg)](https://github.com/Gsjsjzhznsz/Rust-Minecraft-Launcher/actions/workflows/ci.yml)
+[![Pages](https://github.com/Gsjsjzhznsz/Rust-Minecraft-Launcher/actions/workflows/pages.yml/badge.svg)](https://github.com/Gsjsjzhznsz/Rust-Minecraft-Launcher/actions/workflows/pages.yml)
 
 **业界第一个 Rust 核心 + 五端同构的 Minecraft: Java Edition 启动器（立项代号 Quartz）。**
 
@@ -10,6 +11,14 @@
 设计依据来自五家竞品的调研：PojavLauncher（已归档→Amethyst）、FCL、ZalithLauncher2、
 Prism Launcher、Amethyst-iOS（Pojav_iOS 继任），以及 Rust 侧先例 Modrinth App（Theseus）
 与鸿蒙侧 AMCL/HomoLauncher 的可行性验证。详见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。
+
+## 在线站点（GitHub Pages，每日自动跟随 main 重建）
+
+- **文档站**：<https://gsjsjzhznsz.github.io/Rust-Minecraft-Launcher/>
+  （Astro + Starlight + starlight-theme-md3，源码在 `apps/docs/`）
+- **UI 网页演示**：<https://gsjsjzhznsz.github.io/Rust-Minecraft-Launcher/demo/>
+  （Svelte 5 UI + 内置模拟后端，仅供演示 —— 下载/启动均为模拟动画，真实功能请用 APK；
+  源码在 `apps/shell-tauri/ui/`，由 `VITE_DEMO=1` 构建开关注入 mock）
 
 ## 当前状态（M0 基础已就位）
 

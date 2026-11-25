@@ -29,3 +29,6 @@ tool-results/
 /logs/
 /upload/
 skills/
+
+# Astro 文档站构建缓存
+.astro/

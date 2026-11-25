@@ -3,6 +3,7 @@
   import Icon from "./Icon.svelte";
   import { showPage, session, permBanners, requestPermission, envState } from "../store.svelte";
   import { avatarLetter, avatarStyle } from "../format";
+  import { IS_DEMO } from "../demo";
   import HomePage from "../pages/HomePage.svelte";
   import DownloadPage from "../pages/DownloadPage.svelte";
   import InstancesPage from "../pages/InstancesPage.svelte";
@@ -60,6 +61,9 @@
         <span class="mini-name">{session.account?.username ?? "未登录"}</span>
       </div>
       <div class="version-tag">v{envState.meta?.version ?? "-"}</div>
+      {#if IS_DEMO}
+        <div class="demo-tag" title="网页演示：数据为模拟，完整功能请下载 APK">演示模式</div>
+      {/if}
     </div>
   </aside>
 
@@ -79,6 +83,9 @@
       </span>
       <span class="mini-name">{session.account?.username ?? "未登录"}</span>
     </button>
+    {#if IS_DEMO}
+      <span class="demo-tag" title="网页演示：数据为模拟，完整功能请下载 APK">演示</span>
+    {/if}
   </header>
 
   <main class="content">

@@ -1,0 +1,95 @@
+name: Pages（文档站 + UI 演示）
+
+# GitHub Pages 单站点组合部署：
+#   /        ← Astro + Starlight（starlight-theme-md3）文档站（apps/docs）
+#   /demo/   ← Svelte 5 UI 网页演示（apps/shell-tauri/ui，VITE_DEMO=1 内置模拟后端）
+#
+# 触发：
+#   - push main（文档 / UI / 本工作流变更）
+#   - 每日定时重建（跟随 main 最新状态 —— scheduled workflow 只在默认分支运行）
+#   - 手动触发
+#
+# 站点地址：https://gsjsjzhznsz.github.io/Rust-Minecraft-Launcher/
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "apps/docs/**"
+      - "apps/shell-tauri/ui/**"
+      - ".github/workflows/pages.yml"
+  schedule:
+    # 每日 UTC 21:17 = 北京时间 05:17
+    - cron: "17 21 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: |
+            apps/shell-tauri/ui/package-lock.json
+            apps/docs/package-lock.json
+
+      # UI 演示构建：VITE_DEMO=1 注入模拟后端 + 演示徽标；
+      # VITE_BASE 对齐 Pages 项目站路径。APK 构建不经过此脚本，不受影响。
+      - name: 构建 UI 演示（模拟后端，仅供网页预览）
+        working-directory: apps/shell-tauri/ui
+        env:
+          VITE_BASE: /Rust-Minecraft-Launcher/demo/
+        run: |
+          npm ci
+          npm run build:demo
+
+      # 文档站：Astro 7 + Starlight 0.43 + starlight-theme-md3，base=/Rust-Minecraft-Launcher
+      - name: 构建文档站（Astro + Starlight）
+        working-directory: apps/docs
+        run: |
+          npm ci
+          npm run build
+
+      # 单 Pages 站点合成：文档在根，UI 演示在 /demo/（文档内 iframe 引用）
+      - name: 组合站点
+        run: |
+          mkdir -p site/demo
+          cp -r apps/docs/dist/* site/
+          cp -r apps/shell-tauri/ui/dist/* site/demo/
+          echo "站点结构："
+          ls site
+          test -f site/index.html && test -f site/demo/index.html
+
+      - name: 配置 Pages（首次自动启用）
+        uses: actions/configure-pages@v5
+        with:
+          enablement: true
+
+      - name: 上传 Pages 产物
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: 部署到 GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

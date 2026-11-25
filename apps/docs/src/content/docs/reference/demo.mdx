@@ -1,0 +1,37 @@
+---
+title: 网页演示版
+description: 在浏览器里体验 Quartz Launcher 完整 UI —— 纯演示，模拟数据
+---
+
+Quartz 的 UI 是一套 Web 应用（Svelte 5），因此它可以脱离 APK 直接跑在浏览器里。
+我们把它部署在 GitHub Pages 上作为**在线演示**，每天自动跟随 `main` 分支重建：
+
+import "../../../styles/demo-frame.css";
+
+<div class="demo-frame">
+  <iframe
+    src="/Rust-Minecraft-Launcher/demo/"
+    title="Quartz Launcher 网页演示"
+    loading="lazy"
+  ></iframe>
+</div>
+
+## 演示版里能体验什么
+
+- 完整六页导航：主页 / 下载游戏 / 实例 / 内容 / 账户 / 设置
+- 版本列表、过滤搜索、实例卡片
+- 点「下载」可以看到完整的分阶段进度动画（版本清单 → 客户端 → 资源文件…）
+- 点「启动」可以看到实时日志滚动与正常退出流程
+- 微软设备码登录的完整交互（不会真实登录）
+
+## 演示版与真实 APK 的区别
+
+| | 网页演示版 | APK |
+| --- | --- | --- |
+| 界面与交互 | **完全一致** | 完全一致 |
+| 数据来源 | 内置模拟后端（`mock.ts`） | Rust 核心（真实下载/启动） |
+| 能否真的玩游戏 | 否 | 是 |
+| 更新方式 | 每日自动跟随 main 分支 | GitHub Releases |
+
+演示模式构建由 `VITE_DEMO=1` 开关控制：模拟后端只存在于 demo 构建，
+APK 生产构建中该模块整体被 tree-shake，体积零影响。

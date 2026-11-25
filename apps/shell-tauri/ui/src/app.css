@@ -338,6 +338,23 @@ input[type="range"]::-webkit-slider-thumb {
 .mini-name { font-size: 13px; color: var(--text-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .version-tag { font-size: 11px; color: var(--text-faint); padding: 0 4px; }
 
+/* 演示模式徽标（仅 VITE_DEMO=1 构建渲染） */
+.demo-tag {
+  font-size: 10px; font-weight: 700; letter-spacing: 0.5px;
+  padding: 3px 10px; border-radius: 999px;
+  color: #fbbf24;
+  background: rgba(251, 191, 36, 0.12);
+  border: 1px solid rgba(251, 191, 36, 0.35);
+  backdrop-filter: blur(8px);
+  white-space: nowrap;
+  animation: demo-pulse 2.4s ease-in-out infinite;
+}
+.topbar .demo-tag { margin-left: auto; }
+@keyframes demo-pulse {
+  0%, 100% { opacity: 0.75; }
+  50% { opacity: 1; box-shadow: 0 0 14px rgba(251, 191, 36, 0.25); }
+}
+
 .avatar {
   width: 34px; height: 34px; border-radius: 50%;
   display: inline-flex; align-items: center; justify-content: center;

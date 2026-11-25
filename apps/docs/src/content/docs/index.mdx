@@ -1,0 +1,46 @@
+---
+title: Quartz Launcher
+description: "业界第一个 Rust 核心 + 五端同构的 Minecraft Java 版启动器"
+template: splash
+hero:
+  title: "Quartz Launcher"
+  tagline: "Rust 大脑 · 系统 WebView 壳 · ui-pack 实时热更 —— 给移动端与五端一台真正现代化的 Minecraft: Java Edition 启动器"
+  actions:
+    - text: 快速上手
+      link: /Rust-Minecraft-Launcher/guides/quickstart/
+      icon: right-arrow
+      variant: primary
+    - text: 在线演示 UI
+      link: /Rust-Minecraft-Launcher/reference/demo/
+      icon: external
+---
+
+import { Card, CardGrid, LinkCard } from "@astrojs/starlight/components";
+
+把 Pojav / FCL / ZL2 / Prism / Amethyst 五家十年踩出来的 C/C++ 资产当作可插拔积木，
+用 Rust 重写恰好被每家重复写了三遍的「启动器大脑」，五端只写薄壳。
+
+<CardGrid stagger>
+  <Card title="Rust 核心（quartz-core）">
+    元数据 / 规则引擎 / 并发下载（SHA-1 校验、断点跳过）/ 实例体系 / JVM 装配 / 认证 / 整合包 / 渲染路由 / 输入协议，全部纯逻辑、零平台依赖，clippy 零告警。
+  </Card>
+  <Card title="五端同构 UI">
+    一套 Svelte 5 + Tauri 2 系统 WebView 界面，跑在 Android / iOS / macOS (ARM) / Windows (ARM) / 鸿蒙 NEXT。40 个 command、12 类事件的一份契约。
+  </Card>
+  <Card title="ui-pack 实时热更">
+    UI 是版本化、签名校验、可灰度、可秒级回滚的 Web 资源包 —— 改界面不发版，崩溃超阈值自动回滚上一版。
+  </Card>
+  <Card title="渲染路由矩阵">
+    gl4es / ANGLE / Zink / MetalANGLE / Mesa Dozen 按版本与平台自动选档：1.17+ 走 Vulkan 档，旧版本走 GLES2 兜底，性能红线不妥协。
+  </Card>
+</CardGrid>
+
+## 当前状态
+
+- **v0.2.8**：Android 壳可用 —— 下载 / 实例 / 装载器 / 账号 / 设置 / 日志诊断全链路打通，
+  Svelte 5 组件化 UI（2026 Aurora 视觉）已随包发布。
+- 核心与壳的契约只有一份：command 向后兼容，UI 允许热更。
+
+<LinkCard title="在线演示（网页版 UI，模拟数据）" href="/Rust-Minecraft-Launcher/reference/demo/" description="浏览器里直接体验完整启动器界面 —— 每日自动跟随 main 分支重建" />
+
+<LinkCard title="下载 Android APK" href="https://github.com/Gsjsjzhznsz/Rust-Minecraft-Launcher/releases" description="GitHub Releases · arm64-v8a · CI 自动构建" />
