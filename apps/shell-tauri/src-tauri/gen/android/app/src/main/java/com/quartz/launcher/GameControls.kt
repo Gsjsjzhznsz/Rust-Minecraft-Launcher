@@ -227,8 +227,49 @@ class GameControls(
 
     override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
         super.onSizeChanged(w, h, oldw, oldh)
-        // 光标初始居中（横屏旋转后也随新尺寸重算）
-        if (cursorView.visibility == View.VISIBLE) centerCursor()
+        if (cursorView.visibility != View.VISIBLE) return
+        if (!cursorFollowed) {
+            // 光标初始居中（横屏旋转后也随新尺寸重算）
+            centerCursor()
+        } else {
+            // v0.2.10：已跟随过的光标按新旧尺寸比例重映射并夹取回屏幕，
+            // 防止 ROM 瞬时旋转/insets 变化后指针留在旧坐标 —— 绝对位置超出
+            // 新尺寸 = 光标画到屏外（用户体感「虚拟鼠标在下方屏幕不显示」）
+            remapCursor(oldw, oldh)
+        }
+    }
+
+    /** v0.2.10：尺寸变化时把已跟随光标按中心点比例重映射到新 bounds。 */
+    private fun remapCursor(oldw: Int, oldh: Int) {
+        val cw = cursorView.layoutParams.width
+        val ch = cursorView.layoutParams.height
+        if (oldw <= 0 || oldh <= 0 || width <= 0 || height <= 0) {
+            clampCursor()
+            return
+        }
+        val absX = paddingLeft + cursorView.translationX + cw / 2f
+        val absY = paddingTop + cursorView.translationY + ch / 2f
+        val nx = absX * width / oldw
+        val ny = absY * height / oldh
+        cursorView.translationX = nx - cw / 2f - paddingLeft
+        cursorView.translationY = ny - ch / 2f - paddingTop
+        clampCursor()
+    }
+
+    /**
+     * v0.2.10：把光标夹取回容器可见范围（绝对坐标 [0, width-cw]）。
+     * v0.2.9 起光标允许画进 insets padding 区（clipChildren=false），因此
+     * 这里夹取的是整屏 bounds 而非 padding 内容区 —— 只保证不出屏。
+     */
+    private fun clampCursor() {
+        val cw = cursorView.layoutParams.width
+        val ch = cursorView.layoutParams.height
+        val minTX = -paddingLeft.toFloat()
+        val maxTX = (width - cw - paddingLeft).coerceAtLeast(minTX).toFloat()
+        val minTY = -paddingTop.toFloat()
+        val maxTY = (height - ch - paddingTop).coerceAtLeast(minTY).toFloat()
+        cursorView.translationX = cursorView.translationX.coerceIn(minTX, maxTX)
+        cursorView.translationY = cursorView.translationY.coerceIn(minTY, maxTY)
     }
 
     /** 光标居中于容器 bounds：子视图位置 = padding + translation，须扣 padding。 */

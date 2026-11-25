@@ -69,6 +69,12 @@ class GameView(context: Context) : SurfaceView(context, null, 0), SurfaceHolder.
     }
 
     override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
+        // v0.2.10 自愈：游戏层存活期间 surface 变成竖屏（高>宽）说明 ROM 把窗口
+        // 瞬时转了方向 —— 立即把 Activity 锁回横屏，避免 MC 收到竖屏尺寸重算
+        // GUI 缩放（分辨率/DPI 突变、控件错位、虚拟光标出界）。
+        if (height > width) {
+            (context as? MainActivity)?.ensureGameLandscape("surfaceChanged ${width}x${height}")
+        }
         GameIpc.size(width, height)
     }
 

@@ -174,6 +174,21 @@ class MainActivity : TauriActivity() {
     instance = this
   }
 
+  /**
+   * v0.2.10 方向/沉浸自愈：ROM（HyperOS/MIUI 实机）会在游戏进行中瞬时把窗口
+   * 转回竖屏或重新亮出系统栏 —— 实机 launch-1795608201：12:03:51 窗口变
+   * 1080x2400（竖屏）持续 2s 后转回，用户体感 = 「分辨率/DPI 突然变了」+
+   * 控件错位 + 虚拟光标出界。焦点恢复时一律重新锁定横屏 + 重新沉浸。
+   */
+  override fun onWindowFocusChanged(hasFocus: Boolean) {
+    super.onWindowFocusChanged(hasFocus)
+    if (!hasFocus) return
+    if (gameView != null) {
+      ensureGameLandscape("onWindowFocusChanged")
+      enterGameImmersive()
+    }
+  }
+
   override fun onDestroy() {
     super.onDestroy()
     if (instance === this) {
@@ -299,6 +314,21 @@ class MainActivity : TauriActivity() {
       } catch (_: Throwable) {
       }
     }
+  }
+
+  /**
+   * v0.2.10 方向自愈：游戏层存在期间强制 SENSOR_LANDSCAPE。
+   * 仅在方向偏离时才 setRequestedOrientation（避免无谓抖动），偏离时留痕
+   * （appendMarker）便于下轮日志定位是哪条路径把方向改掉了。
+   */
+  fun ensureGameLandscape(from: String) {
+    if (gameView == null) return
+    if (requestedOrientation == ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE) return
+    (applicationContext as? QuartzApp)?.appendMarker(
+      "UI-ORIENTATION",
+      "游戏层检测到方向偏离（来自 $from，requested=$requestedOrientation），已重新锁定横屏"
+    )
+    requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
   }
 
   fun hideGameSurface() {
