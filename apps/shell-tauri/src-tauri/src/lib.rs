@@ -2146,7 +2146,10 @@ fn build_plan_for(
         None => mc_dir.clone(),
     };
     // Android：移植版 LWJGL 合并 jar 替换 Mojang org.lwjgl:*（glibc natives 不可用）
+    // 启动前就地升级老版本 pack（修订版 1 → 2：jar 去 .sha1，消 LWJGL
+    // 「Incompatible Java and native library versions」ERROR，免 154MB 重下）
     let lwjgl_jar = if cfg!(target_os = "android") && lwjgl::is_installed() {
+        let _ = lwjgl::upgrade_in_place();
         Some(lwjgl::classes_jar())
     } else {
         None

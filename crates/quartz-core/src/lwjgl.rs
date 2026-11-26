@@ -68,6 +68,56 @@ pub fn install_dir() -> PathBuf {
     paths::runtime_dir().join("lwjgl3")
 }
 
+/// 当前 pack 修订版。历史：
+/// - 1：初始版（jar 为 APK 原样，内嵌 META-INF/**.sha1）。
+/// - 2：jar 去 .sha1（checkHash 降噪，消「Incompatible Java and native
+///   library versions」ERROR）。
+///
+/// 老设备上已安装的 pack 不会自动重下（is_installed 只查文件存在），
+/// 靠 pack-revision 标记 + 启动前 [`upgrade_in_place`] 就地升级。
+pub const PACK_REVISION: u32 = 2;
+
+/// pack 修订版标记文件路径。
+fn revision_file() -> PathBuf {
+    install_dir().join("pack-revision")
+}
+
+/// 读取已安装 pack 的修订版号（无标记视为 1 —— 初始版）。
+fn installed_revision() -> u32 {
+    std::fs::read_to_string(revision_file())
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .unwrap_or(1)
+}
+
+/// 就地升级老版本 pack（不重新下载 154MB）。
+///
+/// 目前唯一的升级动作：对已安装的合并类 jar 重跑 `.sha1` 剔除
+/// （修订版 1 → 2）。成功后写 pack-revision 标记；jar 重写失败
+/// 返回 false 不阻断启动（游戏照常可跑，只是噪音日志仍在）。
+/// 幂等：修订版 >= 当前值时直接返回 false。
+pub fn upgrade_in_place() -> bool {
+    if !classes_jar().exists() {
+        return false;
+    }
+    if installed_revision() >= PACK_REVISION {
+        return false;
+    }
+    match strip_sha1_entries(&classes_jar()) {
+        Ok(_) => {
+            let _ = std::fs::write(revision_file(), PACK_REVISION.to_string());
+            log_debug(&format!(
+                "pack 就地升级至修订版 {PACK_REVISION}（jar 去 .sha1）"
+            ));
+            true
+        }
+        Err(e) => {
+            log_debug(&format!("pack 就地升级失败（保留原样）：{e}"));
+            false
+        }
+    }
+}
+
 /// 合并类 jar 路径（启动时替换 org.lwjgl:* 类路径）。
 pub fn classes_jar() -> PathBuf {
     install_dir().join("lwjgl-glfw-classes.jar")
@@ -171,11 +221,13 @@ pub async fn download_and_install(
     // 不同），每次启动打出两条「Incompatible Java and native library versions」
     // 噪音。去掉 .sha1 后 checkHash 因 classesURL == null 直接跳过，无副作用。
 
-    // ---- ③ 落位（原子改名） ----
+    // ---- ③ 落位（原子改名） + 修订版标记 ----
     if dir.exists() {
         std::fs::remove_dir_all(&dir)?;
     }
     std::fs::rename(&staging, &dir)?;
+    // 新装的 jar 已经在提取阶段去过 .sha1，直接标记为当前修订版
+    let _ = std::fs::write(revision_file(), PACK_REVISION.to_string());
     if !is_installed() {
         return Err(Error::Other(
             "LWJGL pack 安装不完整（缺 classes.jar 或核心 so）".into(),
@@ -357,5 +409,50 @@ mod tests {
             .iter()
             .all(|n| !(n.starts_with("META-INF/") && n.ends_with(".sha1"))));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn upgrade_in_place_bumps_revision_and_strips_sha1() {
+        // v0.2.11：老设备上已装的 pack（修订版 1，jar 带 .sha1）在启动前
+        // 就地升级 —— 无需重新下载 154MB，且升级后 revision 标记必须落位。
+        let _guard = crate::runtime::tests::TEST_STATE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let root = std::env::temp_dir().join(format!("qz-lw-upg-{}", std::process::id()));
+        paths::set_runtime_jres_root(root.clone());
+        std::fs::create_dir_all(install_dir()).unwrap();
+        let jar = classes_jar();
+        {
+            use std::io::Write;
+            let file = std::fs::File::create(&jar).unwrap();
+            let mut zw = zip::ZipWriter::new(file);
+            let opts: zip::write::SimpleFileOptions = Default::default();
+            zw.start_file("META-INF/linux/arm64/org/lwjgl/liblwjgl.so.sha1", opts)
+                .unwrap();
+            zw.write_all(b"deadbeef").unwrap();
+            zw.start_file("org/lwjgl/glfw/GLFW.class", opts).unwrap();
+            zw.write_all(b"class-bytes").unwrap();
+            zw.finish().unwrap();
+        }
+        // 无 revision 标记 = 修订版 1；先重跑一次确认幂等基线为 false 之前必须先升级成功
+        assert!(upgrade_in_place());
+        assert_eq!(
+            std::fs::read_to_string(revision_file()).unwrap().trim(),
+            PACK_REVISION.to_string()
+        );
+        // 升级后 jar 无 .sha1
+        let mut archive =
+            zip::ZipArchive::new(std::io::BufReader::new(std::fs::File::open(&jar).unwrap()))
+                .unwrap();
+        let names: Vec<String> = (0..archive.len())
+            .map(|i| archive.by_index(i).unwrap().name().to_string())
+            .collect();
+        assert!(!names
+            .iter()
+            .any(|n| n.starts_with("META-INF/") && n.ends_with(".sha1")));
+        // 幂等：修订版已是 2，再次调用不再改写（返回 false）
+        assert!(!upgrade_in_place());
+        let _ = std::fs::remove_dir_all(install_dir());
+        paths::set_runtime_jres_root(std::env::temp_dir().join("quartz-test-jres"));
     }
 }
