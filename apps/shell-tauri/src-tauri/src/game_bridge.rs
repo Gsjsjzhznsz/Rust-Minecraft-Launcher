@@ -2096,7 +2096,15 @@ unsafe fn run_game_from_spec(
         // 通道，真实设备上普通 dlopen 被 clns namespace 拦截 —— v0.2.15 实机
         // 实锤）→ sphal 绝对路径 → 普通 dlopen（模拟器/宽松 ROM 兑底）。子进程
         // 报回胜出通道 how，父进程按同一通道补载（open_icd_handle）。
-        for icd in vendor_icd_candidates() {
+        // v0.2.17：候选追加 Turnip 包（mesa 自建 ICD，KGSL，骁龙免 root
+        // zink 的唯一现实路径 —— 厂商 Adreno blob 在 App 进程 dlsym 失败/
+        // loader 路径 SIGSEGV，详见 renderers.rs TURNIP_ZIP 注释）；
+        // 排在厂商 ICD 之后（原生驱动优先）、loader 兑底之前。
+        let mut candidates = vendor_icd_candidates();
+        if crate::renderers::is_installed(crate::renderers::TURNIP_PACK_ID) {
+            candidates.push(crate::renderers::turnip_driver_lib());
+        }
+        for icd in candidates {
             let desc = icd.display().to_string();
             let payload = fork_isolated_probe(4000, move || {
                 let Ok(cs) = CString::new(icd.to_string_lossy().into_owned()) else {
@@ -2104,6 +2112,19 @@ unsafe fn run_game_from_spec(
                 };
                 unsafe {
                     sanitize_vk_probe_env();
+                    // v0.2.17：候选包内依赖预载（turnip 的 libc++_shared ——
+                    // 链接器命名空间按名解析 DT_NEEDED 不搜应用数据目录，
+                    // 必须按绝对路径先载；厂商 hw 目录无此文件，零影响）
+                    if let Some(dir) = icd.parent() {
+                        let dep = dir.join("libc++_shared.so");
+                        if dep.exists() {
+                            if let Ok(dc) =
+                                CString::new(dep.to_string_lossy().into_owned())
+                            {
+                                dlopen(dc.as_ptr(), RTLD_NOW | RTLD_GLOBAL);
+                            }
+                        }
+                    }
                     let mut h: *mut c_void = ptr::null_mut();
                     let mut how = "";
                     let mut errs: Vec<String> = Vec::new();
@@ -2199,9 +2220,29 @@ unsafe fn run_game_from_spec(
             Some((desc, how, r)) => {
                 // v0.2.16：父进程按子进程胜出的同一通道补载（sphal 句柄同样
                 // 有效 —— dlopen 句柄本质是 soinfo 指针，Mesa 只取 gpa 符号）。
-                let h = unsafe { open_icd_handle(Path::new(&desc), how) };
+                let cand = Path::new(&desc);
+                // v0.2.17：turnip 直连前预载包内依赖（与探针子进程同顺序，
+                // 父子进程同一份映射）；并把包内 ICD json 落给 loader 兑底
+                // 通道（VULKAN_PTR 若被 Mesa 忽略，落 libvulkan.so 也不至于
+                // 撞上必崩的厂商 blob 路径）。
+                if let Some(dir) = cand.parent() {
+                    let dep = dir.join("libc++_shared.so");
+                    if dep.exists() {
+                        if let Ok(dc) = CString::new(dep.to_string_lossy().into_owned()) {
+                            unsafe { dlopen(dc.as_ptr(), RTLD_NOW | RTLD_GLOBAL) };
+                        }
+                    }
+                }
+                let h = unsafe { open_icd_handle(cand, how) };
                 if !h.is_null() {
                     std::env::set_var("VULKAN_PTR", format!("{:x}", h as usize));
+                    let json = cand.parent().map(|d| d.join("freedreno_icd.json"));
+                    if let Some(json) = json {
+                        if json.exists() {
+                            std::env::set_var("VK_ICD_FILENAMES", &json);
+                            std::env::set_var("VK_DRIVER_FILES", &json);
+                        }
+                    }
                     eprintln!("[quartz] zink：VULKAN_PTR=ICD 直连 {desc}（{how}，{r}）");
                     report = format!("QUARTZ_VK_PROBE:OK:icd {desc} {r}");
                 } else {

@@ -2951,6 +2951,58 @@ fn ensure_renderer(app: &AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+/// v0.2.17：zink 启动前确保 Turnip 驱动包就绪（骁龙免 root Vulkan）。
+/// 仅在 ①当前渲染层为 zink ②主机有 KGSL 节点（/dev/kgsl-3d0，免 root
+/// Adreno 的现实接口）时下载；Mali 等设备直接跳过，行为与 v0.2.16 一致。
+/// 下载失败不阻塞启动（探针仍会尝试厂商 ICD/loader，全败则干净回退）。
+#[cfg(target_os = "android")]
+fn ensure_turnip_pack(app: &AppHandle) {
+    if renderers::active() != "zink" || !renderers::turnip_host_gate() {
+        return;
+    }
+    if renderers::is_installed(renderers::TURNIP_PACK_ID) {
+        return;
+    }
+    let log = |line: String| {
+        let _ = app.emit(
+            "launch://log",
+            &LaunchLog {
+                source: "quartz".into(),
+                line,
+            },
+        );
+    };
+    log("[quartz] zink：在线获取 Turnip 开源驱动（Mesa KGSL，骁龙免 root Vulkan，约 3.5MB）……".into());
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<DownloadProgress>(64);
+    let app2 = app.clone();
+    tauri::async_runtime::spawn(async move {
+        while let Some(ev) = rx.recv().await {
+            let line = if ev.stage == "error" {
+                format!("[quartz] Turnip 驱动下载错误：{}", ev.error.unwrap_or_default())
+            } else {
+                format!("[quartz] Turnip 驱动下载 {}%", ev.percent as u32)
+            };
+            let _ = app2.emit(
+                "launch://log",
+                &LaunchLog {
+                    source: "quartz".into(),
+                    line,
+                },
+            );
+        }
+    });
+    let client = meta::http_client();
+    let r = tauri::async_runtime::block_on(async move {
+        renderers::download_and_install(&client, renderers::TURNIP_PACK_ID, tx).await
+    });
+    match r {
+        Ok(_) => log("[quartz] Turnip 驱动就绪（本次启动即可被 zink 探测）".into()),
+        Err(e) => log(format!(
+            "[quartz] Turnip 驱动获取失败：{e}（zink 将仅尝试厂商驱动；若都不可用会自动回退 MobileGlues）"
+        )),
+    }
+}
+
 /// 真实启动：版本 JSON -> LaunchPlan -> 游戏运行（M0 已接入）。
 /// Android：进程内 JVM + 显示桥（SurfaceView + EGL，v0.1.5 游戏显示接入）；
 /// 桌面：JVM 子进程。JVM pack 缺失时返回 `RUNTIME_MISSING:<major>`，UI 自动触发下载。
@@ -2989,6 +3041,9 @@ fn launch_game(
     {
         ensure_lwjgl_pack(&app)?;
         ensure_renderer(&app)?;
+        // v0.2.17：骁龙（KGSL）+ zink 时预取 Turnip 开源驱动包
+        //（不阻塞失败，探针层面有完整兑底链）
+        ensure_turnip_pack(&app);
         // 显示桥落位（:game 进程 dlopen）：覆盖 Pojav APK 提取的旧 C 版 pojavexec
         //（jar↔so 错位根因）。
         let _ = &state;

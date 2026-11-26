@@ -31,6 +31,10 @@ pub enum PackSource {
     /// —— 支持改名（zink_dri 的 SONAME 是 libgallium_dri.so，Mesa EGL
     /// 按该名 dlopen，文件名必须对齐）。
     ApkExtract(&'static str, &'static [(&'static str, &'static str)]),
+    /// v0.2.17：下载 zip 后按 basename 提取（.so/.json）—— Turnip 驱动包
+    /// （本仓 CI 自建 mesa ICD 的发布资产，zip 根级平铺，非 APK 布局）。
+    /// 列表为空 = 提取全部 .so/.json；非空 = 白名单 (zip 内 basename, 落盘名)。
+    ZipExtract(&'static str, &'static [(&'static str, &'static str)]),
 }
 
 /// 渲染器 pack 元数据。
@@ -165,8 +169,49 @@ pub fn catalog() -> &'static [RendererSpec] {
     ]
 }
 
+/// v0.2.17：Turnip（Mesa freedreno Vulkan ICD，KGSL 内核后端）—— 骁龙 zink
+/// 的免 root Vulkan 驱动包。不属于可选渲染层（无 EGL 实现，仅作 zink 的
+/// Vulkan 设备供给），因此不进 [`catalog`]（UI 不列出、set_active 拒绝）。
+/// 来源：本仓 CI（scripts/build_turnip.sh）从 mesa-26.3.1 自建 —— 社区
+/// 预编译（FCL/ZL2）按 mesa 的 vulkan-android.sym 只导 HAL `HMI` 入口，
+/// Termux 构建缺 Android WSI，均不能被 VULKAN_PTR 直连消费端使用；
+/// 我们的补丁（mesa-turnip-plain-gpa.patch）同时导出
+/// vk_icdGetInstanceProcAddr + vkGetInstanceProcAddr（IronizedZink 只
+/// dlsym 后者）。
+const TURNIP_ZIP: &str = "https://github.com/Gsjsjzhznsz/Rust-Minecraft-Launcher/releases/latest/download/renderer-turnip-aarch64.zip";
+
+/// turnip 伪渲染层 pack id（不进 catalog，见上）。
+pub const TURNIP_PACK_ID: &str = "turnip";
+
+static TURNIP_SPEC: RendererSpec = RendererSpec {
+    id: TURNIP_PACK_ID,
+    name: "Turnip (Adreno)",
+    // egl/gl 指向驱动库本体仅为复用 is_installed 完整性检查（egl==gl ==
+    // 只检一个文件）；turnip 不走 EGL 加载路径。
+    egl_lib: "libvulkan_freedreno.so",
+    gl_lib: "libvulkan_freedreno.so",
+    note: "Mesa freedreno Vulkan ICD（KGSL）—— zink 的骁龙免 root 驱动（内部包）",
+    source: Some(PackSource::ZipExtract(TURNIP_ZIP, &[])),
+    preload: &[],
+    size_hint: "约 17 MB",
+};
+
+/// turnip 驱动库落盘路径。
+pub fn turnip_driver_lib() -> PathBuf {
+    install_dir(TURNIP_PACK_ID).join("libvulkan_freedreno.so")
+}
+
+/// 主机侧门控：免 root Adreno 的 KGSL 设备节点存在。
+/// Mali 等其它 GPU 无此节点 —— 不下载不探测，行为与 v0.2.16 一致。
+pub fn turnip_host_gate() -> bool {
+    Path::new("/dev/kgsl-3d0").exists()
+}
+
 /// 按 id 查找。
 pub fn spec_for(id: &str) -> Option<&'static RendererSpec> {
+    if id == TURNIP_PACK_ID {
+        return Some(&TURNIP_SPEC);
+    }
     catalog().iter().find(|s| s.id == id)
 }
 
@@ -217,6 +262,13 @@ pub fn active() -> String {
 
 /// 选中渲染器并落盘（id 必须在目录中）。
 pub fn set_active(id: &str) -> Result<()> {
+    // v0.2.17：turnip 是 zink 的内部 Vulkan 驱动包（无 EGL 实现），
+    // 选它会走坏 launch 流程 —— 明确拒绝。
+    if id == TURNIP_PACK_ID {
+        return Err(Error::Other(
+            "turnip 是 zink 的内部 Vulkan 驱动包，不能作为渲染层直接使用".into(),
+        ));
+    }
     if spec_for(id).is_none() {
         return Err(Error::Other(format!("未知渲染器：{id}")));
     }
@@ -349,6 +401,37 @@ pub async fn download_and_install(
                 buf.flush().await?;
             }
         }
+        PackSource::ZipExtract(url, whitelist) => {
+            // 与 ApkExtract 同款下载 + spawn_blocking 提取（zip 内任意路径
+            // 按 basename 匹配，root 级平铺的驱动包无需目录约束）
+            let resp = crate::mirror::get_stream(client, url).await?;
+            let total = resp.content_length().unwrap_or(0);
+            let part = staging.parent().unwrap().join(format!(".{id}.zip.part"));
+            let mut cur: u64 = 0;
+            let mut stream = resp;
+            {
+                use tokio::io::AsyncWriteExt;
+                let mut file = tokio::io::BufWriter::new(
+                    tokio::fs::File::create(&part)
+                        .await
+                        .map_err(|e| Error::Other(crate::error::io_context(&e, &part)))?,
+                );
+                while let Some(chunk) = crate::mirror::next_chunk(&mut stream).await? {
+                    file.write_all(&chunk)
+                        .await
+                        .map_err(|e| Error::Other(crate::error::io_context(&e, &part)))?;
+                    cur += chunk.len() as u64;
+                    report("renderer-download", cur, total, format!("{id} zip"), false);
+                }
+                file.flush().await?;
+            }
+            let part2 = part.clone();
+            let staging2 = staging.clone();
+            tokio::task::spawn_blocking(move || extract_zip_libs(&part2, &staging2, whitelist))
+                .await
+                .map_err(|e| Error::Other(format!("提取线程崩溃：{e}")))??;
+            let _ = std::fs::remove_file(&part);
+        }
         PackSource::ApkExtract(url, whitelist) => {
             let resp = crate::mirror::get_stream(client, url).await?;
             let total = resp.content_length().unwrap_or(0);
@@ -414,6 +497,38 @@ async fn head_len_async(client: &reqwest::Client, url: &str) -> u64 {
 /// EGL 库加载前须预载的同目录依赖（空表 = 无）。
 pub fn preload_libs(id: &str) -> &'static [&'static str] {
     spec_for(id).map(|s| s.preload).unwrap_or(&[])
+}
+
+/// v0.2.17：从 zip 提取 .so/.json（basename 匹配，任意目录层级）。
+/// whitelist 为空 = 提取全部 .so 与 .json；非空 = 仅 (basename, 落盘名) 列表。
+fn extract_zip_libs(zip: &Path, dest: &Path, whitelist: &[(&str, &str)]) -> Result<usize> {
+    let file = std::fs::File::open(zip)?;
+    let mut archive = zip::ZipArchive::new(std::io::BufReader::new(file))?;
+    let mut count = 0usize;
+    for i in 0..archive.len() {
+        let mut entry = archive.by_index(i)?;
+        let Some(name) = entry.enclosed_name() else {
+            continue;
+        };
+        let name = name.to_string_lossy();
+        if !(name.ends_with(".so") || name.ends_with(".json")) {
+            continue;
+        }
+        let src_name = name.rsplit('/').next().unwrap_or(&name);
+        let out_name = if whitelist.is_empty() {
+            src_name
+        } else {
+            match whitelist.iter().find(|(apk_name, _)| *apk_name == src_name) {
+                Some((_, disk_name)) => *disk_name,
+                None => continue,
+            }
+        };
+        let out = dest.join(out_name);
+        let mut out_file = std::fs::File::create(&out)?;
+        std::io::copy(&mut entry, &mut out_file)?;
+        count += 1;
+    }
+    Ok(count)
 }
 
 /// 从 APK 提取 lib/arm64-v8a/*.so。whitelist 为空 = 全部提取；
@@ -556,5 +671,72 @@ mod tests {
         paths::set_runtime_jres_root(root.clone());
         assert_eq!(install_dir("gl4es"), root.join("renderers/gl4es"));
         paths::set_runtime_jres_root(std::env::temp_dir().join("quartz-test-jres"));
+    }
+
+    /// v0.2.17：turnip 伪渲染层 —— 不进 catalog（UI 不可见），但 spec_for
+    /// 可解析（下载/安装/完整性检查复用）；set_active 明确拒绝。
+    #[test]
+    fn turnip_pack_wiring() {
+        assert!(spec_for(TURNIP_PACK_ID).is_some());
+        assert!(catalog().iter().all(|s| s.id != TURNIP_PACK_ID));
+        assert!(set_active(TURNIP_PACK_ID).is_err());
+        // is_installed 复用：驱动库存在即完整（egl==gl==驱动库）
+        let _guard = crate::runtime::tests::TEST_STATE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let root = std::env::temp_dir().join("qz-rd3");
+        let _ = std::fs::remove_dir_all(&root);
+        paths::set_runtime_jres_root(root.clone());
+        let dir = install_dir(TURNIP_PACK_ID);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(!is_installed(TURNIP_PACK_ID));
+        std::fs::write(turnip_driver_lib(), b"fake").unwrap();
+        assert!(is_installed(TURNIP_PACK_ID));
+        assert_eq!(
+            turnip_driver_lib(),
+            root.join("renderers/turnip/libvulkan_freedreno.so")
+        );
+        paths::set_runtime_jres_root(std::env::temp_dir().join("quartz-test-jres"));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// v0.2.17：ZipExtract 按 basename 提取 .so/.json（root 平铺 + 子目录）。
+    #[test]
+    fn zip_extract_pulls_so_and_json() {
+        let work = std::env::temp_dir().join(format!("qz-zipx-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&work);
+        std::fs::create_dir_all(&work).unwrap();
+        let zip_path = work.join("pack.zip");
+        let file = std::fs::File::create(&zip_path).unwrap();
+        let mut w = zip::ZipWriter::new(file);
+        use std::io::Write as _;
+        let opts: zip::write::SimpleFileOptions = Default::default();
+        w.start_file("libvulkan_freedreno.so", opts).unwrap();
+        std::io::Write::write_all(&mut w, b"so-bytes").unwrap();
+        w.start_file("sub/dir/freedreno_icd.json", opts).unwrap();
+        std::io::Write::write_all(&mut w, b"{}").unwrap();
+        w.start_file("README", opts).unwrap();
+        std::io::Write::write_all(&mut w, b"skip-me").unwrap();
+        w.finish().unwrap().flush().unwrap();
+        let dest = work.join("out");
+        std::fs::create_dir_all(&dest).unwrap();
+        let n = extract_zip_libs(&zip_path, &dest, &[]).unwrap();
+        assert_eq!(n, 2);
+        assert!(dest.join("libvulkan_freedreno.so").exists());
+        assert!(dest.join("freedreno_icd.json").exists());
+        assert!(!dest.join("README").exists());
+        // 白名单模式：仅指定项，且支持改名
+        let dest2 = work.join("out2");
+        std::fs::create_dir_all(&dest2).unwrap();
+        let n2 = extract_zip_libs(
+            &zip_path,
+            &dest2,
+            &[("libvulkan_freedreno.so", "libvulkan_freedreno.so")],
+        )
+        .unwrap();
+        assert_eq!(n2, 1);
+        assert!(dest2.join("libvulkan_freedreno.so").exists());
+        assert!(!dest2.join("freedreno_icd.json").exists());
+        std::fs::remove_dir_all(&work).ok();
     }
 }

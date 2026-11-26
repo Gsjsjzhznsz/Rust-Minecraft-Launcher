@@ -1,0 +1,39 @@
+diff --git a/src/freedreno/vulkan/tu_device.cc b/src/freedreno/vulkan/tu_device.cc
+index 2819821..534af0e 100644
+--- a/src/freedreno/vulkan/tu_device.cc
++++ b/src/freedreno/vulkan/tu_device.cc
+@@ -3545,6 +3545,17 @@ vk_icdGetInstanceProcAddr(VkInstance instance, const char *pName)
+    return tu_GetInstanceProcAddr(instance, pName);
+ }
+ 
++/* Quartz: also expose the plain entry point, so consumers that dlsym()
++ * vkGetInstanceProcAddr directly (Pojav-fork zink via VULKAN_PTR) can
++ * drive this ICD without going through a Vulkan loader.
++ */
++PUBLIC
++VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
++vkGetInstanceProcAddr(VkInstance instance, const char *pName)
++{
++   return tu_GetInstanceProcAddr(instance, pName);
++}
++
+ static VkResult
+ tu_add_to_heap(struct tu_device *dev, struct tu_bo *bo)
+ {
+diff --git a/src/vulkan/vulkan-android.sym b/src/vulkan/vulkan-android.sym
+index 7148e09..4a610c0 100644
+--- a/src/vulkan/vulkan-android.sym
++++ b/src/vulkan/vulkan-android.sym
+@@ -4,6 +4,12 @@
+ 		# as HAL_MODULE_INFO_SYM (which is just a #define for HMI) and it's an
+ 		# instance of struct hwvulkan_module_t.
+ 		HMI;
++		# Quartz: standard ICD entries so loader-JSON and direct-dlsym
++		# consumers (Pojav-fork zink via VULKAN_PTR) can drive this ICD.
++		vk_icdGetInstanceProcAddr;
++		vk_icdGetPhysicalDeviceProcAddr;
++		vk_icdNegotiateLoaderICDInterfaceVersion;
++		vkGetInstanceProcAddr;
+ 
+ 	local:
+ 		# When static linking LLVM, all its symbols are public API.
