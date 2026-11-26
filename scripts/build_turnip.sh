@@ -45,7 +45,12 @@ command -v flex  >/dev/null || { echo "缺 flex";  exit 1; }
 command -v m4    >/dev/null || { echo "缺 m4";    exit 1; }
 command -v pkg-config >/dev/null || { echo "缺 pkg-config"; exit 1; }
 python3 -c 'import mako' 2>/dev/null || python3 -m pip install -q mako pyyaml
-echo "glslang/bison/flex/m4/pkg-config/mako 就绪"
+# meson/ninja：runner 未必预装（pip 装到用户 bin，入 PATH）
+command -v meson >/dev/null || python3 -m pip install -q meson ninja
+export PATH="$HOME/.local/bin:$PATH"
+command -v meson >/dev/null || { echo "缺 meson"; exit 1; }
+command -v ninja >/dev/null || { echo "缺 ninja"; exit 1; }
+echo "glslang/bison/flex/m4/pkg-config/mako/meson/ninja 就绪"
 
 echo "=== [2/6] NDK ==="
 [ -x "$NDK/bin/aarch64-linux-android29-clang" ] || { echo "NDK 缺失：$NDK"; exit 1; }
