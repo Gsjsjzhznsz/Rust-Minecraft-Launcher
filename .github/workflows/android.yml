@@ -100,16 +100,18 @@ jobs:
             exit 0
           fi
           cp /home/z/my-project/download/Quartz.apk "/tmp/Quartz-${TAG}.apk"
+          # 带版本号（存档）+ 不带版本号（运行时 releases/latest/download 直链）双名
           cp /home/z/my-project/download/renderer-turnip-aarch64.zip "/tmp/renderer-turnip-aarch64-${TAG}.zip"
+          cp /home/z/my-project/download/renderer-turnip-aarch64.zip "/tmp/renderer-turnip-aarch64.zip"
           NOTES="$REL_NOTES"
           if [ -z "$NOTES" ]; then
             NOTES=$(printf '%b' "Quartz Android debug APK（自动构建）。\n\n- 包名：\`com.quartz.launcher\`\n- ABI：arm64-v8a\n- 构建提交：${GITHUB_SHA}\n- 安装前请先卸载旧版本（签名变更会导致安装失败）")
           fi
           if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" "/tmp/Quartz-${TAG}.apk" "/tmp/renderer-turnip-aarch64-${TAG}.zip" --clobber
+            gh release upload "$TAG" "/tmp/Quartz-${TAG}.apk" "/tmp/renderer-turnip-aarch64-${TAG}.zip" "/tmp/renderer-turnip-aarch64.zip" --clobber
             echo "[ci] 已上传资产到已有 Release $TAG"
           else
-            gh release create "$TAG" "/tmp/Quartz-${TAG}.apk" "/tmp/renderer-turnip-aarch64-${TAG}.zip" \
+            gh release create "$TAG" "/tmp/Quartz-${TAG}.apk" "/tmp/renderer-turnip-aarch64-${TAG}.zip" "/tmp/renderer-turnip-aarch64.zip" \
               --title "Quartz ${TAG}" \
               --notes "$NOTES" \
               --target "$GITHUB_SHA"
