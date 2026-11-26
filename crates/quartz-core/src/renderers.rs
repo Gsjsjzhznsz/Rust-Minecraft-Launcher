@@ -253,6 +253,14 @@ pub fn launch_env(id: &str) -> Vec<(String, String)> {
             ("MESA_GL_VERSION_OVERRIDE".into(), "4.6".into()),
             ("MESA_GLSL_VERSION_OVERRIDE".into(), "460".into()),
             ("MESA_VK_IGNORE_CONFORMANCE_WARNING".into(), "1".into()),
+            // driconf 三项（v0.2.12，FCLauncher zink 分支同款）：放宽 GLSL
+            // 编译门禁，MC 的着色器源在 zink 转译下常带越界扩展声明
+            ("force_glsl_extensions_warn".into(), "true".into()),
+            ("allow_higher_compat_version".into(), "true".into()),
+            (
+                "allow_glsl_extension_directive_midshader".into(),
+                "true".into(),
+            ),
             ("LIBGL_ES".into(), "3".into()),
         ],
         _ => vec![],

@@ -122,6 +122,8 @@ unsafe extern "C" {
 }
 const RTLD_NOW: c_int = 2;
 const RTLD_GLOBAL: c_int = 0x100;
+const RTLD_LAZY: c_int = 1;
+const RTLD_LOCAL: c_int = 0;
 
 /// dlopen 失败时取 dlerror 文本（安全封装，空串兑底）。
 unsafe fn last_dlerror() -> String {
@@ -211,10 +213,11 @@ fn probe_renderer_egl(id: &str) -> Result<(), String> {
         std::env::set_var("LIBGL_DEBUG", "verbose");
     }
 
-    // v0.2.9 诊断：/dev/dri/renderD* 可访问性 —— Mesa surfaceless/android 平台
-    // 都要拿 DRM render node 建 GPU 设备；内核未暴露（老 kbase 只有 /dev/mali0）
-    // 或 SELinux 拒绝时 eglInitialize 必返 EGL_NOT_INITIALIZED。先探后试，
-    // 日志直读根因（无论 EGL 成败都打印）。
+    // v0.2.9 诊断：/dev/dri/renderD* 可访问性 —— 主线 Mesa 的 DRI 设备发现
+    // 要 DRM render node；但 Pojav 系 Mesa fork（IronizedZink）的 zink 走
+    // 进程内 Vulkan loader（VULKAN_PTR，见 1.4.5 预载），不依赖它。此诊断
+    // 仅用于区分设备发现路径（有 renderD = DRI 路可用；无 = 必须走 Vulkan
+    // loader），不再作为设备能否跑 zink 的判据（v0.2.12 修正旧结论）。
     let mut node_report: Vec<String> = Vec::new();
     for i in 0..8u32 {
         let p = std::path::PathBuf::from(format!("/dev/dri/renderD{i}"));
@@ -228,8 +231,8 @@ fn probe_renderer_egl(id: &str) -> Result<(), String> {
     }
     if node_report.is_empty() {
         eprintln!(
-            "[quartz] EGL 预检诊断：/dev/dri/renderD* 均不存在（内核未暴露 DRM render node，\
-             zink/Mesa 无法拿 GPU 设备 —— 该设备 zink 不可用的典型原因）"
+            "[quartz] EGL 预检诊断：/dev/dri/renderD* 不存在（无 DRI 路径，\
+             zink 将走 Vulkan loader 设备发现 —— v0.2.12 起 FCL 同款机制）"
         );
     } else {
         eprintln!("[quartz] EGL 预检诊断：render node -> {}", node_report.join(", "));
@@ -1474,7 +1477,11 @@ unsafe fn run_game_from_spec(
     // Zink（Mesa GL4.6→Vulkan）走真桌面 GL 上下文（EGL_KHR_create_context）；
     // 其余渲染层维持 GLES 语义。桥按 POJAV_RENDERER 是否含 "desktopgl" 分流。
     if active_renderer == "zink" {
-        std::env::set_var("POJAV_RENDERER", format!("desktopgl_{active_renderer}"));
+        // v0.2.12：POJAV_RENDERER 对齐 FCL 完整同款值。桥接层按
+        // contains("desktopgl") 分流（改值不影响）；尾部 _kopper 是
+        // Pojav 系 Mesa fork 的窗口层门控 —— kopper 用 Vulkan swapchain
+        // 作窗口系统（绕过 DRM），设备发现走进程内 Vulkan loader。
+        std::env::set_var("POJAV_RENDERER", "opengles3_desktopgl_zink_kopper");
         // Mesa DRI 驱动（libgallium_dri.so）搜索路径：Android 构建不从系统
         // dri 目录找驱动，必须指向渲染层目录本身。
         std::env::set_var(
@@ -1492,6 +1499,26 @@ unsafe fn run_game_from_spec(
     if active_renderer == "zink" {
         if let Err(e) = ensure_zink_cutils_shim() {
             eprintln!("[quartz] libcutils shim 落位失败（zink 按名解析将失败）：{e}");
+        }
+    }
+
+    // 1.4.5) zink：Vulkan loader 预载（v0.2.12 —— FCL load_vulkan() 等价物）。
+    // 根因实锤：FCL/Zalith2 用同一套 IronizedZink so 在本机可跑，而 Quartz
+    // 预检 eglInitialize=0x3001。对比 FCL 源码（egl_bridge.c load_vulkan）：
+    // 其 zink 启动前必先 dlopen("libvulkan.so") 把系统 Vulkan loader 装进
+    // 进程，句柄写入 VULKAN_PTR 环境变量；Pojav 系 Mesa fork 的设备发现
+    // 依赖它枚举厂商 GPU（Mali/Adreno/Xclipse 均走厂商 ICD），完全不依赖
+    // DRM render node —— 旧版缺这一步，Mesa 设备层无 Vulkan 可用，两条
+    // 平台尝试（default/surfaceless）均 EGL_NOT_INITIALIZED。
+    if active_renderer == "zink" && std::env::var("VULKAN_PTR").is_err() {
+        let cv = CString::new("libvulkan.so").unwrap();
+        let vh = dlopen(cv.as_ptr(), RTLD_LAZY | RTLD_LOCAL);
+        if !vh.is_null() {
+            std::env::set_var("VULKAN_PTR", format!("{:x}", vh as usize));
+            eprintln!("[quartz] zink：系统 Vulkan loader 已预载，VULKAN_PTR=0x{:x}（FCL load_vulkan 等价物）", vh as usize);
+        } else {
+            let err = unsafe { last_dlerror() };
+            eprintln!("[quartz] zink：libvulkan.so 预载失败：{err}（设备发现将受限，可能 0x3001）");
         }
     }
 
@@ -1554,14 +1581,15 @@ unsafe fn run_game_from_spec(
     // 1.6) 渲染层 EGL 预检（v0.2.7）：zink/Mesa EGL 初始化失败（实机 0x3001）
     //      在此处立即干净退出（QUARTZ_RENDERER_EGL_FAIL 标记 → 主进程检测后
     //      自动回退渲染层），不再带病 CreateJavaVM 撞 LWJGL 空上下文 255。
-    if let Err(e) = probe_renderer_egl(&active_renderer) {
-        return Err(e);
-    }
+    //      v0.2.12：Mesa 着色器缓存目录提前到预检前（FCL 同款时序，zink
+    //      初始化期即可能写缓存）；driconf 三项随 launch_env 注入。
     if active_renderer == "zink" {
-        // Mesa 着色器磁盘缓存（可写内部目录；不设则 mesa 退回内存缓存）
         let mesa_cache = crate::paths::game_root().join(".cache").join("mesa");
         let _ = std::fs::create_dir_all(&mesa_cache);
         std::env::set_var("MESA_GLSL_CACHE_DIR", &mesa_cache);
+    }
+    if let Err(e) = probe_renderer_egl(&active_renderer) {
+        return Err(e);
     }
 
     // 2) 显示桥注入 ART（grab/剪贴板回调注册；ctx = GameService 实例）
