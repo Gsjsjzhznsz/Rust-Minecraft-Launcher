@@ -171,6 +171,93 @@ unsafe fn last_dlerror() -> String {
     CStr::from_ptr(p).to_string_lossy().into_owned()
 }
 
+/// dlerror 串压缩：linker namespace 拒载的原文极长（完整报库路径 + 命名
+/// 空间链），v0.2.15 实机日志一行超 600 字符把游戏日志行填满。保留定位
+/// 要素，160 字符截断。
+fn short_dl(s: &str) -> String {
+    let s = s.trim();
+    if s.chars().count() <= 160 {
+        s.to_string()
+    } else {
+        let cut: String = s.chars().take(160).collect();
+        format!("{cut}…")
+    }
+}
+
+/// v0.2.16：sphal 命名空间加载 —— android_load_sphal_library（libdl，
+/// API 27+），系统 loader 加载厂商 Vulkan ICD 走的正是这条通道。
+/// v0.2.15 实机实锤：应用普通 dlopen 对 /vendor/lib64/hw/vulkan.*.so 被
+/// linker namespace 拦截（clns-10「not accessible for the namespace」），
+/// ICD 直连想在真实设备上等效 FCL nsbypass，必须经 sphal。minSdk 24 < 27
+/// 不敢静态链接（老设备 dlopen 本库即失败），运行时 dlsym 解析；解析不到
+/// 返回 null，调用方回退普通 dlopen（覆盖模拟器/宽松 ROM）。
+unsafe fn load_sphal_library(name: &CStr) -> *mut c_void {
+    unsafe fn resolve() -> *mut c_void {
+        let sym = CString::new("android_load_sphal_library").unwrap();
+        // RTLD_DEFAULT（bionic：主程序全局组，libdl 在其中）
+        let p = dlsym(ptr::null_mut(), sym.as_ptr());
+        if !p.is_null() {
+            return p;
+        }
+        // 兜底：dlopen(NULL) 取主程序句柄再查一次
+        let h = dlopen(ptr::null(), RTLD_LAZY | RTLD_LOCAL);
+        if h.is_null() {
+            return ptr::null_mut();
+        }
+        dlsym(h, sym.as_ptr())
+    }
+    static SYM: OnceLock<usize> = OnceLock::new();
+    let addr = *SYM.get_or_init(|| unsafe { resolve() } as usize);
+    if addr == 0 {
+        return ptr::null_mut();
+    }
+    type SphalFn = unsafe extern "C" fn(*const c_char, c_int) -> *mut c_void;
+    let f: SphalFn = std::mem::transmute(addr);
+    f(name.as_ptr(), RTLD_NOW | RTLD_LOCAL)
+}
+
+/// v0.2.16：Vulkan 探针隔离子进程环境净化。:game 进程带着渲染层 launch_env
+/// 启动（GALLIUM_DRIVER/MESA_* 等），fork 子进程原样继承 —— VK_* 变量直接
+/// 改变系统 loader 的 ICD/层发现行为，LD_PRELOAD/LD_AUDIT 更是子进程首批
+/// 加载对象。探针要的是「贴着 FCL/ZL2 条件」的最小环境。仅在子进程生效
+/// （_exit 收尾），游戏进程环境不动。
+fn sanitize_vk_probe_env() {
+    for k in [
+        "VK_ICD_FILENAMES",
+        "VK_DRIVER_FILES",
+        "VK_LAYER_PATH",
+        "VK_LOADER_DEBUG",
+        "VK_LOADER_LAYERS_ENABLE",
+        "VK_LOADER_DEVICE_SELECT",
+        "VK_LOADER_GPU_SELECT",
+        "VK_PRESET",
+        "LD_PRELOAD",
+        "LD_AUDIT",
+    ] {
+        std::env::remove_var(k);
+    }
+}
+
+/// v0.2.16：按子进程探针胜出的加载通道在父进程补载同一 ICD。句柄必须
+/// 父进程自持（fork 子进程句柄不跨进程有效，见 1.4.5 注释）——通道一致
+/// 才保证父子拿到同一份映射。
+unsafe fn open_icd_handle(path: &Path, how: &str) -> *mut c_void {
+    let cs = CString::new(path.to_string_lossy().into_owned()).unwrap_or_default();
+    match how {
+        "sphal-base" => {
+            let b = path
+                .file_name()
+                .and_then(|n| CString::new(n.to_string_lossy().into_owned()).ok());
+            match b {
+                Some(b) => load_sphal_library(&b),
+                None => ptr::null_mut(),
+            }
+        }
+        "sphal-abs" => load_sphal_library(&cs),
+        _ => dlopen(cs.as_ptr(), RTLD_LAZY | RTLD_LOCAL),
+    }
+}
+
 /// 显示桥 .so 落位：runtime_dir()/libpojavexec.so + lwjgl3/natives/libpojavexec.so
 /// （后者是 OpenJDK System.loadLibrary("pojavexec") 的 java.library.path 首目录，
 /// 必须覆盖掉 Pojav APK 提取的旧 C 版 —— gladiolus 发布包 jar↔so 版本错位）。
@@ -370,6 +457,8 @@ unsafe fn probe_vulkan_devices(handle: *mut c_void) -> Result<String, String> {
 /// 的 vulkan.<soc>.so 时的兑底 —— 等价于 FCL nsbypass 在私有命名空间里
 /// 替 loader 完成 ICD 发现；ICD 按约定导出 vkGetInstanceProcAddr，zink
 /// 只需这一个符号即可驱动（见 probe_vulkan_devices 注释）。
+/// v0.2.16：目录 readdir 被封（部分 ROM）时以已知厂商 ICD 名兑底 —— 每个
+/// 候选独立隔离子进程探测，猜错代价为零。
 fn vendor_icd_candidates() -> Vec<PathBuf> {
     let mut out = Vec::new();
     for dir in ["/vendor/lib64/hw", "/odm/lib64/hw", "/system/lib64/hw"] {
@@ -388,6 +477,17 @@ fn vendor_icd_candidates() -> Vec<PathBuf> {
             .collect();
         names.sort();
         out.extend(names);
+    }
+    if out.is_empty() {
+        for n in [
+            "vulkan.mali.so",
+            "vulkan.adreno.so",
+            "vulkan.gpu.so",
+            "vulkan.ahard.so",
+        ] {
+            out.push(PathBuf::from("/vendor/lib64/hw").join(n));
+            out.push(PathBuf::from("/odm/lib64/hw").join(n));
+        }
     }
     out
 }
@@ -1113,6 +1213,45 @@ fn drain_game_log_to_console() {
     }
 }
 
+/// v0.2.16：回退重试前确保目标渲染层已安装。
+/// v0.2.15 实机教训（launch-1795703377）：zink 失败自动回退 mobileglues 后
+/// 直接重试 —— 但 ensure_renderer 只在 launch_game 主流程对「启动时选中的
+/// 渲染层」生效，回退切换后的目标从没人管：该设备从未下载过 mobileglues
+/// 包 → 重试进程预检「渲染层库缺失」再次 252，用户面对「无可回退目标」
+/// 死胡同，游戏完全无法启动。这里阻塞在线安装（复用 ensure_renderer 的
+/// 下载链路），失败则放弃重试并明确上报（联网后可手动启动让主流程补装）。
+fn ensure_renderer_installed_for_retry(id: &str) -> Result<(), String> {
+    if crate::renderers::is_installed(id) {
+        return Ok(());
+    }
+    let has_source = crate::renderers::spec_for(id)
+        .map(|s| s.source.is_some())
+        .unwrap_or(false);
+    if !has_source {
+        return Err(format!("渲染层 {id} 无下载源"));
+    }
+    append_state_log(&format!("[quartz] 回退渲染层 {id} 未安装：在线获取…"));
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<crate::instance::DownloadProgress>(64);
+    let id2 = id.to_string();
+    tauri::async_runtime::spawn(async move {
+        while let Some(ev) = rx.recv().await {
+            let line = if ev.stage == "error" {
+                format!("[quartz] 渲染层下载错误：{}", ev.error.unwrap_or_default())
+            } else {
+                format!("[quartz] 渲染层下载 {}%", ev.percent as u32)
+            };
+            append_state_log(&line);
+        }
+    });
+    let client = crate::meta::http_client();
+    tauri::async_runtime::block_on(async move {
+        crate::renderers::download_and_install(&client, &id2, tx).await
+    })
+    .map_err(|e| format!("渲染层 {id} 下载失败：{e}"))?;
+    append_state_log(&format!("[quartz] 回退渲染层 {id} 安装完成"));
+    Ok(())
+}
+
 /// 统一退出上报：隐藏游戏层 + 恢复竖屏 + emit launch://exit（附日志尾部）。幂等。
 /// 调用方：GameHost.gameExited（:game 正常结束）/ gameProcessGone（崩溃/停止）/ 看门狗。
 pub fn finish_game_exit(code: i32) {
@@ -1149,6 +1288,16 @@ pub fn finish_game_exit(code: i32) {
                     // 放行守卫后走正常退出流程。
                     EXIT_EMITTED.store(false, Ordering::SeqCst);
                     finish_game_exit(137);
+                    return;
+                }
+                // v0.2.16：重试前确保回退目标渲染层已安装（缺失→在线获取；
+                // 失败→放弃重试，明确上报，别让用户撞「库缺失 252」死胡同）。
+                if let Err(e) = ensure_renderer_installed_for_retry("mobileglues") {
+                    append_state_log(&format!(
+                        "[quartz] 回退渲染层 mobileglues 不可用：{e}（放弃重试；联网后可直接再点「开始」自动补装）"
+                    ));
+                    EXIT_EMITTED.store(false, Ordering::SeqCst);
+                    finish_game_exit(252);
                     return;
                 }
                 let log_file = STATE_LOG_FILE
@@ -1335,6 +1484,12 @@ pub unsafe extern "C" fn Java_com_quartz_launcher_GameHost_gameProcessGone(
     _obj: jni_sys::jobject,
 ) {
     let stopped = STOP_REQUESTED.load(Ordering::SeqCst);
+    // v0.2.16：正常退出（gameExited 已收尾，EXIT_EMITTED=true）不再采集
+    // crash 缓冲 —— v0.2.15 实机教训：zink 预检 252 干净退出后 binder death
+    // 仍触发本回调，把探针隔离子进程的预期 tombstone（fork 子进程 SIGSEGV，
+    // 符合设计）当游戏崩溃证据整段搬进启动日志，用户误读为「游戏又崩了」。
+    // 只有「进程本身异常死亡」（EXIT_EMITTED 仍为 false）才值得采证。
+    let clean_exit = EXIT_EMITTED.load(Ordering::SeqCst);
     if !EXIT_EMITTED.load(Ordering::SeqCst) {
         append_state_log(if stopped {
             "[quartz] 游戏进程已停止"
@@ -1346,7 +1501,7 @@ pub unsafe extern "C" fn Java_com_quartz_launcher_GameHost_gameProcessGone(
     // 崩溃证据补充采集（异步，不拖慢 UI 恢复）：v0.2.7 起致命信号一律交还
     // 原生链（拦截器已移除），debuggerd tombstone 会落 logcat crash 缓冲，
     // 此处把缓冲采集进 launch 日志；JVM hs_err 同步回收（SIGABRT 家族）。
-    if !stopped {
+    if !stopped && !clean_exit {
         std::thread::spawn(|| {
             let out = std::process::Command::new("logcat")
                 .args(["-d", "-b", "crash", "-t", "200"])
@@ -1918,9 +2073,11 @@ unsafe fn run_game_from_spec(
     //   ① 所有探针 fork 隔离 —— 崩溃只带走 fork 出的子进程，游戏进程
     //      必然存活（fork_isolated_probe）。
     //   ② ICD 直连优先（FCL nsbypass 等价路径）：/vendor|/odm|/system
-    //      lib64/hw/vulkan.*.so 逐候选隔离探测，胜出候选由父进程补
-    //      dlopen 落 VULKAN_PTR（子进程句柄不跨 fork 有效，必须父进程
-    //      自己持有同一份映射）。
+    //      lib64/hw/vulkan.*.so 逐候选隔离探测，加载走 sphal 通道
+    //      （android_load_sphal_library，系统 loader 同款；v0.2.15 实机
+    //      实锤普通 dlopen 被 clns namespace 拦截），胜出候选由父进程按
+    //      同一通道补载落 VULKAN_PTR（子进程句柄不跨 fork 有效，必须
+    //      父进程自己持有同一份映射）。
     //   ③ 系统 loader 仅作兑底，且必须在隔离子进程内验证
     //      vkCreateInstance 可用后才落句柄 —— v0.2.14 的「全败仍落
     //      loader 保留 zink 机会」已删除：loader 探针崩溃本身就证明把
@@ -1931,10 +2088,14 @@ unsafe fn run_game_from_spec(
     if active_renderer == "zink" {
         let loader = CString::new("libvulkan.so").unwrap();
         let vh = dlopen(loader.as_ptr(), RTLD_LAZY | RTLD_LOCAL);
-        let mut chosen: Option<(String, String)> = None; // (候选描述, 设备报告)
+        let mut chosen: Option<(String, String, String)> = None; // (候选描述, 加载通道, 设备报告)
         let mut notes: Vec<String> = Vec::new();
 
-        // ② 厂商 ICD 直连（每候选一个隔离子进程：候选 N 崩溃不影响 N+1）
+        // ② 厂商 ICD 直连（每候选一个隔离子进程：候选 N 崩溃不影响 N+1）。
+        // v0.2.16 加载通道按序尝试：sphal 文件名（系统 loader 加载 ICD 的同款
+        // 通道，真实设备上普通 dlopen 被 clns namespace 拦截 —— v0.2.15 实机
+        // 实锤）→ sphal 绝对路径 → 普通 dlopen（模拟器/宽松 ROM 兑底）。子进程
+        // 报回胜出通道 how，父进程按同一通道补载（open_icd_handle）。
         for icd in vendor_icd_candidates() {
             let desc = icd.display().to_string();
             let payload = fork_isolated_probe(4000, move || {
@@ -1942,20 +2103,51 @@ unsafe fn run_game_from_spec(
                     return "ERR|stage=cstring".to_string();
                 };
                 unsafe {
-                    let h = dlopen(cs.as_ptr(), RTLD_LAZY | RTLD_LOCAL);
+                    sanitize_vk_probe_env();
+                    let mut h: *mut c_void = ptr::null_mut();
+                    let mut how = "";
+                    let mut errs: Vec<String> = Vec::new();
+                    if let Some(fname) = icd.file_name() {
+                        if let Ok(bs) = CString::new(fname.to_string_lossy().into_owned()) {
+                            h = load_sphal_library(&bs);
+                            if h.is_null() {
+                                errs.push(format!("sphal-base={}", short_dl(&last_dlerror())));
+                            } else {
+                                how = "sphal-base";
+                            }
+                        }
+                    }
                     if h.is_null() {
-                        let err = last_dlerror();
-                        return format!("ERR|stage=dlopen:{err}");
+                        h = load_sphal_library(&cs);
+                        if h.is_null() {
+                            errs.push(format!("sphal-abs={}", short_dl(&last_dlerror())));
+                        } else {
+                            how = "sphal-abs";
+                        }
+                    }
+                    if h.is_null() {
+                        h = dlopen(cs.as_ptr(), RTLD_LAZY | RTLD_LOCAL);
+                        if h.is_null() {
+                            errs.push(format!("dlopen={}", short_dl(&last_dlerror())));
+                            return format!("ERR|stage=load:{}", errs.join(";"));
+                        }
+                        how = "dlopen";
                     }
                     match probe_vulkan_devices(h) {
-                        Ok(r) => format!("OK|{r}"),
+                        Ok(r) => format!("OK|{how}|{r}"),
                         Err(e) => format!("ERR|{e}"),
                     }
                 }
             });
             match payload {
                 Ok(p) if p.starts_with("OK|") => {
-                    chosen = Some((desc.clone(), p.trim_start_matches("OK|").to_string()));
+                    let mut it = p.splitn(3, '|');
+                    let _ = it.next();
+                    chosen = Some((
+                        desc.clone(),
+                        it.next().unwrap_or("dlopen").to_string(),
+                        it.next().unwrap_or_default().to_string(),
+                    ));
                     break;
                 }
                 Ok(p) => notes.push(format!(
@@ -1972,6 +2164,7 @@ unsafe fn run_game_from_spec(
                 notes.push("libvulkan.so 预载失败".to_string());
             } else {
                 let payload = fork_isolated_probe(4000, move || unsafe {
+                    sanitize_vk_probe_env();
                     match probe_vulkan_devices(vh) {
                         Ok(r) => format!("OK|{r}"),
                         Err(e) => format!("ERR|{e}"),
@@ -1981,6 +2174,7 @@ unsafe fn run_game_from_spec(
                     Ok(p) if p.starts_with("OK|") => {
                         chosen = Some((
                             "loader".to_string(),
+                            "dlopen".to_string(),
                             p.trim_start_matches("OK|").to_string(),
                         ));
                     }
@@ -1997,29 +2191,26 @@ unsafe fn run_game_from_spec(
         let mut skip_reason: Option<String> = None;
         let report: String;
         match &chosen {
-            Some((desc, r)) if desc == "loader" => {
+            Some((desc, _how, r)) if desc == "loader" => {
                 std::env::set_var("VULKAN_PTR", format!("{:x}", vh as usize));
                 eprintln!("[quartz] zink：VULKAN_PTR=系统 loader（{r}）");
                 report = format!("QUARTZ_VK_PROBE:OK:loader {r}");
             }
-            Some((desc, r)) => {
-                match CString::new(desc.clone())
-                    .map(|cs| dlopen(cs.as_ptr(), RTLD_LAZY | RTLD_LOCAL))
-                    .ok()
-                {
-                    Some(h) if !h.is_null() => {
-                        std::env::set_var("VULKAN_PTR", format!("{:x}", h as usize));
-                        eprintln!("[quartz] zink：VULKAN_PTR=ICD 直连 {desc}（{r}）");
-                        report = format!("QUARTZ_VK_PROBE:OK:icd {desc} {r}");
-                    }
-                    _ => {
-                        eprintln!(
-                            "[quartz] zink：父进程补 dlopen {desc} 失败（{}）—— 按全败处理",
-                            last_dlerror()
-                        );
-                        skip_reason = Some("父进程 Vulkan 句柄落位失败".to_string());
-                        report = "QUARTZ_VK_PROBE:FAIL:父进程 Vulkan 句柄落位失败".to_string();
-                    }
+            Some((desc, how, r)) => {
+                // v0.2.16：父进程按子进程胜出的同一通道补载（sphal 句柄同样
+                // 有效 —— dlopen 句柄本质是 soinfo 指针，Mesa 只取 gpa 符号）。
+                let h = unsafe { open_icd_handle(Path::new(&desc), how) };
+                if !h.is_null() {
+                    std::env::set_var("VULKAN_PTR", format!("{:x}", h as usize));
+                    eprintln!("[quartz] zink：VULKAN_PTR=ICD 直连 {desc}（{how}，{r}）");
+                    report = format!("QUARTZ_VK_PROBE:OK:icd {desc} {r}");
+                } else {
+                    eprintln!(
+                        "[quartz] zink：父进程补载 {desc} 失败（{}）—— 按全败处理",
+                        unsafe { last_dlerror() }
+                    );
+                    skip_reason = Some("父进程 Vulkan 句柄落位失败".to_string());
+                    report = "QUARTZ_VK_PROBE:FAIL:父进程 Vulkan 句柄落位失败".to_string();
                 }
             }
             None => {
