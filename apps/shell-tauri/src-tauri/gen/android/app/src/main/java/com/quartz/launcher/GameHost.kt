@@ -22,6 +22,23 @@ object GameHost {
     @JvmStatic
     var grabbed: Boolean = false
 
+    /**
+     * v0.2.14：游戏会话是否进行中（Rust 侧启动成功直到游戏退出/失败恢复）。
+     * 跨 Activity 重建存活（object 单例）—— 重建后的新 Activity 靠它感知
+     * 「游戏仍在跑」并自动恢复游戏层（surface 重建），否则永久丢 Surface
+     * （实机 launch-1795694032：surfaceDestroyed 后无新 Surface -> 原生崩溃）。
+     */
+    @JvmStatic
+    var gameActive: Boolean = false
+
+    /**
+     * v0.2.14：Surface 创建代次计数（每次 surfaceCreated 递增）。
+     * surfaceDestroyed 后的恢复计时器比对代次：期间有新 Surface 则取消恢复，
+     * 没有则由 MainActivity 强制重建游戏层。
+     */
+    @JvmStatic
+    var surfaceSeq: Int = 0
+
     /** :game -> 主进程 回信通道（MSG_INIT replyTo）。 */
     val messenger = Messenger(object : Handler(Looper.getMainLooper()) {
         override fun handleMessage(msg: Message) {

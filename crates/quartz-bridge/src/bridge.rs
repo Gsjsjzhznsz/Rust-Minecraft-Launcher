@@ -551,6 +551,11 @@ pub mod egl {
         pub format: std::cell::Cell<i32>,
         pub native_surface: std::cell::Cell<*mut ANativeWindow>,
         pub new_native_surface: std::cell::Cell<*mut ANativeWindow>,
+        /// v0.2.14：当前 EGLSurface 是否为 1x1 pbuffer 兑底。
+        /// pbuffer 期间 eglSwapBuffers 必须跳过——MC 依旧全速渲染 2460x1080 场景，
+        /// 对 pbuffer swap 在 MobileGlues/GL 转译层行为不可控（实机 launch-1795694032
+        /// 原生崩溃点），改为丢帧输出，新 Surface 到来后自动恢复真窗口。
+        pub is_pbuffer: std::cell::Cell<bool>,
     }
 
     unsafe impl Send for RenderWindow {}
@@ -1104,6 +1109,7 @@ pub extern "C" fn pojav_create_context(share: *mut c_void) -> *mut c_void {
             format: std::cell::Cell::new(format),
             native_surface: std::cell::Cell::new(ptr::null_mut()),
             new_native_surface: std::cell::Cell::new(ptr::null_mut()),
+            is_pbuffer: std::cell::Cell::new(false),
         });
         let handle = Arc::as_ptr(&bundle) as usize;
         s.windows.lock().unwrap().insert(handle, bundle);
@@ -1145,6 +1151,7 @@ unsafe fn gl_swap_surface(bundle: &Arc<RenderWindow>, display: egl::EGLDisplay, 
     if !new_native.is_null() {
         bundle.new_native_surface.set(ptr::null_mut());
         bundle.native_surface.set(new_native);
+        bundle.is_pbuffer.set(false);
         ANativeWindow_acquire(new_native);
         ANativeWindow_setBuffersGeometry(new_native, 0, 0, bundle.format.get());
         let surface = (api.create_window_surface.unwrap())(
@@ -1159,13 +1166,14 @@ unsafe fn gl_swap_surface(bundle: &Arc<RenderWindow>, display: egl::EGLDisplay, 
             log(&format!("eglCreateWindowSurface 失败：{err:#06x}"));
         }
     } else {
-        log("无新 Surface，切 1x1 pbuffer 兜底");
+        log("无新 Surface，切 1x1 pbuffer 兜底（丢帧输出，等新 Surface 自动恢复）");
         let pbuf_attrs = [egl::EGL_WIDTH, 1, egl::EGL_HEIGHT, 1, egl::EGL_NONE];
         bundle.surface.set((api.create_pbuffer_surface.unwrap())(
             display,
             bundle.config.get(),
             pbuf_attrs.as_ptr(),
         ));
+        bundle.is_pbuffer.set(true);
     }
 }
 
@@ -1250,6 +1258,8 @@ pub extern "C" fn pojav_swap_buffers(_window: *mut c_void) {
         let Some(bundle) = state().windows.lock().unwrap().get(&handle).cloned() else {
             return;
         };
+        // v0.2.14：先处理 NEW_WINDOW 换绑（pbuffer 期间新 Surface 到来时在此恢复），
+        // 再对 pbuffer 兜底丢帧（防 MobileGlues 对 pbuffer swap 的原生崩溃）。
         if bundle.state.get() == egl::STATE_NEW_WINDOW {
             (api.make_current.unwrap())(
                 display,
@@ -1265,6 +1275,10 @@ pub extern "C" fn pojav_swap_buffers(_window: *mut c_void) {
                 bundle.context.get(),
             );
             bundle.state.set(egl::STATE_ALIVE);
+        }
+        // pbuffer 兜底：丢帧输出，不调 eglSwapBuffers。
+        if bundle.is_pbuffer.get() {
+            return;
         }
         if !bundle.surface.get().is_null()
             && (api.swap_buffers.unwrap())(display, bundle.surface.get()) == 0
@@ -2321,6 +2335,15 @@ pub unsafe extern "C" fn quartz_bridge_setup_surface(env: EnvPtr, surface: jobje
 }
 
 /// Surface 销毁：释放 ANativeWindow（渲染线程下一帧回退 pbuffer）。
+///
+/// v0.2.14 崩溃修复（实机 launch-1795694032）：此前只释放全局 ANativeWindow
+/// 引用，主窗口 bundle 的 EGLSurface 依然绑定在该已释放窗口上 —— MC 渲染线程
+/// 下一帧对死 EGLSurface 调 eglSwapBuffers（驱动层 use-after-free，Mali 实机
+/// SIGSEGV），或触发 BAD_SURFACE 兜底链后在 pbuffer/无 context 下继续渲染直至
+/// 崩溃。现改为：仅标记主窗口 STATE_NEW_WINDOW 并清空待换 Surface，让渲染线程
+/// 下一帧在自身 EGL 锁内安全走 gl_swap_surface（销毁死 EGLSurface / 释放引用 /
+/// 切 pbuffer 兜底丢帧），新 Surface 到来后自动换绑恢复 —— 全程不对已销毁窗口
+/// 做任何 EGL 调用。
 #[no_mangle]
 pub unsafe extern "C" fn quartz_bridge_release_surface() {
     guard!({
@@ -2328,7 +2351,15 @@ pub unsafe extern "C" fn quartz_bridge_release_surface() {
         let old = s.window.swap(ptr::null_mut(), Ordering::AcqRel);
         if !old.is_null() {
             ANativeWindow_release(old);
-            log("releaseSurface：窗口已释放（主进程 surfaceDestroyed）");
+            let main_handle = *s.main_window.lock().unwrap();
+            if let Some(handle) = main_handle {
+                if let Some(bundle) = s.windows.lock().unwrap().get(&handle).cloned() {
+                    bundle.new_native_surface.set(ptr::null_mut());
+                    bundle.is_pbuffer.set(false);
+                    bundle.state.set(egl::STATE_NEW_WINDOW);
+                }
+            }
+            log("releaseSurface：窗口已释放（主进程 surfaceDestroyed），等新 Surface 换绑");
         }
     });
 }

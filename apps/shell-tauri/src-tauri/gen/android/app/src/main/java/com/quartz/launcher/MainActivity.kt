@@ -71,6 +71,8 @@ class MainActivity : TauriActivity() {
       val act = instance ?: return
       act.runOnUiThread {
         act.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+        // v0.2.14：游戏会话标记（跨 Activity 重建存活，供重建恢复判断）。
+        GameHost.gameActive = true
         act.showGameSurface()
       }
     }
@@ -80,6 +82,9 @@ class MainActivity : TauriActivity() {
     fun hideGameSurfaceStatic() {
       val act = instance ?: return
       act.runOnUiThread {
+        // v0.2.14：清除游戏会话标记 + 代次递增使未决恢复计时器失效。
+        GameHost.gameActive = false
+        GameHost.surfaceSeq++
         act.hideGameSurface()
         act.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
       }
@@ -183,6 +188,17 @@ class MainActivity : TauriActivity() {
   override fun onWindowFocusChanged(hasFocus: Boolean) {
     super.onWindowFocusChanged(hasFocus)
     if (!hasFocus) return
+    // v0.2.14：游戏会话进行中但游戏层缺失（Activity 曾因 ROM 密度/配置抖动重建）
+    // —— 自动恢复游戏层并重锁横屏，否则 :game 永久丢 Surface（实机
+    // launch-1795694032：surfaceDestroyed 后无新 Surface -> 原生崩溃）。
+    if (GameHost.gameActive && gameView == null) {
+      (applicationContext as? QuartzApp)?.appendMarker(
+        "UI-GAME-SURFACE",
+        "游戏会话进行中但游戏层缺失（Activity 重建后），已自动恢复游戏层"
+      )
+      requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+      showGameSurface()
+    }
     if (gameView != null) {
       ensureGameLandscape("onWindowFocusChanged")
       enterGameImmersive()
@@ -361,6 +377,52 @@ class MainActivity : TauriActivity() {
   /** 游戏鼠标 grab 状态变化（QuartzBridge 经静态方法回调）。 */
   fun onGrabStateChanged(grabbed: Boolean) {
     gameControls?.setGrabbed(grabbed)
+  }
+
+  // ------------------------------------------------------------------
+  // v0.2.14：Surface 丢失自恢复（实机 launch-1795694032 崩溃链的壳层侧修复）
+  // ------------------------------------------------------------------
+
+  /**
+   * surfaceDestroyed 后启动恢复计时（2.5s）：
+   * - 期间 GameView.surfaceCreated 递增 GameHost.surfaceSeq -> 代次不匹配，自动取消；
+   * - 到期仍无新 Surface 且游戏会话进行中 -> 强制重挂 GameView 触发新 Surface，
+   *   :game 经 setupSurface/NEW_WINDOW 换绑恢复画面（配合桥侧 v0.2.14 修复不再崩溃）。
+   */
+  fun scheduleSurfaceRestore(seq: Int) {
+    val content = findViewById<ViewGroup>(android.R.id.content) ?: return
+    content.postDelayed({
+      if (GameHost.gameActive && gameView != null && GameHost.surfaceSeq == seq) {
+        (applicationContext as? QuartzApp)?.appendMarker(
+          "UI-SURFACE-RESTORE",
+          "surfaceDestroyed 后 2.5s 未收到新 Surface（seq=$seq），强制重挂游戏层"
+        )
+        restoreGameView()
+      }
+    }, 2500)
+  }
+
+  /** 重挂同一 GameView 实例（SurfaceView re-attach 必触发 surfaceCreated/Changed）。 */
+  private fun restoreGameView() {
+    try {
+      val gv = gameView ?: return
+      val content = findViewById<ViewGroup>(android.R.id.content) ?: return
+      content.removeView(gv)
+      // index 0：游戏层保持在最底层（控件层/光标层在上方不被盖住）
+      content.addView(
+        gv,
+        0,
+        FrameLayout.LayoutParams(
+          ViewGroup.LayoutParams.MATCH_PARENT,
+          ViewGroup.LayoutParams.MATCH_PARENT
+        )
+      )
+    } catch (t: Throwable) {
+      (applicationContext as? QuartzApp)?.appendMarker(
+        "UI-SURFACE-RESTORE",
+        "游戏层重挂失败：${t.message}\n" + t.stackTraceToString().take(1000)
+      )
+    }
   }
 
   // ------------------------------------------------------------------

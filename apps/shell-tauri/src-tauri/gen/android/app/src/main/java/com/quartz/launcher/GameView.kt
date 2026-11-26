@@ -64,6 +64,8 @@ class GameView(context: Context) : SurfaceView(context, null, 0), SurfaceHolder.
     }
 
     override fun surfaceCreated(holder: SurfaceHolder) {
+        // v0.2.14：代次递增（取消未决的 surface 恢复计时）+ 交接新 Surface
+        GameHost.surfaceSeq++
         val surface: Surface = holder.surface
         GameIpc.sendSurface(surface)
     }
@@ -80,6 +82,12 @@ class GameView(context: Context) : SurfaceView(context, null, 0), SurfaceHolder.
 
     override fun surfaceDestroyed(holder: SurfaceHolder) {
         GameIpc.releaseSurface()
+        // v0.2.14：游戏会话进行中丶Surface 被壳层销毁（Activity 重建/ROM 布局抖动）
+        // —— 2.5s 内无新 Surface 则由 MainActivity 强制重挂游戏层，
+        // :game 侧（v0.2.14 桥修复）会安全切 pbuffer 丢帧等待换绑，不再崩溃。
+        if (GameHost.gameActive) {
+            (context as? MainActivity)?.scheduleSurfaceRestore(GameHost.surfaceSeq)
+        }
     }
 
     /** 重置虚拟光标（窗口尺寸变化后由 Activity 调用）。 */
