@@ -238,6 +238,11 @@ pub fn ensure_zink_cutils_shim() -> Result<(), String> {
 /// zink 的 Vulkan 设备探针结果（预检失败信息引用，1.4.5 段写入）。
 static VULKAN_PROBE_REPORT: OnceLock<String> = OnceLock::new();
 
+/// v0.2.15：Vulkan 探针全败时置位（值为原因串）—— EGL 预检对 zink
+/// fail-fast。Mesa 内部 dlopen libvulkan + vkCreateInstance 与探针完全
+/// 同路径，loader 在本进程的 SIGSEGV 不会因为换个调用者而消失。
+static ZINK_SKIP_PRECHECK: OnceLock<String> = OnceLock::new();
+
 /// Vulkan 探针用 FFI 最小集。语义与 zink 对 VULKAN_PTR 句柄的消费完全同构
 /// （LXK-98/zalith-voxy 对 amethyst mesa-fork 的补丁：zink 从句柄只取
 /// vkGetInstanceProcAddr，其余函数经 gpa(NULL/instance, ...) 逐级解析）。
@@ -423,6 +428,118 @@ fn capture_mesa_logcat() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// fork 隔离探针（v0.2.15，v0.2.14 事故复盘的核心防线）
+// ---------------------------------------------------------------------------
+
+/// fork 隔离执行 `body`（**只在子进程**运行），子进程把返回串写入管道后
+/// `_exit(0)`（不走 atexit、绝不返回 JVM/线程上下文）。父进程轮询
+/// waitpid，超时 SIGKILL。
+///
+/// 设计动机：vkCreateInstance 在 :game 进程的系统 loader 里存在实测
+/// SIGSEGV（v0.2.14 事故：探针裸跑 quartz-game-run 主线程，loader
+/// CreateInstance 空指针把整个游戏进程带走，回退链全灭）。任何探针/预检
+/// 都不允许再裸跑在游戏进程线程上 —— 崩溃只允许带走 fork 出的子进程。
+///
+/// 返回 Ok(子进程报告串) / Err(隔离终止原因)；子进程被信号终止时错误串
+/// 带信号号（SIGSEGV=11），可直接进游戏日志作设备层死因。
+unsafe fn fork_isolated_probe<F>(timeout_ms: u64, body: F) -> Result<String, String>
+where
+    F: FnOnce() -> String,
+{
+    let mut fds: [c_int; 2] = [0, 0];
+    if libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) != 0 {
+        return Err("stage=pipe2:创建管道失败".into());
+    }
+    let pid = libc::fork();
+    if pid < 0 {
+        libc::close(fds[0]);
+        libc::close(fds[1]);
+        return Err("stage=fork:创建隔离子进程失败".into());
+    }
+    if pid == 0 {
+        // ---- 子进程：只跑 body + 写管道 + _exit，不触碰 JVM/线程状态 ----
+        libc::close(fds[0]);
+        let payload = body();
+        let bytes = payload.as_bytes();
+        let mut buf = Vec::with_capacity(4 + bytes.len());
+        buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+        buf.extend_from_slice(bytes);
+        // 非阻塞管道容量 64K，报告串远小于此，循环写至完整落盘
+        let mut off = 0usize;
+        while off < buf.len() {
+            let n = libc::write(fds[1], buf[off..].as_ptr().cast(), buf.len() - off);
+            if n <= 0 {
+                break;
+            }
+            off += n as usize;
+        }
+        libc::close(fds[1]);
+        libc::_exit(0);
+    }
+    // ---- 父进程（游戏进程本体）：轮询 + 超时击杀 + 收包 ----
+    libc::close(fds[1]);
+    let started = std::time::Instant::now();
+    let mut acc: Vec<u8> = Vec::new();
+    let mut status: c_int = 0;
+    let mut chunk = [0u8; 4096];
+    loop {
+        loop {
+            let n = libc::read(fds[0], chunk.as_mut_ptr().cast(), chunk.len());
+            if n > 0 {
+                acc.extend_from_slice(&chunk[..n as usize]);
+            } else {
+                break; // 0=暂无新数据（O_NONBLOCK）/ 负数=错误
+            }
+        }
+        let w = libc::waitpid(pid, &mut status, libc::WNOHANG);
+        if w == pid {
+            break;
+        }
+        if w < 0 {
+            libc::close(fds[0]);
+            return Err("stage=waitpid:状态回收失败".into());
+        }
+        if started.elapsed().as_millis() as u64 >= timeout_ms {
+            libc::kill(pid, libc::SIGKILL);
+            let _ = libc::waitpid(pid, &mut status, 0);
+            libc::close(fds[0]);
+            return Err(format!(
+                "stage=probe-timeout:{timeout_ms}ms 无响应，隔离子进程已终止"
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(15));
+    }
+    // 子进程已退出：排空管道残余（写端已随退出关闭，读到 EOF 为止）
+    loop {
+        let n = libc::read(fds[0], chunk.as_mut_ptr().cast(), chunk.len());
+        if n <= 0 {
+            break;
+        }
+        acc.extend_from_slice(&chunk[..n as usize]);
+    }
+    libc::close(fds[0]);
+    // 解包：4 字节 LE 长度前缀 + 报告串
+    if acc.len() >= 4 {
+        let n = u32::from_le_bytes(acc[0..4].try_into().unwrap_or([0; 4])) as usize;
+        if n > 0 && acc.len() >= 4 + n {
+            if let Ok(s) = String::from_utf8(acc[4..4 + n].to_vec()) {
+                return Ok(s);
+            }
+        }
+    }
+    if libc::WIFSIGNALED(status) {
+        return Err(format!(
+            "stage=child-signal:隔离子进程被信号 {} 终止（SIGSEGV=11 → 该 Vulkan 路径在本进程不可用，已隔离）",
+            libc::WTERMSIG(status)
+        ));
+    }
+    Err(format!(
+        "stage=child-exit:隔离子进程无报告退出（rc={}）",
+        libc::WEXITSTATUS(status)
+    ))
+}
+
 /// 渲染层 EGL 预检（v0.2.7）：预载完成后立刻按桥接层同款语义 dlopen 渲染层
 /// EGL 实现 + eglGetDisplay(EGL_DEFAULT_DISPLAY) + eglInitialize 一次。
 ///
@@ -435,6 +552,18 @@ fn capture_mesa_logcat() {
 /// 渲染层（见 fallback_renderer_after_exit）。预检与后续 load_api 的二次
 /// dlopen/eglInitialize 幂等（句柄复用，EGL 对已初始化 display 返回 TRUE）。
 fn probe_renderer_egl(id: &str) -> Result<(), String> {
+    // v0.2.15：Vulkan 探针全败时 zink fail-fast —— Mesa EGL 内部同样会
+    // dlopen libvulkan + vkCreateInstance（与探针完全同路径），loader 在
+    // 本进程的 SIGSEGV 不会因为换个调用者而消失，不能再赌（v0.2.14
+    // 教训：那次赌输的代价是整个游戏进程）。
+    if id == "zink" {
+        if let Some(reason) = ZINK_SKIP_PRECHECK.get() {
+            let msg = format!("QUARTZ_RENDERER_EGL_FAIL:renderer=zink:vulkan-unavailable:{reason}");
+            eprintln!("[quartz] 渲染层 EGL 预检失败：{msg}");
+            return Err(msg);
+        }
+    }
+
     // v0.2.9 诊断环境：Mesa 的失败原因行（驱动加载/设备创建）输出到 stderr，
     // 经游戏日志直读根因。仅 zink 注入（其他渲染层无 Mesa 诊断路径）。
     if id == "zink" {
@@ -1778,76 +1907,138 @@ unsafe fn run_game_from_spec(
         }
     }
 
-    // 1.4.5) zink：Vulkan 设备就绪探针 + VULKAN_PTR 落位（v0.2.13）。
-    // 机制（amethyst mesa-fork 23.0 的 VULKAN_PTR 补丁 + FCL egl_bridge
+    // 1.4.5) zink：Vulkan 设备就绪探针 + VULKAN_PTR 落位（v0.2.15 安全重写）。
+    // 机制（amethyst mesa-fork 的 VULKAN_PTR 补丁 + FCL egl_bridge
     // load_vulkan 同款）：fork 的 zink 从 VULKAN_PTR 读十六进制句柄，只取
-    // vkGetInstanceProcAddr 驱动 Vulkan；未设则 dlopen("libvulkan.so")。
-    // v0.2.12 只做了 dlopen 仍 0x3001 —— 实机差异：FCL/ZL2 在 zygote 应用
-    // 进程里跑，系统 loader 的 ICD 发现（sphal 命名空间 vulkan.<soc>.so）
-    // 可用；:game 是 exec 出的 app-data JVM 进程，该路径可能落空 → zink
-    // 建不了 screen → surfaceless 回退 kms_swrast（无 DRM）→ 0x3001。
-    // 故 v0.2.13 先探针再落句柄（FCL nsbypass 的轻量等价物）：
-    //   a) 探针 1：系统 loader 句柄 vkCreateInstance + 设备枚举；
-    //   b) 失败 → 探针 2：/vendor|/odm /lib64/hw/vulkan.*.so ICD 直连；
-    //   c) 任一通过 → VULKAN_PTR 落该句柄；全败 → 仍落 loader 句柄（保留
-    //      zink 机会），探针报告进 VULKAN_PROBE_REPORT 供预检失败信息引用。
+    // vkGetInstanceProcAddr 驱动 Vulkan；未设则自行 dlopen("libvulkan.so")。
+    //
+    // v0.2.14 事故复盘：探针裸跑在 quartz-game-run 主线程，:game 进程系统
+    // loader 的 vkCreateInstance 实测 SIGSEGV（libvulkan CreateInstance
+    // 空指针）→ 整个游戏进程死亡，回退链全灭。v0.2.15 三条铁律：
+    //   ① 所有探针 fork 隔离 —— 崩溃只带走 fork 出的子进程，游戏进程
+    //      必然存活（fork_isolated_probe）。
+    //   ② ICD 直连优先（FCL nsbypass 等价路径）：/vendor|/odm|/system
+    //      lib64/hw/vulkan.*.so 逐候选隔离探测，胜出候选由父进程补
+    //      dlopen 落 VULKAN_PTR（子进程句柄不跨 fork 有效，必须父进程
+    //      自己持有同一份映射）。
+    //   ③ 系统 loader 仅作兑底，且必须在隔离子进程内验证
+    //      vkCreateInstance 可用后才落句柄 —— v0.2.14 的「全败仍落
+    //      loader 保留 zink 机会」已删除：loader 探针崩溃本身就证明把
+    //      loader 交给 zink 必崩，那次赌输就是事故死因。
+    //   ④ 全败 → 不设 VULKAN_PTR + ZINK_SKIP_PRECHECK 落位：EGL 预检对
+    //      zink fail-fast（Mesa 内部 dlopen libvulkan 的路径与探针同源，
+    //      同样会崩），干净回退 MobileGlues。
     if active_renderer == "zink" {
         let loader = CString::new("libvulkan.so").unwrap();
         let vh = dlopen(loader.as_ptr(), RTLD_LAZY | RTLD_LOCAL);
-        let mut chosen: Option<(*mut c_void, String)> = None;
-        if !vh.is_null() {
-            match probe_vulkan_devices(vh) {
-                Ok(r) => chosen = Some((vh, format!("loader {r}"))),
-                Err(e) => eprintln!(
-                    "[quartz] zink：系统 loader 设备探针失败（{e}）——尝试厂商 ICD 直连（FCL nsbypass 等价替代）"
-                ),
-            }
-        } else {
-            let err = last_dlerror();
-            eprintln!("[quartz] zink：libvulkan.so 预载失败：{err}（设备发现将受限，可能 0x3001）");
-        }
-        if chosen.is_none() {
-            for icd in vendor_icd_candidates() {
-                let Some(s) = icd.to_str() else {
-                    continue;
+        let mut chosen: Option<(String, String)> = None; // (候选描述, 设备报告)
+        let mut notes: Vec<String> = Vec::new();
+
+        // ② 厂商 ICD 直连（每候选一个隔离子进程：候选 N 崩溃不影响 N+1）
+        for icd in vendor_icd_candidates() {
+            let desc = icd.display().to_string();
+            let payload = fork_isolated_probe(4000, move || {
+                let Ok(cs) = CString::new(icd.to_string_lossy().into_owned()) else {
+                    return "ERR|stage=cstring".to_string();
                 };
-                let Ok(cs) = CString::new(s.to_owned()) else {
-                    continue;
-                };
-                let h = dlopen(cs.as_ptr(), RTLD_LAZY | RTLD_LOCAL);
-                if h.is_null() {
-                    let err = last_dlerror();
-                    eprintln!("[quartz] zink：ICD 直连 {s} 失败：{err}");
-                    continue;
-                }
-                match probe_vulkan_devices(h) {
-                    Ok(r) => {
-                        chosen = Some((h, format!("icd {s} {r}")));
-                        break;
+                unsafe {
+                    let h = dlopen(cs.as_ptr(), RTLD_LAZY | RTLD_LOCAL);
+                    if h.is_null() {
+                        let err = last_dlerror();
+                        return format!("ERR|stage=dlopen:{err}");
                     }
-                    Err(e) => eprintln!("[quartz] zink：ICD {s} 探针失败（{e}）"),
+                    match probe_vulkan_devices(h) {
+                        Ok(r) => format!("OK|{r}"),
+                        Err(e) => format!("ERR|{e}"),
+                    }
+                }
+            });
+            match payload {
+                Ok(p) if p.starts_with("OK|") => {
+                    chosen = Some((desc.clone(), p.trim_start_matches("OK|").to_string()));
+                    break;
+                }
+                Ok(p) => notes.push(format!(
+                    "ICD {desc}（{}）",
+                    p.trim_start_matches("ERR|").trim_start_matches('|')
+                )),
+                Err(e) => notes.push(format!("ICD {desc}：{e}")),
+            }
+        }
+
+        // ③ 系统 loader 兑底（句柄继承进子进程，子进程内验证后才可用）
+        if chosen.is_none() {
+            if vh.is_null() {
+                notes.push("libvulkan.so 预载失败".to_string());
+            } else {
+                let payload = fork_isolated_probe(4000, move || unsafe {
+                    match probe_vulkan_devices(vh) {
+                        Ok(r) => format!("OK|{r}"),
+                        Err(e) => format!("ERR|{e}"),
+                    }
+                });
+                match payload {
+                    Ok(p) if p.starts_with("OK|") => {
+                        chosen = Some((
+                            "loader".to_string(),
+                            p.trim_start_matches("OK|").to_string(),
+                        ));
+                    }
+                    Ok(p) => notes.push(format!(
+                        "系统 loader（{}）—— loader 路径在本进程不可用，不交给 zink",
+                        p.trim_start_matches("ERR|").trim_start_matches('|')
+                    )),
+                    Err(e) => notes.push(format!("系统 loader：{e}（不交给 zink）")),
                 }
             }
         }
-        let report = match chosen {
-            Some((h, why)) => {
-                std::env::set_var("VULKAN_PTR", format!("{:x}", h as usize));
-                eprintln!("[quartz] zink：VULKAN_PTR=0x{:x}（{}）", h as usize, why);
-                format!("QUARTZ_VK_PROBE:OK:{why}")
+
+        // 落句柄 + 报告：胜出候选由父进程持有；全败则 fail-fast 交回退链
+        let mut skip_reason: Option<String> = None;
+        let report: String;
+        match &chosen {
+            Some((desc, r)) if desc == "loader" => {
+                std::env::set_var("VULKAN_PTR", format!("{:x}", vh as usize));
+                eprintln!("[quartz] zink：VULKAN_PTR=系统 loader（{r}）");
+                report = format!("QUARTZ_VK_PROBE:OK:loader {r}");
+            }
+            Some((desc, r)) => {
+                match CString::new(desc.clone())
+                    .map(|cs| dlopen(cs.as_ptr(), RTLD_LAZY | RTLD_LOCAL))
+                    .ok()
+                {
+                    Some(h) if !h.is_null() => {
+                        std::env::set_var("VULKAN_PTR", format!("{:x}", h as usize));
+                        eprintln!("[quartz] zink：VULKAN_PTR=ICD 直连 {desc}（{r}）");
+                        report = format!("QUARTZ_VK_PROBE:OK:icd {desc} {r}");
+                    }
+                    _ => {
+                        eprintln!(
+                            "[quartz] zink：父进程补 dlopen {desc} 失败（{}）—— 按全败处理",
+                            last_dlerror()
+                        );
+                        skip_reason = Some("父进程 Vulkan 句柄落位失败".to_string());
+                        report = "QUARTZ_VK_PROBE:FAIL:父进程 Vulkan 句柄落位失败".to_string();
+                    }
+                }
             }
             None => {
-                if !vh.is_null() {
-                    std::env::set_var("VULKAN_PTR", format!("{:x}", vh as usize));
-                    eprintln!(
-                        "[quartz] zink：探针全败，仍落 loader 句柄 VULKAN_PTR=0x{:x}（保留 zink 机会；预检失败信息将携带完整报告）",
-                        vh as usize
-                    );
-                }
-                "QUARTZ_VK_PROBE:FAIL:无可用 Vulkan 设备（loader 与 ICD 直连探针均失败）"
-                    .to_string()
+                let joined = notes.join("；");
+                skip_reason = Some(joined.clone());
+                report = format!(
+                    "QUARTZ_VK_PROBE:FAIL:无可用 Vulkan 设备（ICD 直连与 loader 探针在隔离子进程内均失败：{joined}）"
+                );
             }
-        };
+        }
         let _ = VULKAN_PROBE_REPORT.set(report);
+        if let Some(reason) = skip_reason {
+            let _ = ZINK_SKIP_PRECHECK.set(reason);
+            std::env::remove_var("VULKAN_PTR");
+            eprintln!(
+                "[quartz] zink：设备 Vulkan 路径不可用（{}）—— EGL 预检将 fail-fast，干净回退",
+                ZINK_SKIP_PRECHECK.get().map(String::as_str).unwrap_or("")
+            );
+        }
     }
 
     // 1.5) 渲染层依赖预载（链接器命名空间按名解析 DT_NEEDED 时不搜索应用
@@ -1915,8 +2106,32 @@ unsafe fn run_game_from_spec(
         let mesa_cache = crate::paths::game_root().join(".cache").join("mesa");
         let _ = std::fs::create_dir_all(&mesa_cache);
         std::env::set_var("MESA_GLSL_CACHE_DIR", &mesa_cache);
+        // v0.2.15：诊断环境提前到父进程（预检 fork 后只在子进程跑，
+        // 但后续真实渲染初始化仍需要这些 env 才能把 Mesa 诊断打进日志）。
+        std::env::set_var("MESA_DEBUG", "1");
+        std::env::set_var("LIBGL_DEBUG", "verbose");
     }
-    if let Err(e) = probe_renderer_egl(&active_renderer) {
+    if active_renderer == "zink" && ZINK_SKIP_PRECHECK.get().is_none() {
+        // v0.2.15：zink 预检 fork 隔离（事故纵深防御）—— 即便 VULKAN_PTR
+        // 手持子进程验证过的句柄，Mesa EGL 初始化仍可能走进未知崩溃路径
+        // （驱动里没跑过的分支）。崩在子进程，父进程合成同款
+        // QUARTZ_RENDERER_EGL_FAIL 交回退链；子进程 stderr 与其
+        // mesa-logcat 采集照常落游戏日志（fd 继承）。
+        match fork_isolated_probe(8000, || match probe_renderer_egl("zink") {
+            Ok(()) => "OK|".to_string(),
+            Err(e) => format!("ERR|{e}"),
+        }) {
+            Ok(p) if p.starts_with("OK|") => {}
+            Ok(p) => {
+                return Err(p.strip_prefix("ERR|").unwrap_or(&p).to_string());
+            }
+            Err(e) => {
+                return Err(format!(
+                    "QUARTZ_RENDERER_EGL_FAIL:renderer=zink:预检子进程异常终止（{e}）—— 已隔离，交回退链"
+                ));
+            }
+        }
+    } else if let Err(e) = probe_renderer_egl(&active_renderer) {
         return Err(e);
     }
 
