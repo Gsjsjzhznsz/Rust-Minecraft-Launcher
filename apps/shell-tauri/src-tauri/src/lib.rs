@@ -29,7 +29,10 @@
 
 use quartz_core::instance::DownloadProgress;
 use quartz_core::renderbus::{self, DeviceCaps};
-use quartz_core::{auth, content, host_arch, instance, jvmops, lwjgl, meta, modkit, model, paths, platform, renderers, rules, runtime, settings, RuntimeCtx};
+use quartz_core::{
+    auth, content, host_arch, instance, jvmops, lwjgl, meta, model, modkit, paths, platform,
+    renderers, rules, runtime, settings, RuntimeCtx,
+};
 use serde::Serialize;
 use serde_json::json;
 use std::path::{Path, PathBuf};
@@ -58,9 +61,7 @@ pub struct AppState {
 // ---------------------------------------------------------------------------
 
 #[cfg(target_os = "android")]
-fn with_jni<T>(
-    f: impl FnOnce(&mut jni::JNIEnv, &jni::objects::JObject) -> Option<T>,
-) -> Option<T> {
+fn with_jni<T>(f: impl FnOnce(&mut jni::JNIEnv, &jni::objects::JObject) -> Option<T>) -> Option<T> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let ctx = ndk_context::android_context();
         let vm = unsafe { jni::JavaVM::from_raw(ctx.vm().cast()) }.ok()?;
@@ -100,7 +101,10 @@ fn jni_file_path(env: &mut jni::JNIEnv, file: &jni::objects::JObject) -> Option<
 }
 
 #[cfg(target_os = "android")]
-fn jni_external_files_dir(env: &mut jni::JNIEnv, context: &jni::objects::JObject) -> Option<PathBuf> {
+fn jni_external_files_dir(
+    env: &mut jni::JNIEnv,
+    context: &jni::objects::JObject,
+) -> Option<PathBuf> {
     use jni::objects::JValue;
     let file = env
         .call_method(
@@ -119,7 +123,10 @@ fn jni_external_files_dir(env: &mut jni::JNIEnv, context: &jni::objects::JObject
 }
 
 #[cfg(target_os = "android")]
-fn jni_internal_files_dir(env: &mut jni::JNIEnv, context: &jni::objects::JObject) -> Option<PathBuf> {
+fn jni_internal_files_dir(
+    env: &mut jni::JNIEnv,
+    context: &jni::objects::JObject,
+) -> Option<PathBuf> {
     let file = env
         .call_method(context, "getFilesDir", "()Ljava/io/File;", &[])
         .ok()?
@@ -238,9 +245,7 @@ fn request_storage_permission() -> Result<bool, String> {
                 .ok()?
                 .l()
                 .ok()?;
-            let name = env
-                .new_string("com.quartz.launcher.MainActivity")
-                .ok()?;
+            let name = env.new_string("com.quartz.launcher.MainActivity").ok()?;
             let cls_obj = env
                 .call_method(
                     &loader,
@@ -260,7 +265,10 @@ fn request_storage_permission() -> Result<bool, String> {
             return Ok(true);
         }
         // 到这里说明 JNI 链路本身异常（with_jni 已清异常）；给用户明确的手动指引。
-        Err("无法唤起系统权限界面。请手动授予：系统设置 → 应用 → Quartz → 权限 → 所有文件访问权限".to_string())
+        Err(
+            "无法唤起系统权限界面。请手动授予：系统设置 → 应用 → Quartz → 权限 → 所有文件访问权限"
+                .to_string(),
+        )
     }
     #[cfg(not(target_os = "android"))]
     {
@@ -283,9 +291,7 @@ fn android_set_orientation(landscape: bool) {
             .ok()?
             .l()
             .ok()?;
-        let name = env
-            .new_string("com.quartz.launcher.MainActivity")
-            .ok()?;
+        let name = env.new_string("com.quartz.launcher.MainActivity").ok()?;
         let cls_obj = env
             .call_method(
                 &loader,
@@ -476,7 +482,11 @@ fn append_crash_marker(kind: &str, body: &str) {
         .unwrap_or(0);
     use std::io::Write as _;
     let text = format!("==== CRASH @{epoch} {kind} ====\n{body}\n");
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
         let _ = writeln!(f, "{text}");
         let _ = f.flush();
     }
@@ -488,7 +498,11 @@ fn append_crash_marker(kind: &str, body: &str) {
             if let Some(parent) = public.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
-            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(public) {
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(public)
+            {
                 let _ = writeln!(f, "{text}");
             }
         }
@@ -560,7 +574,11 @@ fn cleanup_stale_partials() {
                 };
                 if ok {
                     reclaimed += size;
-                    eprintln!("[quartz] 已清理残留下载缓存：{}（{} 字节）", p.display(), size);
+                    eprintln!(
+                        "[quartz] 已清理残留下载缓存：{}（{} 字节）",
+                        p.display(),
+                        size
+                    );
                 }
             }
         }
@@ -678,7 +696,9 @@ fn migrate_root(from: PathBuf, to: PathBuf, app: AppHandle) {
     let new_accounts = to.join("accounts.json");
     let migrate_accounts = old_accounts.exists() && !new_accounts.exists();
     if migrate_accounts {
-        let size = std::fs::metadata(&old_accounts).map(|m| m.len()).unwrap_or(0);
+        let size = std::fs::metadata(&old_accounts)
+            .map(|m| m.len())
+            .unwrap_or(0);
         plan.push((old_accounts, new_accounts, size));
     }
 
@@ -691,7 +711,11 @@ fn migrate_root(from: PathBuf, to: PathBuf, app: AppHandle) {
     }
 
     let total: u64 = plan.iter().map(|(_, _, s)| *s).sum::<u64>().max(1);
-    eprintln!("[quartz] 开始迁移存储：{} 个文件（{} 字节）", plan.len(), total);
+    eprintln!(
+        "[quartz] 开始迁移存储：{} 个文件（{} 字节）",
+        plan.len(),
+        total
+    );
     let mut copied: u64 = 0;
     let mut last = std::time::Instant::now() - std::time::Duration::from_secs(1);
     for (src, dst, size) in plan {
@@ -800,8 +824,11 @@ fn set_memory_mb(mb: u32) -> Result<(), String> {
     )
     .unwrap_or_else(|_| serde_json::json!({}));
     v["memoryMb"] = serde_json::json!(mb);
-    std::fs::write(&path, serde_json::to_string_pretty(&v).map_err(|e| e.to_string())?)
-        .map_err(|e| e.to_string())
+    std::fs::write(
+        &path,
+        serde_json::to_string_pretty(&v).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -912,7 +939,13 @@ fn ensure_assets_ready(version_id: &str, app: &AppHandle) -> Result<(), String> 
                     quartz_core::space::human_bytes(ev.total)
                 )
             };
-            let _ = app2.emit("launch://log", &LaunchLog { source: "quartz".into(), line });
+            let _ = app2.emit(
+                "launch://log",
+                &LaunchLog {
+                    source: "quartz".into(),
+                    line,
+                },
+            );
         }
     });
     let client = meta::http_client();
@@ -959,7 +992,11 @@ fn list_logs() -> Vec<LogEntry> {
                     .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                     .map(|d| d.as_millis() as u64)
                     .unwrap_or(0);
-                out.push(LogEntry { name, size, modified_ms });
+                out.push(LogEntry {
+                    name,
+                    size,
+                    modified_ms,
+                });
             }
         }
     }
@@ -1055,8 +1092,7 @@ fn renderer_advice(mc: String, caps: Option<serde_json::Value>) -> serde_json::V
 #[tauri::command]
 fn plan_offline(player: String, memory_mb: u32) -> Result<serde_json::Value, String> {
     let version: model::VersionJson =
-        serde_json::from_str(quartz_core::fixtures::VERSION_1_20_4)
-            .map_err(|e| e.to_string())?;
+        serde_json::from_str(quartz_core::fixtures::VERSION_1_20_4).map_err(|e| e.to_string())?;
     let ctx = RuntimeCtx::new("linux", host_arch());
     let allowed: Vec<&model::Library> = version
         .libraries
@@ -1077,7 +1113,11 @@ fn plan_offline(player: String, memory_mb: u32) -> Result<serde_json::Value, Str
         instance_dir: &paths::game_root().join("instances").join("demo"),
         account: &account,
         memory_mb,
-        java_major: version.java_version.as_ref().map(|j| j.major_version).unwrap_or(17),
+        java_major: version
+            .java_version
+            .as_ref()
+            .map(|j| j.major_version)
+            .unwrap_or(17),
         java_path: None,
         window: None,
         client_jar_path: None,
@@ -1121,7 +1161,10 @@ fn list_accounts() -> Result<Vec<AccountEntry>, String> {
         .into_iter()
         .map(|a| {
             let selected = store.selected.as_deref() == Some(a.uuid.as_str());
-            AccountEntry { account: a, selected }
+            AccountEntry {
+                account: a,
+                selected,
+            }
         })
         .collect())
 }
@@ -1304,7 +1347,11 @@ fn get_runtime_status(java_major: u32) -> serde_json::Value {
 
 /// 后台下载 JVM 运行时 pack，进度经 `runtime://progress` 上报（与下载游戏事件同构）。
 #[tauri::command]
-async fn download_runtime(java_major: u32, app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+async fn download_runtime(
+    java_major: u32,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
     if state
         .runtime_busy
         .swap(true, std::sync::atomic::Ordering::SeqCst)
@@ -1499,7 +1546,9 @@ fn parse_loader_spec(loader: &str, loader_version: &str) -> Result<instance::Loa
         "forge" => Ok(instance::LoaderSpec::Forge { version: lv }),
         "neoforge" => Ok(instance::LoaderSpec::NeoForge { version: lv }),
         "optifine" => Ok(instance::LoaderSpec::OptiFine { version: lv }),
-        _ => Err(format!("未知 loader 类型：{loader}（支持 fabric/quilt/forge/neoforge/optifine）")),
+        _ => Err(format!(
+            "未知 loader 类型：{loader}（支持 fabric/quilt/forge/neoforge/optifine）"
+        )),
     }
 }
 
@@ -1518,31 +1567,46 @@ async fn list_loader_versions(loader: String, mc: String) -> Result<Vec<LoaderEn
             .await
             .map_err(|e| format!("Fabric 版本列表拉取失败：{e}"))?
             .into_iter()
-            .map(|v| LoaderEntry { version: v.version, stable: v.stable })
+            .map(|v| LoaderEntry {
+                version: v.version,
+                stable: v.stable,
+            })
             .collect(),
         "quilt" => modkit::loaders::list_quilt_loaders(&mc)
             .await
             .map_err(|e| format!("Quilt 版本列表拉取失败：{e}"))?
             .into_iter()
-            .map(|v| LoaderEntry { version: v.version, stable: v.stable })
+            .map(|v| LoaderEntry {
+                version: v.version,
+                stable: v.stable,
+            })
             .collect(),
         "forge" => modkit::loaders::list_forge_versions(&mc)
             .await
             .map_err(|e| format!("Forge 版本列表拉取失败：{e}"))?
             .into_iter()
-            .map(|v| LoaderEntry { version: v, stable: true })
+            .map(|v| LoaderEntry {
+                version: v,
+                stable: true,
+            })
             .collect(),
         "neoforge" => modkit::loaders::list_neoforge_versions(&mc)
             .await
             .map_err(|e| format!("NeoForge 版本列表拉取失败：{e}"))?
             .into_iter()
-            .map(|v| LoaderEntry { version: v, stable: true })
+            .map(|v| LoaderEntry {
+                version: v,
+                stable: true,
+            })
             .collect(),
         "optifine" => modkit::loaders::list_optifine_versions(&mc)
             .await
             .map_err(|e| format!("OptiFine 版本列表拉取失败：{e}"))?
             .into_iter()
-            .map(|v| LoaderEntry { version: v.name.trim_start_matches("OptiFine ").to_string(), stable: true })
+            .map(|v| LoaderEntry {
+                version: v.name.trim_start_matches("OptiFine ").to_string(),
+                stable: true,
+            })
             .collect(),
         _ => return Err(format!("未知 loader 类型：{loader}")),
     };
@@ -1624,8 +1688,12 @@ fn list_instances() -> Result<Vec<serde_json::Value>, String> {
                 .loader
                 .as_ref()
                 .map(|l| match l {
-                    instance::LoaderSpec::Fabric { loader_version } => format!("Fabric {loader_version}"),
-                    instance::LoaderSpec::Quilt { loader_version } => format!("Quilt {loader_version}"),
+                    instance::LoaderSpec::Fabric { loader_version } => {
+                        format!("Fabric {loader_version}")
+                    }
+                    instance::LoaderSpec::Quilt { loader_version } => {
+                        format!("Quilt {loader_version}")
+                    }
                     instance::LoaderSpec::Forge { version } => format!("Forge {version}"),
                     instance::LoaderSpec::NeoForge { version } => format!("NeoForge {version}"),
                     instance::LoaderSpec::OptiFine { version } => format!("OptiFine {version}"),
@@ -1748,7 +1816,8 @@ fn ms_login(app: AppHandle) -> Result<(), String> {
         .unwrap_or_else(|| auth::microsoft::DEFAULT_CLIENT_ID.to_string());
     if client_id.is_empty() {
         return Err(
-            "未配置 Azure client_id：请在「设置」页填入项目自有 Public Client ID 后重试".to_string(),
+            "未配置 Azure client_id：请在「设置」页填入项目自有 Public Client ID 后重试"
+                .to_string(),
         );
     }
     let app = app.clone();
@@ -1810,7 +1879,9 @@ fn ms_login(app: AppHandle) -> Result<(), String> {
         }
         .await;
         let payload = match result {
-            Ok(account) => json!({ "ok": true, "account": account, "error": serde_json::Value::Null }),
+            Ok(account) => {
+                json!({ "ok": true, "account": account, "error": serde_json::Value::Null })
+            }
             Err(e) => json!({ "ok": false, "account": serde_json::Value::Null, "error": e }),
         };
         let _ = app.emit("ms://result", &payload);
@@ -1854,7 +1925,9 @@ async fn download_authlib(app: AppHandle) -> Result<(), String> {
         let result = auth::authlib::download_injector(&client).await;
         let payload = match &result {
             Ok(v) => json!({ "done": true, "version": v, "error": serde_json::Value::Null }),
-            Err(e) => json!({ "done": false, "version": serde_json::Value::Null, "error": e.to_string() }),
+            Err(e) => {
+                json!({ "done": false, "version": serde_json::Value::Null, "error": e.to_string() })
+            }
         };
         let _ = app.emit("authlib://progress", &payload);
     });
@@ -1899,9 +1972,24 @@ async fn import_mrpack(
         .dependencies
         .get("fabric-loader")
         .map(|v| ("fabric", v.clone()))
-        .or_else(|| index.dependencies.get("quilt-loader").map(|v| ("quilt", v.clone())))
-        .or_else(|| index.dependencies.get("forge").map(|v| ("forge", v.clone())))
-        .or_else(|| index.dependencies.get("neoforge").map(|v| ("neoforge", v.clone())));
+        .or_else(|| {
+            index
+                .dependencies
+                .get("quilt-loader")
+                .map(|v| ("quilt", v.clone()))
+        })
+        .or_else(|| {
+            index
+                .dependencies
+                .get("forge")
+                .map(|v| ("forge", v.clone()))
+        })
+        .or_else(|| {
+            index
+                .dependencies
+                .get("neoforge")
+                .map(|v| ("neoforge", v.clone()))
+        });
     let name = instance_name.unwrap_or_else(|| index.name.clone());
     let (spec, java_major) = match &loader_kind {
         Some((k, v)) => (
@@ -2002,10 +2090,9 @@ fn delete_content_cmd(
 
 /// 实例内容目录解析（None = 全局 .minecraft）。
 fn instance_dir_for(instance_id: &Option<String>) -> Option<std::path::PathBuf> {
-    instance_id.as_ref().map(|id| {
-        instances_store()
-            .instance_dir(id)
-    })
+    instance_id
+        .as_ref()
+        .map(|id| instances_store().instance_dir(id))
 }
 
 // ---- 设置 ----
@@ -2106,8 +2193,8 @@ fn build_plan_for(
     version_id: &str,
     instance_id: Option<&str>,
 ) -> Result<(model::VersionJson, jvmops::LaunchPlan, u32), String> {
-    let resolved = meta::resolve_version_chain(version_id)
-        .map_err(|e| format!("版本解析失败：{e}"))?;
+    let resolved =
+        meta::resolve_version_chain(version_id).map_err(|e| format!("版本解析失败：{e}"))?;
     let version = resolved.version;
     let jar_path = paths::versions_dir()
         .join(&resolved.jar_version)
@@ -2242,7 +2329,10 @@ fn spawn_game(
         move |source: &str, line: &str| {
             let _ = app.emit(
                 "launch://log",
-                &LaunchLog { source: source.into(), line: line.into() },
+                &LaunchLog {
+                    source: source.into(),
+                    line: line.into(),
+                },
             );
             if let Ok(mut guard) = log_file.lock() {
                 if let Some(f) = guard.as_mut() {
@@ -2263,11 +2353,7 @@ fn spawn_game(
         let id = renderers::active();
         let spec = renderers::spec_for(&id);
         if renderers::is_installed(&id) {
-            ld_parts.push(
-                renderers::install_dir(&id)
-                    .to_string_lossy()
-                    .into_owned(),
-            );
+            ld_parts.push(renderers::install_dir(&id).to_string_lossy().into_owned());
         }
         if lwjgl::is_installed() {
             ld_parts.push(lwjgl::natives_dir().to_string_lossy().into_owned());
@@ -2278,7 +2364,11 @@ fn spawn_game(
                 "[quartz] 渲染层：{}（{}）｜ LWJGL 安卓包：{}",
                 spec.map(|s| s.name).unwrap_or("未知"),
                 id,
-                if lwjgl::is_installed() { "已就绪" } else { "未安装" },
+                if lwjgl::is_installed() {
+                    "已就绪"
+                } else {
+                    "未安装"
+                },
             ),
         );
         id
@@ -2350,7 +2440,10 @@ fn spawn_game(
                     p.display()
                 ),
             ),
-            None => qlog("quartz", "[quartz] tagged-pointer 兼容层落盘失败（跳过注入）"),
+            None => qlog(
+                "quartz",
+                "[quartz] tagged-pointer 兼容层落盘失败（跳过注入）",
+            ),
         }
     }
 
@@ -2436,7 +2529,11 @@ fn spawn_game(
                 "JVM 自检失败（退出码 {}，LD_LIBRARY_PATH={}）：{}",
                 out.status.code().unwrap_or(-1),
                 ld_library_path,
-                if tail.is_empty() { "无输出（进程可能被信号杀死）" } else { &tail }
+                if tail.is_empty() {
+                    "无输出（进程可能被信号杀死）"
+                } else {
+                    &tail
+                }
             ));
         }
         Err(e) => {
@@ -2557,7 +2654,10 @@ fn spawn_game(
     if let Some(stdout) = child.stdout.take() {
         let qlog2 = qlog.clone();
         std::thread::spawn(move || {
-            for line in std::io::BufReader::new(stdout).lines().map_while(Result::ok) {
+            for line in std::io::BufReader::new(stdout)
+                .lines()
+                .map_while(Result::ok)
+            {
                 qlog2("stdout", &line);
             }
         });
@@ -2565,7 +2665,10 @@ fn spawn_game(
     if let Some(stderr) = child.stderr.take() {
         let qlog2 = qlog.clone();
         std::thread::spawn(move || {
-            for line in std::io::BufReader::new(stderr).lines().map_while(Result::ok) {
+            for line in std::io::BufReader::new(stderr)
+                .lines()
+                .map_while(Result::ok)
+            {
                 qlog2("stderr", &line);
             }
         });
@@ -2610,9 +2713,7 @@ fn spawn_game(
                     }
                 }
             }
-            if let Some((hp, _)) =
-                hs_errs.into_iter().max_by_key(|(_, t)| *t)
-            {
+            if let Some((hp, _)) = hs_errs.into_iter().max_by_key(|(_, t)| *t) {
                 qlog(
                     "quartz",
                     &format!("[quartz] 发现 JVM 崩溃报告：{}", hp.display()),
@@ -2743,7 +2844,10 @@ fn dump_crash_evidence(
             "renderers/active",
             renderers::install_dir(&renderers::active()),
         ),
-        ("jre lib/server", runtime::install_dir(17).join("lib/server")),
+        (
+            "jre lib/server",
+            runtime::install_dir(17).join("lib/server"),
+        ),
         ("game natives", paths::minecraft_dir().join("natives")),
     ];
     for (label, dir) in dirs {
@@ -2786,7 +2890,13 @@ fn ensure_lwjgl_pack(app: &AppHandle) -> Result<(), String> {
             } else {
                 format!("[quartz] LWJGL 下载 {}%", ev.percent as u32)
             };
-            let _ = app2.emit("launch://log", &LaunchLog { source: "quartz".into(), line });
+            let _ = app2.emit(
+                "launch://log",
+                &LaunchLog {
+                    source: "quartz".into(),
+                    line,
+                },
+            );
         }
     });
     let client = meta::http_client();
@@ -2824,7 +2934,13 @@ fn ensure_renderer(app: &AppHandle) -> Result<(), String> {
             } else {
                 format!("[quartz] 渲染层下载 {}%", ev.percent as u32)
             };
-            let _ = app2.emit("launch://log", &LaunchLog { source: "quartz".into(), line });
+            let _ = app2.emit(
+                "launch://log",
+                &LaunchLog {
+                    source: "quartz".into(),
+                    line,
+                },
+            );
         }
     });
     let client = meta::http_client();
@@ -2853,7 +2969,11 @@ fn launch_game(
         }
         #[cfg(not(target_os = "android"))]
         {
-            state.game_pid.lock().map_err(|_| "内部状态锁异常")?.is_some()
+            state
+                .game_pid
+                .lock()
+                .map_err(|_| "内部状态锁异常")?
+                .is_some()
         }
     };
     if running {
@@ -2898,8 +3018,14 @@ fn launch_game(
         if let Ok(mut guard) = log_file.lock() {
             if let Some(f) = guard.as_mut() {
                 use std::io::Write;
-                let _ = writeln!(f, "==== Quartz launch {version_id} (java {major}, :game process) ====");
-                let _ = writeln!(f, "mode: separate :game process JVM + quartz-bridge (Rust display bridge)");
+                let _ = writeln!(
+                    f,
+                    "==== Quartz launch {version_id} (java {major}, :game process) ===="
+                );
+                let _ = writeln!(
+                    f,
+                    "mode: separate :game process JVM + quartz-bridge (Rust display bridge)"
+                );
                 let _ = writeln!(f, "main_class: {}", plan.main_class);
                 let _ = writeln!(f, "---- jvm options ({} 个) ----", plan.jvm_args.len());
                 for a in &plan.jvm_args {
@@ -2916,7 +3042,9 @@ fn launch_game(
             "launch://log",
             &LaunchLog {
                 source: "quartz".into(),
-                line: format!("[quartz] 启动模式：:game 独立进程 JVM + Rust 显示桥（{version_id}）"),
+                line: format!(
+                    "[quartz] 启动模式：:game 独立进程 JVM + Rust 显示桥（{version_id}）"
+                ),
             },
         );
         game_bridge::launch_via_game_process(
@@ -2932,7 +3060,13 @@ fn launch_game(
 
     #[cfg(not(target_os = "android"))]
     {
-        spawn_game(version_id.clone(), plan, major, state.game_pid.clone(), app.clone())?;
+        spawn_game(
+            version_id.clone(),
+            plan,
+            major,
+            state.game_pid.clone(),
+            app.clone(),
+        )?;
         Ok(())
     }
 }
@@ -2955,11 +3089,7 @@ fn stop_game(state: State<'_, AppState>, app: AppHandle) -> Result<bool, String>
     #[cfg(not(target_os = "android"))]
     {
         let _ = &app;
-        let pid = state
-            .game_pid
-            .lock()
-            .map_err(|_| "内部状态锁异常")?
-            .take();
+        let pid = state.game_pid.lock().map_err(|_| "内部状态锁异常")?.take();
         match pid {
             Some(pid) => {
                 #[cfg(unix)]

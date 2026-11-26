@@ -25,20 +25,25 @@
 
 use crate::LaunchExit;
 use crate::LaunchLog;
-use tauri::Emitter;
 use jni_sys::{jboolean, jint, JNI_OK, JNI_VERSION_1_8};
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use tauri::Emitter;
 
 type EnvPtr = *mut jni_sys::JNIEnv;
 type VmPtr = *mut jni_sys::JavaVM;
 
 /// 桥 C ABI（dlopen + dlsym 后的函数指针表）。
 pub struct BridgeApi {
-    pub init: unsafe extern "C" fn(vm: VmPtr, class: jni_sys::jobject, m_grab: jni_sys::jmethodID, m_clip: jni_sys::jmethodID),
+    pub init: unsafe extern "C" fn(
+        vm: VmPtr,
+        class: jni_sys::jobject,
+        m_grab: jni_sys::jmethodID,
+        m_clip: jni_sys::jmethodID,
+    ),
     pub setup_surface: unsafe extern "C" fn(env: EnvPtr, surface: jni_sys::jobject) -> c_int,
     pub release_surface: unsafe extern "C" fn(),
     pub window_ready: unsafe extern "C" fn() -> c_int,
@@ -96,18 +101,50 @@ impl BridgeApi {
                 }};
             }
             Some(BridgeApi {
-                init: sym!("quartz_bridge_init", unsafe extern "C" fn(VmPtr, jni_sys::jobject, jni_sys::jmethodID, jni_sys::jmethodID)),
-                setup_surface: sym!("quartz_bridge_setup_surface", unsafe extern "C" fn(EnvPtr, jni_sys::jobject) -> c_int),
+                init: sym!(
+                    "quartz_bridge_init",
+                    unsafe extern "C" fn(
+                        VmPtr,
+                        jni_sys::jobject,
+                        jni_sys::jmethodID,
+                        jni_sys::jmethodID,
+                    )
+                ),
+                setup_surface: sym!(
+                    "quartz_bridge_setup_surface",
+                    unsafe extern "C" fn(EnvPtr, jni_sys::jobject) -> c_int
+                ),
                 release_surface: sym!("quartz_bridge_release_surface", unsafe extern "C" fn()),
-                window_ready: sym!("quartz_bridge_window_ready", unsafe extern "C" fn() -> c_int),
-                send_cursor_pos: sym!("quartz_bridge_send_cursor_pos", unsafe extern "C" fn(f32, f32)),
-                send_mouse_button: sym!("quartz_bridge_send_mouse_button", unsafe extern "C" fn(c_int, c_int, c_int)),
-                send_key: sym!("quartz_bridge_send_key", unsafe extern "C" fn(c_int, c_int, c_int, c_int)),
-                send_char: sym!("quartz_bridge_send_char", unsafe extern "C" fn(c_int, c_int)),
+                window_ready: sym!(
+                    "quartz_bridge_window_ready",
+                    unsafe extern "C" fn() -> c_int
+                ),
+                send_cursor_pos: sym!(
+                    "quartz_bridge_send_cursor_pos",
+                    unsafe extern "C" fn(f32, f32)
+                ),
+                send_mouse_button: sym!(
+                    "quartz_bridge_send_mouse_button",
+                    unsafe extern "C" fn(c_int, c_int, c_int)
+                ),
+                send_key: sym!(
+                    "quartz_bridge_send_key",
+                    unsafe extern "C" fn(c_int, c_int, c_int, c_int)
+                ),
+                send_char: sym!(
+                    "quartz_bridge_send_char",
+                    unsafe extern "C" fn(c_int, c_int)
+                ),
                 send_scroll: sym!("quartz_bridge_send_scroll", unsafe extern "C" fn(f64, f64)),
-                send_screen_size: sym!("quartz_bridge_send_screen_size", unsafe extern "C" fn(c_int, c_int)),
+                send_screen_size: sym!(
+                    "quartz_bridge_send_screen_size",
+                    unsafe extern "C" fn(c_int, c_int)
+                ),
                 is_grabbed: sym!("quartz_bridge_is_grabbed", unsafe extern "C" fn() -> c_int),
-                notify_rt_vm: sym!("quartz_bridge_notify_rt_vm", unsafe extern "C" fn(VmPtr) -> c_int),
+                notify_rt_vm: sym!(
+                    "quartz_bridge_notify_rt_vm",
+                    unsafe extern "C" fn(VmPtr) -> c_int
+                ),
             })
         })();
         let _ = API.set(loaded);
@@ -194,6 +231,198 @@ pub fn ensure_zink_cutils_shim() -> Result<(), String> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Vulkan 设备就绪探针（v0.2.13，zink 专用）
+// ---------------------------------------------------------------------------
+
+/// zink 的 Vulkan 设备探针结果（预检失败信息引用，1.4.5 段写入）。
+static VULKAN_PROBE_REPORT: OnceLock<String> = OnceLock::new();
+
+/// Vulkan 探针用 FFI 最小集。语义与 zink 对 VULKAN_PTR 句柄的消费完全同构
+/// （LXK-98/zalith-voxy 对 amethyst mesa-fork 的补丁：zink 从句柄只取
+/// vkGetInstanceProcAddr，其余函数经 gpa(NULL/instance, ...) 逐级解析）。
+#[repr(C)]
+struct VkApplicationInfoProbe {
+    s_type: u32,
+    p_next: *const c_void,
+    p_application_name: *const c_char,
+    application_version: u32,
+    p_engine_name: *const c_char,
+    engine_version: u32,
+    api_version: u32,
+}
+
+#[repr(C)]
+struct VkInstanceCreateInfoProbe {
+    s_type: u32,
+    p_next: *const c_void,
+    flags: u32,
+    enabled_layer_count: u32,
+    pp_enabled_layer_names: *const *const c_char,
+    enabled_extension_count: u32,
+    pp_enabled_extension_names: *const *const c_char,
+    p_application_info: *const VkApplicationInfoProbe,
+}
+
+/// 对一个 Vulkan loader 或厂商 ICD 句柄做 vkCreateInstance + 设备枚举探针。
+/// Ok("devices=N:gpu0=…(vid=…)") / Err("stage=…:rc=…")。所有调用都有守卫，
+/// 失败只返回错误串，绝不 panic（探针失败属于正常诊断路径，交回退链处理）。
+unsafe fn probe_vulkan_devices(handle: *mut c_void) -> Result<String, String> {
+    if handle.is_null() {
+        return Err("stage=null-handle".into());
+    }
+    let gpa_p = dlsym(
+        handle,
+        CString::new("vkGetInstanceProcAddr").unwrap().as_ptr(),
+    );
+    if gpa_p.is_null() {
+        return Err("stage=dlsym-vkGetInstanceProcAddr".into());
+    }
+    type GetProcAddrFn = unsafe extern "system" fn(*mut c_void, *const c_char) -> *mut c_void;
+    let gpa: GetProcAddrFn = std::mem::transmute(gpa_p);
+    let gsym = |inst: *mut c_void, name: &str| -> Result<*mut c_void, String> {
+        let cs = CString::new(name).unwrap();
+        let p = gpa(inst, cs.as_ptr());
+        if p.is_null() {
+            Err(format!("stage=gpa-{name}"))
+        } else {
+            Ok(p)
+        }
+    };
+    type CreateInstanceFn = unsafe extern "system" fn(
+        *const VkInstanceCreateInfoProbe,
+        *const c_void,
+        *mut *mut c_void,
+    ) -> i32;
+    type EnumDevicesFn = unsafe extern "system" fn(*mut c_void, *mut u32, *mut *mut c_void) -> i32;
+    type GetPropsFn = unsafe extern "system" fn(*mut c_void, *mut c_void);
+    type DestroyFn = unsafe extern "system" fn(*mut c_void, *const c_void);
+    let create: CreateInstanceFn = std::mem::transmute(gsym(ptr::null_mut(), "vkCreateInstance")?);
+    let app_name = b"quartz-vk-probe\0";
+    let app = VkApplicationInfoProbe {
+        s_type: 0, // VK_STRUCTURE_TYPE_APPLICATION_INFO
+        p_next: ptr::null(),
+        p_application_name: app_name.as_ptr().cast(),
+        application_version: 1,
+        p_engine_name: app_name.as_ptr().cast(),
+        engine_version: 1,
+        api_version: 0x0040_0000, // VK_API_VERSION_1_0
+    };
+    let ci = VkInstanceCreateInfoProbe {
+        s_type: 1, // VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO
+        p_next: ptr::null(),
+        flags: 0,
+        enabled_layer_count: 0,
+        pp_enabled_layer_names: ptr::null(),
+        enabled_extension_count: 0,
+        pp_enabled_extension_names: ptr::null(),
+        p_application_info: &app,
+    };
+    let mut instance: *mut c_void = ptr::null_mut();
+    let rc = create(&ci, ptr::null(), &mut instance);
+    if rc != 0 {
+        return Err(format!("stage=vkCreateInstance:rc={rc}"));
+    }
+    let mut result = Err("stage=enum".into());
+    if let Ok(enum_devs_raw) = gsym(instance, "vkEnumeratePhysicalDevices") {
+        let enum_devs: EnumDevicesFn = std::mem::transmute(enum_devs_raw);
+        let mut count: u32 = 0;
+        let rc = enum_devs(instance, &mut count, ptr::null_mut());
+        if rc == 0 {
+            let mut desc = format!("devices={count}");
+            if count > 0 {
+                let mut devs: Vec<*mut c_void> = vec![ptr::null_mut(); count as usize];
+                let rc2 = enum_devs(instance, &mut count, devs.as_mut_ptr());
+                if rc2 == 0 && !devs[0].is_null() {
+                    if let Ok(get_props_raw) = gsym(instance, "vkGetPhysicalDeviceProperties") {
+                        let get_props: GetPropsFn = std::mem::transmute(get_props_raw);
+                        // VkPhysicalDeviceProperties 布局自 Vulkan 1.0 起稳定：
+                        // vendorID@8，deviceName[256]@20。
+                        let mut props = [0u8; 512];
+                        get_props(devs[0], props.as_mut_ptr().cast());
+                        let vid = u32::from_le_bytes(props[8..12].try_into().unwrap_or([0; 4]));
+                        let name = CStr::from_bytes_until_nul(&props[20..276])
+                            .map(|c| c.to_string_lossy().into_owned())
+                            .unwrap_or_else(|_| "unknown".into());
+                        desc += &format!(":gpu0={name}(vid={vid:#06x})");
+                    }
+                }
+            }
+            result = Ok(desc);
+        } else {
+            result = Err(format!("stage=vkEnumeratePhysicalDevices:rc={rc}"));
+        }
+    }
+    if let Ok(destroy_raw) = gsym(instance, "vkDestroyInstance") {
+        let destroy: DestroyFn = std::mem::transmute(destroy_raw);
+        destroy(instance, ptr::null());
+    }
+    result
+}
+
+/// 厂商 Vulkan ICD 直连候选（按优先级排序）。系统 loader 在 ：game 进程
+/// （exec 出的 app-data JVM，非 zygote 应用进程）找不到 sphal 命名空间下
+/// 的 vulkan.<soc>.so 时的兑底 —— 等价于 FCL nsbypass 在私有命名空间里
+/// 替 loader 完成 ICD 发现；ICD 按约定导出 vkGetInstanceProcAddr，zink
+/// 只需这一个符号即可驱动（见 probe_vulkan_devices 注释）。
+fn vendor_icd_candidates() -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for dir in ["/vendor/lib64/hw", "/odm/lib64/hw", "/system/lib64/hw"] {
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        let mut names: Vec<PathBuf> = rd
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.starts_with("vulkan.") && n.ends_with(".so"))
+                    .unwrap_or(false)
+            })
+            .collect();
+        names.sort();
+        out.extend(names);
+    }
+    out
+}
+
+/// 采集 Mesa 在 logcat 的诊断行（Android 构建的 mesa_log 走
+/// __android_log_print 而非 stderr —— 仅靠 MESA_DEBUG 和游戏日志
+/// 看不到 zink 失败的驱动侧细节）。best-effort，采集失败静默。
+fn capture_mesa_logcat() {
+    let out = std::process::Command::new("logcat")
+        .args(["-d", "--pid", &std::process::id().to_string(), "-t", "500"])
+        .output();
+    let Ok(o) = out else {
+        return;
+    };
+    let text = String::from_utf8_lossy(&o.stdout);
+    let hits: Vec<&str> = text
+        .lines()
+        .rev()
+        .filter(|l| {
+            !l.trim().is_empty()
+                && [
+                    "zink",
+                    "mesa",
+                    "MESA",
+                    "gallium",
+                    "vkCreate",
+                    "libvulkan",
+                    "dri",
+                    "EGL",
+                ]
+                .iter()
+                .any(|k| l.contains(k))
+        })
+        .take(25)
+        .collect();
+    for line in hits.into_iter().rev() {
+        eprintln!("[quartz][mesa-logcat] {line}");
+    }
+}
+
 /// 渲染层 EGL 预检（v0.2.7）：预载完成后立刻按桥接层同款语义 dlopen 渲染层
 /// EGL 实现 + eglGetDisplay(EGL_DEFAULT_DISPLAY) + eglInitialize 一次。
 ///
@@ -235,7 +464,10 @@ fn probe_renderer_egl(id: &str) -> Result<(), String> {
              zink 将走 Vulkan loader 设备发现 —— v0.2.12 起 FCL 同款机制）"
         );
     } else {
-        eprintln!("[quartz] EGL 预检诊断：render node -> {}", node_report.join(", "));
+        eprintln!(
+            "[quartz] EGL 预检诊断：render node -> {}",
+            node_report.join(", ")
+        );
     }
 
     let dir = crate::renderers::install_dir(id);
@@ -259,8 +491,7 @@ fn probe_renderer_egl(id: &str) -> Result<(), String> {
             return fail(format!("dlopen 失败 {e}"));
         }
         type GetDisplay = unsafe extern "system" fn(*mut c_void) -> *mut c_void;
-        type Initialize =
-            unsafe extern "system" fn(*mut c_void, *mut i32, *mut i32) -> u32;
+        type Initialize = unsafe extern "system" fn(*mut c_void, *mut i32, *mut i32) -> u32;
         type GetError = unsafe extern "system" fn() -> i32;
         type GetPlatformDisplay =
             unsafe extern "system" fn(u32, *mut c_void, *const c_void) -> *mut c_void;
@@ -283,7 +514,11 @@ fn probe_renderer_egl(id: &str) -> Result<(), String> {
             if p.is_null() {
                 let cs = CString::new("eglGetPlatformDisplay").unwrap();
                 let p = dlsym(h, cs.as_ptr());
-                if p.is_null() { None } else { Some(std::mem::transmute(p)) }
+                if p.is_null() {
+                    None
+                } else {
+                    Some(std::mem::transmute(p))
+                }
             } else {
                 Some(std::mem::transmute(p))
             }
@@ -333,7 +568,11 @@ fn probe_renderer_egl(id: &str) -> Result<(), String> {
                 }
                 eprintln!(
                     "[quartz] 渲染层 EGL 预检通过：{id}（EGL {mj}.{mn}{}）",
-                    if via_surfaceless { "，surfaceless 平台" } else { "" }
+                    if via_surfaceless {
+                        "，surfaceless 平台"
+                    } else {
+                        ""
+                    }
                 );
                 Ok(())
             }
@@ -343,8 +582,17 @@ fn probe_renderer_egl(id: &str) -> Result<(), String> {
                 } else {
                     node_report.join(", ")
                 };
+                // v0.2.13：Mesa 驱动侧日志在 logcat（不在 stderr），失败即
+                // 采集进游戏日志；并附带 Vulkan 探针报告（定位设备层死因）。
+                if id == "zink" {
+                    capture_mesa_logcat();
+                }
+                let vk = VULKAN_PROBE_REPORT
+                    .get()
+                    .cloned()
+                    .unwrap_or_else(|| "QUARTZ_VK_PROBE:未执行".into());
                 fail(format!(
-                    "eglInitialize={last_err:#06x}（含 surfaceless 重试；render node: {nodes}）"
+                    "eglInitialize={last_err:#06x}（含 surfaceless 重试；render node: {nodes}；{vk}）"
                 ))
             }
         }
@@ -426,29 +674,27 @@ pub fn ensure_bridge_loaded() -> Result<(), String> {
 fn call_activity_static(method: &str, sig: &str, args: &[JValueOwned]) -> bool {
     use jni::objects::JClass;
     use jni::objects::JValue;
-    crate::with_jni(|env, ctx| {
-        unsafe {
-            let loader = env
-                .call_method(ctx, "getClassLoader", "()Ljava/lang/ClassLoader;", &[])
-                .ok()?
-                .l()
-                .ok()?;
-            let name = env.new_string("com.quartz.launcher.MainActivity").ok()?;
-            let cls_obj = env
-                .call_method(
-                    &loader,
-                    "loadClass",
-                    "(Ljava/lang/String;)Ljava/lang/Class;",
-                    &[JValue::Object(&name.into())],
-                )
-                .ok()?
-                .l()
-                .ok()?;
-            let cls = JClass::from(cls_obj);
-            let values: Vec<JValue> = args.iter().map(|v| v.borrow()).collect();
-            env.call_static_method(&cls, method, sig, &values).ok()?;
-            Some(())
-        }
+    crate::with_jni(|env, ctx| unsafe {
+        let loader = env
+            .call_method(ctx, "getClassLoader", "()Ljava/lang/ClassLoader;", &[])
+            .ok()?
+            .l()
+            .ok()?;
+        let name = env.new_string("com.quartz.launcher.MainActivity").ok()?;
+        let cls_obj = env
+            .call_method(
+                &loader,
+                "loadClass",
+                "(Ljava/lang/String;)Ljava/lang/Class;",
+                &[JValue::Object(&name.into())],
+            )
+            .ok()?
+            .l()
+            .ok()?;
+        let cls = JClass::from(cls_obj);
+        let values: Vec<JValue> = args.iter().map(|v| v.borrow()).collect();
+        env.call_static_method(&cls, method, sig, &values).ok()?;
+        Some(())
     })
     .is_some()
 }
@@ -485,29 +731,28 @@ pub fn hide_game_surface() {
 /// 带一个 String 参数的 MainActivity 静态方法调用（startGameServiceStatic）。
 fn call_activity_string(method: &str, sig: &str, arg: &str) -> bool {
     use jni::objects::{JClass, JValue};
-    crate::with_jni(|env, ctx| {
-        unsafe {
-            let loader = env
-                .call_method(ctx, "getClassLoader", "()Ljava/lang/ClassLoader;", &[])
-                .ok()?
-                .l()
-                .ok()?;
-            let name = env.new_string("com.quartz.launcher.MainActivity").ok()?;
-            let cls_obj = env
-                .call_method(
-                    &loader,
-                    "loadClass",
-                    "(Ljava/lang/String;)Ljava/lang/Class;",
-                    &[JValue::Object(&name.into())],
-                )
-                .ok()?
-                .l()
-                .ok()?;
-            let cls = JClass::from(cls_obj);
-            let jarg = env.new_string(arg).ok()?;
-            env.call_static_method(&cls, method, sig, &[JValue::Object(&jarg)]).ok()?;
-            Some(())
-        }
+    crate::with_jni(|env, ctx| unsafe {
+        let loader = env
+            .call_method(ctx, "getClassLoader", "()Ljava/lang/ClassLoader;", &[])
+            .ok()?
+            .l()
+            .ok()?;
+        let name = env.new_string("com.quartz.launcher.MainActivity").ok()?;
+        let cls_obj = env
+            .call_method(
+                &loader,
+                "loadClass",
+                "(Ljava/lang/String;)Ljava/lang/Class;",
+                &[JValue::Object(&name.into())],
+            )
+            .ok()?
+            .l()
+            .ok()?;
+        let cls = JClass::from(cls_obj);
+        let jarg = env.new_string(arg).ok()?;
+        env.call_static_method(&cls, method, sig, &[JValue::Object(&jarg)])
+            .ok()?;
+        Some(())
     })
     .is_some()
 }
@@ -687,13 +932,7 @@ fn log_tail_text(path: Option<&Path>, max_lines: usize) -> Option<String> {
     if lines.is_empty() {
         return None;
     }
-    Some(
-        lines
-            .into_iter()
-            .rev()
-            .collect::<Vec<_>>()
-            .join("\n"),
-    )
+    Some(lines.into_iter().rev().collect::<Vec<_>>().join("\n"))
 }
 
 /// 退出前把游戏日志尚未 tail 到的行同步写进控制台流（防秒退竞态丢错误详情）。
@@ -725,15 +964,19 @@ fn drain_game_log_to_console() {
         *p = pos + buf.len() as u64;
     }
     let text = String::from_utf8_lossy(&buf);
-    let lines: Vec<&str> = text
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .collect();
+    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
     if let Some(app) = APP_HANDLE.get() {
         if let Ok(g) = STATE_LOG_FILE.lock() {
             if let Some(lf) = g.as_ref() {
                 // 最多补 100 行，且保持原顺序
-                for line in lines.iter().rev().take(100).collect::<Vec<_>>().into_iter().rev() {
+                for line in lines
+                    .iter()
+                    .rev()
+                    .take(100)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                {
                     qlog_emit(app, lf, "stdout", line);
                 }
             }
@@ -762,7 +1005,9 @@ pub fn finish_game_exit(code: i32) {
     {
         let retry = LAST_LAUNCH.lock().ok().and_then(|g| g.clone());
         if let (Some(app), Some(launch)) = (APP_HANDLE.get().cloned(), retry) {
-            append_state_log("[quartz] 正在用 MobileGlues 重试本次启动（约 1 秒后自动开始，无需手动操作）……");
+            append_state_log(
+                "[quartz] 正在用 MobileGlues 重试本次启动（约 1 秒后自动开始，无需手动操作）……",
+            );
             // 先摘除旧 :game 绑定（进程已死，不发 MSG_STOP）：屏蔽迟到的
             // onServiceDisconnected / binder death 回调打断重试新会话。
             let _ = call_activity_static("unbindGameServiceStatic", "()V", &[]);
@@ -806,14 +1051,26 @@ pub fn finish_game_exit(code: i32) {
     TAIL_ACTIVE.store(false, Ordering::SeqCst);
     hide_game_surface();
     if let Some(app) = APP_HANDLE.get() {
-        let version = STATE_VERSION.lock().ok().map(|g| g.clone()).unwrap_or_default();
+        let version = STATE_VERSION
+            .lock()
+            .ok()
+            .map(|g| g.clone())
+            .unwrap_or_default();
         // 崩溃证据直达 UI：游戏进程日志尾部 + 启动器日志尾部（用户下次反馈可直接粘贴）。
         let game_tail = log_tail_text(
-            STATE_GAME_LOG_PATH.lock().ok().and_then(|g| g.clone()).as_deref(),
+            STATE_GAME_LOG_PATH
+                .lock()
+                .ok()
+                .and_then(|g| g.clone())
+                .as_deref(),
             40,
         );
         let main_tail = log_tail_text(
-            STATE_MAIN_LOG_PATH.lock().ok().and_then(|g| g.clone()).as_deref(),
+            STATE_MAIN_LOG_PATH
+                .lock()
+                .ok()
+                .and_then(|g| g.clone())
+                .as_deref(),
             16,
         );
         let mut tail = String::new();
@@ -854,11 +1111,7 @@ fn append_state_log(line: &str) {
 // 用户就陷入「选 Zink → 直接崩溃」的闪退循环。幂等：已是 MobileGlues 则不动作。
 // 返回：是否真的切换了渲染层（v0.2.9 即时重试依据）。
 fn maybe_fallback_renderer_after_exit() -> bool {
-    let Some(path) = STATE_GAME_LOG_PATH
-        .lock()
-        .ok()
-        .and_then(|g| g.clone())
-    else {
+    let Some(path) = STATE_GAME_LOG_PATH.lock().ok().and_then(|g| g.clone()) else {
         return false;
     };
     let Ok(text) = std::fs::read_to_string(&path) else {
@@ -880,7 +1133,9 @@ fn maybe_fallback_renderer_after_exit() -> bool {
     }
     let active = crate::renderers::active();
     if active == "mobileglues" {
-        append_state_log("[quartz] 渲染层 EGL 初始化失败且当前已是 MobileGlues：无可回退目标，保持不变");
+        append_state_log(
+            "[quartz] 渲染层 EGL 初始化失败且当前已是 MobileGlues：无可回退目标，保持不变",
+        );
         return false;
     }
     match crate::renderers::set_active("mobileglues") {
@@ -1025,8 +1280,19 @@ pub unsafe extern "C" fn Java_com_quartz_launcher_GameHost_grabChanged(
     let _ = grabbed;
 }
 
-fn qlog_emit(app: &tauri::AppHandle, log_file: &Arc<Mutex<Option<std::fs::File>>>, source: &str, line: &str) {
-    let _ = app.emit("launch://log", &LaunchLog { source: source.into(), line: line.into() });
+fn qlog_emit(
+    app: &tauri::AppHandle,
+    log_file: &Arc<Mutex<Option<std::fs::File>>>,
+    source: &str,
+    line: &str,
+) {
+    let _ = app.emit(
+        "launch://log",
+        &LaunchLog {
+            source: source.into(),
+            line: line.into(),
+        },
+    );
     if let Ok(mut guard) = log_file.lock() {
         if let Some(f) = guard.as_mut() {
             use std::io::Write;
@@ -1312,7 +1578,10 @@ unsafe fn bridge_init_with(env: EnvPtr, ctx: jni_sys::jobject) -> Result<(), Str
 }
 
 /// 调用 QuartzBridge.latestSurface()（静态，返回最近收到的有效 Surface 或 null）。
-unsafe fn quartz_bridge_latest_surface(env: EnvPtr, ctx: jni_sys::jobject) -> Option<jni_sys::jobject> {
+unsafe fn quartz_bridge_latest_surface(
+    env: EnvPtr,
+    ctx: jni_sys::jobject,
+) -> Option<jni_sys::jobject> {
     let tbl = &**env;
     if (tbl.ExceptionCheck.unwrap())(env) != 0 {
         (tbl.ExceptionClear.unwrap())(env);
@@ -1363,7 +1632,11 @@ unsafe fn quartz_bridge_latest_surface(env: EnvPtr, ctx: jni_sys::jobject) -> Op
         (tbl.ExceptionClear.unwrap())(env);
         return None;
     }
-    if out.is_null() { None } else { Some(out) }
+    if out.is_null() {
+        None
+    } else {
+        Some(out)
+    }
 }
 
 /// JNI 返回码符号化（设备日志直读，不再对着 252 猜）。
@@ -1423,7 +1696,11 @@ unsafe fn run_game_from_spec(
     // 0) stdout/stderr 直写日志文件（先于一切：本函数所有输出都进日志）
     {
         let c = CString::new(spec.log_path.clone()).map_err(|_| "日志路径含 NUL")?;
-        let fd = libc::open(c.as_ptr(), libc::O_WRONLY | libc::O_CREAT | libc::O_APPEND, 0o644);
+        let fd = libc::open(
+            c.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_APPEND,
+            0o644,
+        );
         if fd >= 0 {
             libc::dup2(fd, 1);
             libc::dup2(fd, 2);
@@ -1441,8 +1718,7 @@ unsafe fn run_game_from_spec(
     eprintln!("[quartz] 本次游戏崩溃将只终止本进程，启动器 UI 不受影响");
     eprintln!(
         "[quartz] 路径重注入完成：game_root={} | runtime_dir={}",
-        spec.game_root,
-        spec.runtime_dir
+        spec.game_root, spec.runtime_dir
     );
     // 【v0.2.7】不装任何致命信号拦截：SIGABRT/SIGBUS/SIGFPE/SIGILL 全部交还
     // 原生链 → debuggerd tombstone（HyperOS 实测不影响启动器 UI，2026-11-24
@@ -1502,24 +1778,76 @@ unsafe fn run_game_from_spec(
         }
     }
 
-    // 1.4.5) zink：Vulkan loader 预载（v0.2.12 —— FCL load_vulkan() 等价物）。
-    // 根因实锤：FCL/Zalith2 用同一套 IronizedZink so 在本机可跑，而 Quartz
-    // 预检 eglInitialize=0x3001。对比 FCL 源码（egl_bridge.c load_vulkan）：
-    // 其 zink 启动前必先 dlopen("libvulkan.so") 把系统 Vulkan loader 装进
-    // 进程，句柄写入 VULKAN_PTR 环境变量；Pojav 系 Mesa fork 的设备发现
-    // 依赖它枚举厂商 GPU（Mali/Adreno/Xclipse 均走厂商 ICD），完全不依赖
-    // DRM render node —— 旧版缺这一步，Mesa 设备层无 Vulkan 可用，两条
-    // 平台尝试（default/surfaceless）均 EGL_NOT_INITIALIZED。
-    if active_renderer == "zink" && std::env::var("VULKAN_PTR").is_err() {
-        let cv = CString::new("libvulkan.so").unwrap();
-        let vh = dlopen(cv.as_ptr(), RTLD_LAZY | RTLD_LOCAL);
+    // 1.4.5) zink：Vulkan 设备就绪探针 + VULKAN_PTR 落位（v0.2.13）。
+    // 机制（amethyst mesa-fork 23.0 的 VULKAN_PTR 补丁 + FCL egl_bridge
+    // load_vulkan 同款）：fork 的 zink 从 VULKAN_PTR 读十六进制句柄，只取
+    // vkGetInstanceProcAddr 驱动 Vulkan；未设则 dlopen("libvulkan.so")。
+    // v0.2.12 只做了 dlopen 仍 0x3001 —— 实机差异：FCL/ZL2 在 zygote 应用
+    // 进程里跑，系统 loader 的 ICD 发现（sphal 命名空间 vulkan.<soc>.so）
+    // 可用；:game 是 exec 出的 app-data JVM 进程，该路径可能落空 → zink
+    // 建不了 screen → surfaceless 回退 kms_swrast（无 DRM）→ 0x3001。
+    // 故 v0.2.13 先探针再落句柄（FCL nsbypass 的轻量等价物）：
+    //   a) 探针 1：系统 loader 句柄 vkCreateInstance + 设备枚举；
+    //   b) 失败 → 探针 2：/vendor|/odm /lib64/hw/vulkan.*.so ICD 直连；
+    //   c) 任一通过 → VULKAN_PTR 落该句柄；全败 → 仍落 loader 句柄（保留
+    //      zink 机会），探针报告进 VULKAN_PROBE_REPORT 供预检失败信息引用。
+    if active_renderer == "zink" {
+        let loader = CString::new("libvulkan.so").unwrap();
+        let vh = dlopen(loader.as_ptr(), RTLD_LAZY | RTLD_LOCAL);
+        let mut chosen: Option<(*mut c_void, String)> = None;
         if !vh.is_null() {
-            std::env::set_var("VULKAN_PTR", format!("{:x}", vh as usize));
-            eprintln!("[quartz] zink：系统 Vulkan loader 已预载，VULKAN_PTR=0x{:x}（FCL load_vulkan 等价物）", vh as usize);
+            match probe_vulkan_devices(vh) {
+                Ok(r) => chosen = Some((vh, format!("loader {r}"))),
+                Err(e) => eprintln!(
+                    "[quartz] zink：系统 loader 设备探针失败（{e}）——尝试厂商 ICD 直连（FCL nsbypass 等价替代）"
+                ),
+            }
         } else {
-            let err = unsafe { last_dlerror() };
+            let err = last_dlerror();
             eprintln!("[quartz] zink：libvulkan.so 预载失败：{err}（设备发现将受限，可能 0x3001）");
         }
+        if chosen.is_none() {
+            for icd in vendor_icd_candidates() {
+                let Some(s) = icd.to_str() else {
+                    continue;
+                };
+                let Ok(cs) = CString::new(s.to_owned()) else {
+                    continue;
+                };
+                let h = dlopen(cs.as_ptr(), RTLD_LAZY | RTLD_LOCAL);
+                if h.is_null() {
+                    let err = last_dlerror();
+                    eprintln!("[quartz] zink：ICD 直连 {s} 失败：{err}");
+                    continue;
+                }
+                match probe_vulkan_devices(h) {
+                    Ok(r) => {
+                        chosen = Some((h, format!("icd {s} {r}")));
+                        break;
+                    }
+                    Err(e) => eprintln!("[quartz] zink：ICD {s} 探针失败（{e}）"),
+                }
+            }
+        }
+        let report = match chosen {
+            Some((h, why)) => {
+                std::env::set_var("VULKAN_PTR", format!("{:x}", h as usize));
+                eprintln!("[quartz] zink：VULKAN_PTR=0x{:x}（{}）", h as usize, why);
+                format!("QUARTZ_VK_PROBE:OK:{why}")
+            }
+            None => {
+                if !vh.is_null() {
+                    std::env::set_var("VULKAN_PTR", format!("{:x}", vh as usize));
+                    eprintln!(
+                        "[quartz] zink：探针全败，仍落 loader 句柄 VULKAN_PTR=0x{:x}（保留 zink 机会；预检失败信息将携带完整报告）",
+                        vh as usize
+                    );
+                }
+                "QUARTZ_VK_PROBE:FAIL:无可用 Vulkan 设备（loader 与 ICD 直连探针均失败）"
+                    .to_string()
+            }
+        };
+        let _ = VULKAN_PROBE_REPORT.set(report);
     }
 
     // 1.5) 渲染层依赖预载（链接器命名空间按名解析 DT_NEEDED 时不搜索应用
@@ -1736,7 +2064,10 @@ unsafe fn run_game_from_spec(
     options.push("-XX:-UsePerfData".into());
     options.push(format!(
         "-XX:ErrorFile={}",
-        crate::paths::game_root().join("logs").join("hs_err_%p.log").display()
+        crate::paths::game_root()
+            .join("logs")
+            .join("hs_err_%p.log")
+            .display()
     ));
     options.push("-Xlog:init=info:stderr".into());
     options.push("-Djava.security.manager=allow".into());
@@ -1774,10 +2105,19 @@ unsafe fn run_game_from_spec(
     // 6) dlopen JRE 依赖（绝对路径，绕开 bionic 启动期缓存的 LD_LIBRARY_PATH）
     let mut jvm_handle: *mut c_void = ptr::null_mut();
     let libs = [
-        "lib/jli/libjli.so", "lib/libjli.so", "lib/server/libjvm.so",
-        "lib/libverify.so", "lib/libjava.so", "lib/libnet.so", "lib/libnio.so",
-        "lib/libzip.so", "lib/libjimage.so", "lib/libawt.so",
-        "lib/libawt_headless.so", "lib/libfreetype.so", "lib/libfontmanager.so",
+        "lib/jli/libjli.so",
+        "lib/libjli.so",
+        "lib/server/libjvm.so",
+        "lib/libverify.so",
+        "lib/libjava.so",
+        "lib/libnet.so",
+        "lib/libnio.so",
+        "lib/libzip.so",
+        "lib/libjimage.so",
+        "lib/libawt.so",
+        "lib/libawt_headless.so",
+        "lib/libfreetype.so",
+        "lib/libfontmanager.so",
     ];
     for rel in libs {
         let p = jre_home.join(rel);
@@ -1813,19 +2153,20 @@ unsafe fn run_game_from_spec(
         }
         std::mem::transmute(p)
     };
-    let make_args = |opts: &[String]| -> Result<(Vec<jni_sys::JavaVMOption>, Vec<CString>), String> {
-        let mut vopts: Vec<jni_sys::JavaVMOption> = Vec::new();
-        let mut leaked: Vec<CString> = Vec::new();
-        for opt in opts {
-            let cs = CString::new(opt.clone()).map_err(|_| "JVM 参数含 NUL".to_string())?;
-            vopts.push(jni_sys::JavaVMOption {
-                optionString: cs.as_ptr() as *mut c_char,
-                extraInfo: ptr::null_mut(),
-            });
-            leaked.push(cs); // 保活
-        }
-        Ok((vopts, leaked))
-    };
+    let make_args =
+        |opts: &[String]| -> Result<(Vec<jni_sys::JavaVMOption>, Vec<CString>), String> {
+            let mut vopts: Vec<jni_sys::JavaVMOption> = Vec::new();
+            let mut leaked: Vec<CString> = Vec::new();
+            for opt in opts {
+                let cs = CString::new(opt.clone()).map_err(|_| "JVM 参数含 NUL".to_string())?;
+                vopts.push(jni_sys::JavaVMOption {
+                    optionString: cs.as_ptr() as *mut c_char,
+                    extraInfo: ptr::null_mut(),
+                });
+                leaked.push(cs); // 保活
+            }
+            Ok((vopts, leaked))
+        };
     let (mut jvm_options, _leaked) = make_args(&options)?;
     let mut init_args = jni_sys::JavaVMInitArgs {
         version: JNI_VERSION_1_8,
@@ -1927,12 +2268,8 @@ unsafe fn run_game_from_spec(
             (tbl.ExceptionClear.unwrap())(env);
             eprintln!("[quartz] 退出捕获类未找到（hook jar 未进 classpath？）");
         } else {
-            let mid = (tbl.GetStaticMethodID.unwrap())(
-                env,
-                sm_cls,
-                c"install".as_ptr(),
-                c"()V".as_ptr(),
-            );
+            let mid =
+                (tbl.GetStaticMethodID.unwrap())(env, sm_cls, c"install".as_ptr(), c"()V".as_ptr());
             if mid.is_null() {
                 (tbl.ExceptionClear.unwrap())(env);
                 eprintln!("[quartz] 退出捕获 install 未找到");
@@ -1976,7 +2313,8 @@ unsafe fn run_game_from_spec(
             for key in ["java.class.path", "java.library.path"] {
                 let jkey = (tbl.NewStringUTF.unwrap())(env, key.as_ptr());
                 let jargs = [jni_sys::jvalue { l: jkey }];
-                let jval = (tbl.CallStaticObjectMethodA.unwrap())(env, sys_cls, mid, jargs.as_ptr());
+                let jval =
+                    (tbl.CallStaticObjectMethodA.unwrap())(env, sys_cls, mid, jargs.as_ptr());
                 if (tbl.ExceptionCheck.unwrap())(env) != 0 {
                     (tbl.ExceptionClear.unwrap())(env);
                     continue;
@@ -2040,10 +2378,7 @@ unsafe fn run_game_from_spec(
                         (tbl.ExceptionClear.unwrap())(env);
                         continue;
                     }
-                    let jargs = [
-                        jni_sys::jvalue { l: jk },
-                        jni_sys::jvalue { l: jv },
-                    ];
+                    let jargs = [jni_sys::jvalue { l: jk }, jni_sys::jvalue { l: jv }];
                     (tbl.CallStaticObjectMethodA.unwrap())(env, sys_cls, mid, jargs.as_ptr());
                     if (tbl.ExceptionCheck.unwrap())(env) != 0 {
                         (tbl.ExceptionClear.unwrap())(env);
@@ -2051,14 +2386,15 @@ unsafe fn run_game_from_spec(
                         applied += 1;
                     }
                 }
-                eprintln!("[quartz] JVM 属性硬回写完成：{applied} 项 -D 落位（对抗 CreateJavaVM 丢属性）");
+                eprintln!(
+                    "[quartz] JVM 属性硬回写完成：{applied} 项 -D 落位（对抗 CreateJavaVM 丢属性）"
+                );
             }
             if (tbl.ExceptionCheck.unwrap())(env) != 0 {
                 (tbl.ExceptionClear.unwrap())(env);
             }
         }
     }
-
 
     // 9) 定位主类并调用 main
     let main_path = format!("{}", spec.main_class.replace('.', "/"));
@@ -2069,7 +2405,10 @@ unsafe fn run_game_from_spec(
         // 区分「类缺失」与「加载器初始化失败」；上方 [diag] 回读可交叉验证。
         (tbl.ExceptionDescribe.unwrap())(env);
         (tbl.ExceptionClear.unwrap())(env);
-        return Err(format!("主类 {} 未找到（classpath 配置错误？）", spec.main_class));
+        return Err(format!(
+            "主类 {} 未找到（classpath 配置错误？）",
+            spec.main_class
+        ));
     }
     let mid = (tbl.GetStaticMethodID.unwrap())(
         env,
@@ -2086,12 +2425,8 @@ unsafe fn run_game_from_spec(
         (tbl.ExceptionClear.unwrap())(env);
         return Err("java/lang/String 未找到".into());
     }
-    let arr = (tbl.NewObjectArray.unwrap())(
-        env,
-        spec.game_args.len() as i32,
-        str_cls,
-        ptr::null_mut(),
-    );
+    let arr =
+        (tbl.NewObjectArray.unwrap())(env, spec.game_args.len() as i32, str_cls, ptr::null_mut());
     if arr.is_null() {
         (tbl.ExceptionClear.unwrap())(env);
         return Err("参数数组创建失败".into());

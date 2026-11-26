@@ -242,19 +242,20 @@ pub fn launch_env(id: &str) -> Vec<(String, String)> {
             ("LIBGL_ES".into(), "3".into()),
         ],
         "vgpu" => vec![("VGPU_NOERROR".into(), "1".into())],
-        // Zink/Kopper（与 FCL/Zalith2 的注入配方一致）：
+        // Zink/Kopper（v0.2.13 与 FCL/Zalith2 的 zink_kopper 分支逐项对齐）：
         // - GALLIUM_DRIVER + MESA_LOADER_DRIVER_OVERRIDE=zink 强制 gallium zink 驱动
-        // - 版本覆盖：向 MC 呈现桌面 GL4.6/GLSL460（桥会走真桌面 GL 上下文）
+        // - MESA_ANDROID_NO_KMS_SWRAST=1（FCL/ZL2 同款）：Mesa android 平台
+        //   跳过 kms_swrast 探测（对当前 23.0.4 包是无效开关 —— 包内无该
+        //   字符串；包升级到主线新版本后立即生效）
+        // - 不再设 MESA_GL_VERSION_OVERRIDE/MESA_GLSL_VERSION_OVERRIDE：
+        //   FCL/ZL2 实测配方不含版本覆盖，强制 4.6 会向 MC 虚报驱动能力
+        // - driconf 三项（FCLauncher zink 分支同款）：放宽 GLSL 编译门禁
         // - LIBGL_ES=3 作为桥 GLES 兑底的语义开关（桌面分支失败时使用）
-        // - 路径类变量（LIBGL_DRIVERS_PATH）由壳层注入（需渲染器目录）
         "zink" => vec![
             ("GALLIUM_DRIVER".into(), "zink".into()),
             ("MESA_LOADER_DRIVER_OVERRIDE".into(), "zink".into()),
-            ("MESA_GL_VERSION_OVERRIDE".into(), "4.6".into()),
-            ("MESA_GLSL_VERSION_OVERRIDE".into(), "460".into()),
+            ("MESA_ANDROID_NO_KMS_SWRAST".into(), "1".into()),
             ("MESA_VK_IGNORE_CONFORMANCE_WARNING".into(), "1".into()),
-            // driconf 三项（v0.2.12，FCLauncher zink 分支同款）：放宽 GLSL
-            // 编译门禁，MC 的着色器源在 zink 转译下常带越界扩展声明
             ("force_glsl_extensions_warn".into(), "true".into()),
             ("allow_higher_compat_version".into(), "true".into()),
             (
@@ -491,7 +492,7 @@ mod tests {
         assert!(launch_env("gl4es").iter().any(|(k, _)| k == "LIBGL_ES"));
         assert!(!launch_env("mobileglues").is_empty());
         assert!(launch_env("angle").is_empty());
-        // zink 注入配方与 FCL/Zalith2 一致
+        // zink 注入配方与 FCL/Zalith2 一致（v0.2.13）
         let zink = launch_env("zink");
         assert!(zink
             .iter()
@@ -501,7 +502,10 @@ mod tests {
             .any(|(k, v)| k == "GALLIUM_DRIVER" && v == "zink"));
         assert!(zink
             .iter()
-            .any(|(k, v)| k == "MESA_GL_VERSION_OVERRIDE" && v == "4.6"));
+            .any(|(k, v)| k == "MESA_ANDROID_NO_KMS_SWRAST" && v == "1"));
+        // FCL/ZL2 实测配方不含版本覆盖（v0.2.13 移除，避免虚报驱动能力）
+        assert!(!zink.iter().any(|(k, _)| k == "MESA_GL_VERSION_OVERRIDE"));
+        assert!(!zink.iter().any(|(k, _)| k == "MESA_GLSL_VERSION_OVERRIDE"));
         assert!(zink.iter().any(|(k, _)| k == "LIBGL_ES"));
     }
 
