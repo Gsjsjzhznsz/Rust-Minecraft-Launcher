@@ -404,9 +404,33 @@ unsafe fn probe_vulkan_devices(handle: *mut c_void) -> Result<String, String> {
         handle,
         CString::new("vkGetInstanceProcAddr").unwrap().as_ptr(),
     );
-    if gpa_p.is_null() {
-        return Err("stage=dlsym-vkGetInstanceProcAddr".into());
+    if !gpa_p.is_null() {
+        return unsafe { probe_with_gpa(handle, gpa_p) };
     }
+    // v0.2.19 诊断加厚：厂商 ICD 按 Vulkan ICD 规范只导出 ICD 接口入口
+    // （vk_icdGetInstanceProcAddr，实测小米天玑 mali/mt6895 blob 即如此），
+    // 而 zink 消费端从 VULKAN_PTR 句柄 dlsym 的是标准 vkGetInstanceProcAddr
+    // —— ICD-only 句柄对 mesa 不可消费，胜负语义不变（仍按失败回退）；
+    // 但用 ICD 接口入口把探针跑完，日志留下「ICD 实际可用设备数」证据，
+    // 判断厂商 blob 通道是否值得做转发 shim 补链。
+    let icd_p = dlsym(
+        handle,
+        CString::new("vk_icdGetInstanceProcAddr").unwrap().as_ptr(),
+    );
+    if icd_p.is_null() {
+        return Err("stage=dlsym-vkGetInstanceProcAddr（vk_icdGetInstanceProcAddr 亦缺）".into());
+    }
+    match unsafe { probe_with_gpa(handle, icd_p) } {
+        Ok(r) => Err(format!(
+            "stage=dlsym-vkGetInstanceProcAddr:icd-gpa-ok:{r}（ICD 仅导出接口入口，需 loader 实例消费）"
+        )),
+        Err(e) => Err(format!("stage=dlsym-vkGetInstanceProcAddr:icd-gpa-fail:{e}")),
+    }
+}
+
+/// 以给定 gpa 入口跑完整探针（probe_vulkan_devices 的实现体；loader 实例传
+/// 标准 vkGetInstanceProcAddr，ICD-only blob 传 vk_icdGetInstanceProcAddr）。
+unsafe fn probe_with_gpa(handle: *mut c_void, gpa_p: *mut c_void) -> Result<String, String> {
     type GetProcAddrFn = unsafe extern "system" fn(*mut c_void, *const c_char) -> *mut c_void;
     let gpa: GetProcAddrFn = std::mem::transmute(gpa_p);
     let gsym = |inst: *mut c_void, name: &str| -> Result<*mut c_void, String> {
@@ -2163,8 +2187,8 @@ unsafe fn run_game_from_spec(
                         std::env::set_var("VK_DRIVER_FILES", &json);
                     }
                     match zl2_linker::zl2_driver_loader(Some(tdir.as_path())) {
-                        Ok(h) => match probe_vulkan_devices(h) {
-                            Ok(r) => format!("OK|turnip|{r}"),
+                        Ok((h, tier)) => match probe_vulkan_devices(h) {
+                            Ok(r) => format!("OK|turnip|{tier}|{r}"),
                             Err(e) => format!("ERR|stage=probe:{e}"),
                         },
                         Err(e) => format!("ERR|{e}"),
@@ -2195,8 +2219,8 @@ unsafe fn run_game_from_spec(
             let payload = fork_isolated_probe(8000, || unsafe {
                 sanitize_vk_probe_env();
                 match zl2_linker::zl2_driver_loader(None) {
-                    Ok(h) => match probe_vulkan_devices(h) {
-                        Ok(r) => format!("OK|auto|{r}"),
+                    Ok((h, tier)) => match probe_vulkan_devices(h) {
+                        Ok(r) => format!("OK|auto|{tier}|{r}"),
                         Err(e) => format!("ERR|stage=probe:{e}"),
                     },
                     Err(e) => format!("ERR|{e}"),
@@ -2347,7 +2371,7 @@ unsafe fn run_game_from_spec(
                     .map(|d| d.join("freedreno_icd.json"))
                     .filter(|p| p.exists());
                 match zl2_linker::zl2_driver_loader(turnip_dir.as_deref()) {
-                    Ok(h) => {
+                    Ok((h, _tier)) => {
                         std::env::set_var("VULKAN_PTR", format!("{:x}", h as usize));
                         if let Some(json) = json {
                             std::env::set_var("VK_ICD_FILENAMES", &json);

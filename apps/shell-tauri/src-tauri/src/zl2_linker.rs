@@ -37,6 +37,25 @@
 //!    vkGetInstanceProcAddr，vkCreateInstance 时该实例在命名空间内命中已
 //!    就位的 turnip ICD（freedreno KGSL 免 root 直通 /dev/kgsl-3d0）
 //! ```
+//!
+//! v0.2.19（MediaTek 小米系统 libvulkan 包装层兼容 + RimDroid vkshim 救场
+//! 链全量移植，源码对照 `udarmolota/RimDroid` unity/src/main/cpp/vkshim/
+//! driver.c + app/src/main/cpp/liblinkernsbypass/android_linker_ns.cpp）：
+//! 部分 ROM（实测小米天玑机型）的 /system/lib64/libvulkan.so 是包装层 ——
+//! DT_NEEDED 直接挂着 libgpud_sys.so（本体在 /system_ext/lib64，普通 app
+//! 经系统默认命名空间天然可见；裸命名空间首载即报
+//! `library "libgpud_sys.so" not found`，RimDroid 注释原文："The loader
+//! too can need vendor libraries (libgpud_sys.so on a MediaTek Xiaomi)"）。
+//! 三层对策：
+//! 1. 命名空间搜索路径补全：/system_ext/lib64(+ndk)、system/vendor/odm
+//!    的 ndk 子目录 —— permitted 本就含 /system_ext，只差搜索；
+//! 2. 救场第一级（RimDroid 同款）：建 default 命名空间的 SHARED 副本
+//!    （parent=null + caller=libdl 实体地址），`__loader_android_link_
+//!    namespaces_all_libs` 全量连回（符号缺失时按 dlerror 解析缺失
+//!    SONAME 定向 `__loader_android_link_namespaces` 补位）后重试；
+//! 3. 救场第二级：`__loader_android_get_exported_namespace("sphal")`
+//!    同法连回再重试 —— 与 RimDroid vkshim_open_custom_loader 的三级
+//!    ladder 同构。
 
 #![allow(dead_code)]
 
@@ -167,8 +186,44 @@ mod ffi {
         Ok((f, dl_body))
     }
 
+    /// namespace 上下文：句柄 + linker API 指针缓存（救场链复用）。
+    struct NsCtx {
+        ns: *mut c_void,
+        dlopen_ext: AndroidDlopenExtFn,
+        create: CreateNamespaceFn,
+        link: LinkNamespacesFn,
+        /// driver_namespace 的 caller（本 so 地址 → 归属 clns，ZL2 语义）
+        ns_caller: *const c_void,
+        /// libdl.so 内 dlopen 实体地址 —— 建「default 命名空间可用副本」的
+        /// caller（RimDroid android_create_namespace_escape 的 &dlopen 同款：
+        /// parent=null 时新建 ns 以 caller 归属的命名空间为父，libdl 落在
+        /// default → 得到 default 的 SHARED 副本）。
+        default_caller: usize,
+    }
+
+    /// __loader_ 系列 linker API 宽容解析：全局组直查 → libdl_android.so →
+    /// ld-android.so（三者都是公共 LLNDK，clns 内可直接 dlopen）。
+    unsafe fn dlsym_any(name: &str) -> *mut c_void {
+        let c = CString::new(name).unwrap();
+        let p = dlsym(ptr::null_mut(), c.as_ptr());
+        if !p.is_null() {
+            return p;
+        }
+        for lib in ["libdl_android.so", "ld-android.so"] {
+            let lc = CString::new(lib).unwrap();
+            let h = dlopen(lc.as_ptr(), RTLD_LAZY | RTLD_LOCAL);
+            if !h.is_null() {
+                let p = dlsym(h, c.as_ptr());
+                if !p.is_null() {
+                    return p;
+                }
+            }
+        }
+        ptr::null_mut()
+    }
+
     /// 建 driver_namespace 并接好 link（ZL2 nsbypass.c linker_ns_load 全量移植）。
-    unsafe fn ns_load(search: &str) -> Result<(*mut c_void, AndroidDlopenExtFn), String> {
+    unsafe fn ns_load(search: &str) -> Result<NsCtx, String> {
         let (raw_dlopen, caller_addr) = resolve_raw_dlopen()?;
 
         let ld_c = CString::new("ld-android.so").unwrap();
@@ -225,7 +280,89 @@ mod ffi {
             return Err("stage=zl2-dlopen-ext:android_dlopen_ext 符号缺失".to_string());
         }
         let dlopen_ext: AndroidDlopenExtFn = std::mem::transmute(ext_p);
-        Ok((ns, dlopen_ext))
+        Ok(NsCtx {
+            ns,
+            dlopen_ext,
+            create,
+            link,
+            ns_caller: caller,
+            default_caller: caller_addr,
+        })
+    }
+
+    /// `__loader_android_link_namespaces_all_libs(from, to)`：把 to 的全部库
+    /// 接进 from（bionic API；旧 ROM 可能没有 —— 调用方须判空）。
+    type LinkAllLibsFn = unsafe extern "C" fn(*mut c_void, *mut c_void) -> c_int;
+    unsafe fn link_all_libs_fn() -> Option<LinkAllLibsFn> {
+        let p = dlsym_any("__loader_android_link_namespaces_all_libs");
+        if p.is_null() {
+            None
+        } else {
+            Some(std::mem::transmute::<*mut c_void, LinkAllLibsFn>(p))
+        }
+    }
+
+    /// `__loader_android_get_exported_namespace(name)`：取 sphal 等导出
+    /// 命名空间（厂商库提供方）。
+    type GetExportedNsFn = unsafe extern "C" fn(*const c_char) -> *mut c_void;
+    unsafe fn exported_ns(name: &str) -> *mut c_void {
+        let p = dlsym_any("__loader_android_get_exported_namespace");
+        if p.is_null() {
+            return ptr::null_mut();
+        }
+        let f: GetExportedNsFn = std::mem::transmute(p);
+        let c = CString::new(name).unwrap();
+        f(c.as_ptr())
+    }
+
+    /// 从 bionic dlerror 文案解析缺失依赖的 SONAME：
+    /// `dlopen failed: library "libgpud_sys.so" not found: needed by …`。
+    fn parse_missing_soname(err: &str) -> Option<String> {
+        let start = err.find("library \"")? + "library \"".len();
+        let rest = &err[start..];
+        let end = rest.find('"')?;
+        let s = rest[..end].to_string();
+        if s.is_empty() {
+            None
+        } else {
+            Some(s)
+        }
+    }
+
+    /// RimDroid liblinkernsbypass linkernsbypass_link_namespace_to_default_all_libs
+    /// 移植：建 default 命名空间的 SHARED 副本（parent=null + caller=libdl
+    /// 实体地址 —— linker 以 caller 归属命名空间，libdl 落在 default）。
+    unsafe fn default_copy_ns(ctx: &NsCtx) -> *mut c_void {
+        let name_c = CString::new("qz-default-copy").unwrap();
+        (ctx.create)(
+            name_c.as_ptr(),
+            ptr::null(),
+            ptr::null(),
+            2, // ANDROID_NAMESPACE_TYPE_SHARED
+            ptr::null(),
+            ptr::null_mut(),
+            ctx.default_caller as *const c_void,
+        )
+    }
+
+    /// 把 provider 命名空间的库接进 driver_namespace（from=我们的 ns）：
+    /// 优先 all_libs 全量连回；符号缺失或失败时对缺失 SONAME 定向
+    /// __loader_android_link_namespaces 补位（该 API 全版本必有）。
+    unsafe fn link_provider_into_ns(
+        ctx: &NsCtx,
+        provider: *mut c_void,
+        missing: Option<&str>,
+    ) -> bool {
+        if let Some(f) = link_all_libs_fn() {
+            if f(ctx.ns, provider) != 0 {
+                return true;
+            }
+        }
+        if let Some(s) = missing {
+            let c = CString::new(s).unwrap();
+            return (ctx.link)(ctx.ns, provider, c.as_ptr()) != 0;
+        }
+        false
     }
 
     /// android_dlopen_ext + USE_NAMESPACE：把 path 装入指定命名空间。
@@ -249,10 +386,7 @@ mod ffi {
     /// 全新 SONAME 的 libvulkan.so 实例（ZL2 linker_ns_dlopen_unique 移植；
     /// fd 通道以「读整文件 + 内存补丁 + 落盘 runtime_dir + 绝对路径载入」等效
     /// —— runtime_dir 在 /data 下，driver_namespace permitted 已覆盖）。
-    unsafe fn ns_dlopen_unique(
-        ns: *mut c_void,
-        dlopen_ext: AndroidDlopenExtFn,
-    ) -> Result<*mut c_void, String> {
+    unsafe fn ns_dlopen_unique_ctx(ctx: &NsCtx) -> Result<*mut c_void, String> {
         let real = std::fs::read("/system/lib64/libvulkan.so").map_err(|e| {
             format!("stage=zl2-read-loader:读取 /system/lib64/libvulkan.so 失败：{e}")
         })?;
@@ -265,7 +399,7 @@ mod ffi {
         std::fs::write(&tmp, &buf)
             .map_err(|e| format!("stage=zl2-write-loader:{} 写入失败：{e}", tmp.display()))?;
         let cs = CString::new(tmp.to_string_lossy().into_owned()).unwrap();
-        let h = ns_dlopen(ns, &cs, RTLD_NOW | RTLD_LOCAL, dlopen_ext);
+        let h = ns_dlopen(ctx.ns, &cs, RTLD_NOW | RTLD_LOCAL, ctx.dlopen_ext);
         let _ = std::fs::remove_file(&tmp); // 映射建立后临时文件可删（不阻断）
         if h.is_null() {
             return Err(format!("stage=zl2-loader-load:{}", dlerr_text()));
@@ -273,24 +407,64 @@ mod ffi {
         Ok(h)
     }
 
-    /// ZL2 loadTurnipVulkan 等效链（v0.2.18 移植主入口）。
+    /// 全新 loader 实例装载 + RimDroid vkshim 三级救场（v0.2.19）：
+    /// 首载（依赖搜索路径）失败 → default_copy 全量/定向连回重试 →
+    /// sphal 全量/定向连回重试 → 全败。返回 (句柄, 胜出救场档位)。
+    unsafe fn loader_unique_with_rescue(
+        ctx: &NsCtx,
+    ) -> Result<(*mut c_void, &'static str), String> {
+        let mut last_err: String;
+        match ns_dlopen_unique_ctx(ctx) {
+            Ok(h) => return Ok((h, "search-path")),
+            Err(e) => last_err = e,
+        }
+        // 第一级：default 命名空间副本全量/定向连回（libgpud_sys.so 场景的
+        // 主救场 —— RimDroid vkshim_open_custom_loader 同款）
+        let missing = parse_missing_soname(&last_err);
+        let copy = default_copy_ns(ctx);
+        if !copy.is_null() && link_provider_into_ns(ctx, copy, missing.as_deref()) {
+            match ns_dlopen_unique_ctx(ctx) {
+                Ok(h) => return Ok((h, "default-copy")),
+                Err(e) => last_err = format!("{last_err}；{e}"),
+            }
+        }
+        // 第二级：sphal 导出命名空间（厂商库提供方 —— RimDroid 第三级同源）
+        let sphal = exported_ns("sphal");
+        if !sphal.is_null() && link_provider_into_ns(ctx, sphal, missing.as_deref()) {
+            match ns_dlopen_unique_ctx(ctx) {
+                Ok(h) => return Ok((h, "sphal")),
+                Err(e) => last_err = format!("{last_err}；{e}"),
+            }
+        }
+        Err(format!(
+            "stage=zl2-loader-load:救场链全败（{last_err}）"
+        ))
+    }
+
+    /// ZL2 loadTurnipVulkan 等效链（v0.2.18 移植主入口；v0.2.19 补救场链）。
     ///
     /// # Safety
     /// 仅在 :game 进程（或 fork 隔离子进程）调用；操作进程级 linker
     /// namespace，失败路径全部返回 Err 不 panic。命名空间/句柄不跨 fork
     /// 存活 —— 探针子进程验证后父进程须重放同一链。
-    pub unsafe fn zl2_driver_loader(driver_dir: Option<&Path>) -> Result<*mut c_void, String> {
-        // 命名空间搜索路径（ZL2 SEARCH_PATH="/system/lib64" 原值基础上追加
-        // vendor hw 目录）：/system/lib64 兜住 libhardware/LLNDK 等全部系统
-        // 依赖；驱动目录兜住 turnip + libc++_shared；vendor hw 目录服务厂商
-        // blob 自动发现变体（turnip 变体有 VK_ICD_FILENAMES 门控，厂商 JSON
-        // 不参与发现，搜索路径多几项无副作用）。
-        let vendor_paths = "/vendor/lib64:/vendor/lib64/hw:/odm/lib64:/odm/lib64/hw";
+    pub unsafe fn zl2_driver_loader(
+        driver_dir: Option<&Path>,
+    ) -> Result<(*mut c_void, String), String> {
+        // 命名空间搜索路径（ZL2 SEARCH_PATH="/system/lib64" 原值基础上补全）：
+        // v0.2.19 —— 部分 ROM（实测小米天玑机型）的系统 libvulkan 是包装层，
+        // DT_NEEDED libgpud_sys.so 本体在 /system_ext/lib64；ndk 子目录是
+        // 其他 ROM 库的常见落点。permitted 本就含 /system_ext，只差搜索。
+        // 驱动目录兜住 turnip + libc++_shared；vendor hw 目录服务厂商 blob
+        // 自动发现变体（turnip 变体有 VK_ICD_FILENAMES 门控，厂商 JSON 不
+        // 参与发现，搜索路径多几项无副作用）。
+        let sys_paths = "/system_ext/lib64:/system_ext/lib64/ndk:/system/lib64/ndk";
+        let vendor_paths =
+            "/vendor/lib64:/vendor/lib64/hw:/vendor/lib64/ndk:/odm/lib64:/odm/lib64/hw:/odm/lib64/ndk";
         let search = match driver_dir {
-            Some(d) => format!("/system/lib64:{}:{vendor_paths}", d.display()),
-            None => format!("/system/lib64:{vendor_paths}"),
+            Some(d) => format!("/system/lib64:{sys_paths}:{vendor_paths}:{}", d.display()),
+            None => format!("/system/lib64:{sys_paths}:{vendor_paths}"),
         };
-        let (ns, dlopen_ext) = ns_load(&search)?;
+        let ctx = ns_load(&search)?;
 
         // ZL2 顺序：ICD 先进命名空间（后续 loader 按 SONAME/绝对路径直接命中；
         // libc++_shared 等 DT_NEEDED 由搜索路径里的驱动目录按名解析 ——
@@ -302,25 +476,30 @@ mod ffi {
                 return Err(format!("stage=zl2-icd-missing:{} 不存在", icd.display()));
             }
             let cs = CString::new(icd.to_string_lossy().into_owned()).unwrap();
-            let h = ns_dlopen(ns, &cs, RTLD_NOW | RTLD_LOCAL, dlopen_ext);
+            let h = ns_dlopen(ctx.ns, &cs, RTLD_NOW | RTLD_LOCAL, ctx.dlopen_ext);
             if h.is_null() {
                 return Err(format!("stage=zl2-icd-load:{}", dlerr_text()));
             }
         }
 
-        ns_dlopen_unique(ns, dlopen_ext)
+        let (h, tier) = loader_unique_with_rescue(&ctx)?;
+        Ok((h, tier.to_string()))
     }
 }
 
 /// Android 上转发 FFI 实现（保持调用点签名稳定）。
 #[cfg(target_os = "android")]
-pub unsafe fn zl2_driver_loader(driver_dir: Option<&Path>) -> Result<*mut c_void, String> {
+pub unsafe fn zl2_driver_loader(
+    driver_dir: Option<&Path>,
+) -> Result<(*mut c_void, String), String> {
     ffi::zl2_driver_loader(driver_dir)
 }
 
 /// 非 Android 目标占位（模块仅 Android 运行时有效；占位保证全平台可编译）。
 #[cfg(not(target_os = "android"))]
-pub unsafe fn zl2_driver_loader(_driver_dir: Option<&Path>) -> Result<*mut c_void, String> {
+pub unsafe fn zl2_driver_loader(
+    _driver_dir: Option<&Path>,
+) -> Result<(*mut c_void, String), String> {
     Err("stage=zl2-unavailable:仅 Android 运行时可用".to_string())
 }
 
