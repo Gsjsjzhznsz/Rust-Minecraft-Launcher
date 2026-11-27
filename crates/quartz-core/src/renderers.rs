@@ -34,7 +34,8 @@ pub enum PackSource {
     /// v0.2.17：下载 zip 后按 basename 提取（.so/.json）—— Turnip 驱动包
     /// （本仓 CI 自建 mesa ICD 的发布资产，zip 根级平铺，非 APK 布局）。
     /// v0.2.20：zink 包同模式 —— CI 从 ZL2 官方 Release APK 字节级提取。
-    /// 列表为空 = 提取全部 .so/.json；非空 = 白名单 (zip 内 basename, 落盘名)。
+    /// 列表为空 = 提取全部 .so/.json；非空 = 白名单 (zip 内 basename, 落盘名)，
+    /// v0.2.21 起为硬契约：包内缺任一条目 = 硬失败（制品↔清单错位当场暴露）。
     ZipExtract(&'static str, &'static [(&'static str, &'static str)]),
 }
 
@@ -75,8 +76,12 @@ const ZINK_PACK_ZIP: &str = "https://github.com/Gsjsjzhznsz/Rust-Minecraft-Launc
 /// zink 包制品代数：v0.2.20 = ZL2 2.8.2 提取（rev 2）。将来随 ZL2 升版递增。
 pub const ZINK_PACK_REV: u32 = 2;
 
-/// Zink pack 提取白名单（zip 内 basename → 落盘名；libzink_dri 改名对齐
-/// SONAME —— ZL2 内置该库的 DT_SONAME 即 libgallium_dri.so）。
+/// Zink pack 提取白名单（zip 内 basename → 落盘名）。
+/// v0.2.21：zip 条目与 ZL2 2.8.2 APK lib/arm64-v8a **逐文件同名同字节**
+/// —— libzink_dri.so 保留 ZL2 原名（v0.2.20 曾在 CI 改名 libgallium_dri.so，
+/// App 清单没跟上 → 静默跳过 → gallium 未落盘 → 「zink 下载失败」实锤）；
+/// SONAME 落盘改名（ZL2 内置该库 DT_SONAME 即 libgallium_dri.so，Mesa EGL
+/// 按该名 dlopen，文件名必须对齐）由本白名单在解包时执行。
 ///
 /// 实机诊断（2026-11 v9）：pack 的 libcutils.so 是依赖 libc++_shared.so 的
 /// bionic shim（DT_NEEDED 实测确认）—— 白名单缺 libc++_shared.so 时
@@ -511,10 +516,26 @@ pub async fn download_and_install(
         std::fs::write(dir.join(".pack-rev"), spec.rev.to_string())?;
     }
     if !is_installed(id) {
-        return Err(Error::Other(format!(
-            "渲染层安装不完整（缺少 {}）",
-            spec.egl_lib
-        )));
+        // v0.2.21：缺什么列什么（此前固定报 egl_lib —— v0.2.20 zink 接缝事故
+        // 实为 preload 缺 libgallium_dri.so，用户看到的却是「缺少 libEGL_mesa.so」）
+        let mut missing: Vec<&str> = Vec::new();
+        if !dir.join(spec.egl_lib).exists() {
+            missing.push(spec.egl_lib);
+        }
+        if !dir.join(spec.gl_lib).exists() {
+            missing.push(spec.gl_lib);
+        }
+        for p in spec.preload {
+            if !dir.join(p).exists() {
+                missing.push(p);
+            }
+        }
+        let detail = if missing.is_empty() {
+            format!(".pack-rev 标记不符（期望 {}）", spec.rev)
+        } else {
+            missing.join("、")
+        };
+        return Err(Error::Other(format!("渲染层安装不完整（缺 {detail}）")));
     }
     report("done", 1, 1, format!("{} 安装完成", spec.name), true);
     Ok(dir)
@@ -541,11 +562,17 @@ pub fn preload_libs(id: &str) -> &'static [&'static str] {
 }
 
 /// v0.2.17：从 zip 提取 .so/.json（basename 匹配，任意目录层级）。
-/// whitelist 为空 = 提取全部 .so 与 .json；非空 = 仅 (basename, 落盘名) 列表。
+/// whitelist 为空 = 提取全部 .so 与 .json；非空 = 仅 (basename, 落盘名) 列表，
+/// v0.2.21 起为硬契约：包内缺任一条目 = Err 点名（制品↔清单错位当场暴露）。
 fn extract_zip_libs(zip: &Path, dest: &Path, whitelist: &[(&str, &str)]) -> Result<usize> {
     let file = std::fs::File::open(zip)?;
     let mut archive = zip::ZipArchive::new(std::io::BufReader::new(file))?;
     let mut count = 0usize;
+    // v0.2.21：白名单命中簿记 —— 非空白名单存在未命中条目即硬失败。
+    // v0.2.20 zink 接缝事故：CI 把 zip 条目改名 libgallium_dri.so，App 清单
+    // 仍找 libzink_dri.so，这里静默 continue → gallium 驱动未落盘 → 装完才
+    // 报「安装不完整」且误报缺失对象。缺什么当场点名。
+    let mut matched: Vec<String> = Vec::new();
     for i in 0..archive.len() {
         let mut entry = archive.by_index(i)?;
         let Some(name) = entry.enclosed_name() else {
@@ -560,7 +587,10 @@ fn extract_zip_libs(zip: &Path, dest: &Path, whitelist: &[(&str, &str)]) -> Resu
             src_name
         } else {
             match whitelist.iter().find(|(apk_name, _)| *apk_name == src_name) {
-                Some((_, disk_name)) => *disk_name,
+                Some((_, disk_name)) => {
+                    matched.push(src_name.to_string());
+                    *disk_name
+                }
                 None => continue,
             }
         };
@@ -568,6 +598,22 @@ fn extract_zip_libs(zip: &Path, dest: &Path, whitelist: &[(&str, &str)]) -> Resu
         let mut out_file = std::fs::File::create(&out)?;
         std::io::copy(&mut entry, &mut out_file)?;
         count += 1;
+    }
+    // v0.2.21：非空白名单 = 制品↔清单契约，缺任一条目即硬失败
+    //（v0.2.20 zink 接缝事故回归防线：CI 制品改名/裁剪而清单没跟上时，
+    // 下载环节当场点名，不再拖到「安装不完整」且误报缺失对象）
+    if !whitelist.is_empty() {
+        let missing: Vec<&str> = whitelist
+            .iter()
+            .map(|(s, _)| *s)
+            .filter(|s| !matched.iter().any(|m| m.as_str() == *s))
+            .collect();
+        if !missing.is_empty() {
+            return Err(Error::Other(format!(
+                "渲染层包与提取清单不符（包内缺：{}）—— 制品与白名单未对齐",
+                missing.join("、")
+            )));
+        }
     }
     Ok(count)
 }
@@ -578,6 +624,8 @@ fn extract_apk_libs(apk: &Path, dest: &Path, whitelist: &[(&str, &str)]) -> Resu
     let file = std::fs::File::open(apk)?;
     let mut archive = zip::ZipArchive::new(std::io::BufReader::new(file))?;
     let mut count = 0usize;
+    // v0.2.21：与 extract_zip_libs 同款命中簿记（非空白名单缺条目硬失败）
+    let mut matched: Vec<String> = Vec::new();
     for i in 0..archive.len() {
         let mut entry = archive.by_index(i)?;
         let Some(name) = entry.enclosed_name() else {
@@ -592,7 +640,10 @@ fn extract_apk_libs(apk: &Path, dest: &Path, whitelist: &[(&str, &str)]) -> Resu
             src_name
         } else {
             match whitelist.iter().find(|(apk_name, _)| *apk_name == src_name) {
-                Some((_, disk_name)) => *disk_name,
+                Some((_, disk_name)) => {
+                    matched.push(src_name.to_string());
+                    *disk_name
+                }
                 None => continue,
             }
         };
@@ -600,6 +651,20 @@ fn extract_apk_libs(apk: &Path, dest: &Path, whitelist: &[(&str, &str)]) -> Resu
         let mut out_file = std::fs::File::create(&out)?;
         std::io::copy(&mut entry, &mut out_file)?;
         count += 1;
+    }
+    // v0.2.21：与 extract_zip_libs 同款严格校验（契约错位当场点名）
+    if !whitelist.is_empty() {
+        let missing: Vec<&str> = whitelist
+            .iter()
+            .map(|(s, _)| *s)
+            .filter(|s| !matched.iter().any(|m| m.as_str() == *s))
+            .collect();
+        if !missing.is_empty() {
+            return Err(Error::Other(format!(
+                "渲染层 APK 与提取清单不符（包内缺：{}）—— 制品与白名单未对齐",
+                missing.join("、")
+            )));
+        }
     }
     Ok(count)
 }
@@ -686,6 +751,21 @@ mod tests {
                     .any(|(a, b)| *a == "libzink_dri.so" && *b == "libgallium_dri.so"));
                 assert!(whitelist.iter().any(|(a, _)| *a == "libEGL_mesa.so"));
                 assert!(whitelist.iter().any(|(a, _)| *a == "libcutils.so"));
+                // v0.2.21：CI 制品 ↔ App 契约逐条钉死 —— zip 条目名 = ZL2 APK
+                // lib/arm64-v8a 原名（build_zinkpack.sh 不改名），落盘名见右列；
+                // 左列再错位，这里先红（v0.2.20 接缝事故回归防线）。
+                let expected: &[(&str, &str)] = &[
+                    ("libEGL_mesa.so", "libEGL_mesa.so"),
+                    ("libglapi.so", "libglapi.so"),
+                    ("libglxshim.so", "libglxshim.so"),
+                    ("libzink_dri.so", "libgallium_dri.so"),
+                    ("libcutils.so", "libcutils.so"),
+                    ("libc++_shared.so", "libc++_shared.so"),
+                ];
+                assert_eq!(whitelist.len(), expected.len());
+                for (w, e) in whitelist.iter().zip(expected) {
+                    assert_eq!((w.0, w.1), *e);
+                }
             }
             _ => panic!("zink 应使用 ZipExtract 白名单提取（ZL2 制品包）"),
         }
@@ -790,6 +870,41 @@ mod tests {
         assert_eq!(n2, 1);
         assert!(dest2.join("libvulkan_freedreno.so").exists());
         assert!(!dest2.join("freedreno_icd.json").exists());
+        std::fs::remove_dir_all(&work).ok();
+    }
+
+    /// v0.2.21：白名单严格校验 —— 非空白名单缺条目必须硬失败并点名
+    /// （v0.2.20 zink 接缝事故回归防线：CI 制品名与清单错位时，旧逻辑静默
+    /// 跳过 → 安装不完整误报；现在下载环节当场报「包内缺 <名字>」）。
+    #[test]
+    fn zip_extract_strict_whitelist_fails_on_missing_entry() {
+        let work = std::env::temp_dir().join(format!("qz-zipw-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&work);
+        std::fs::create_dir_all(&work).unwrap();
+        let zip_path = work.join("pack.zip");
+        let file = std::fs::File::create(&zip_path).unwrap();
+        let mut w = zip::ZipWriter::new(file);
+        use std::io::Write as _;
+        let opts: zip::write::SimpleFileOptions = Default::default();
+        w.start_file("libEGL_mesa.so", opts).unwrap();
+        std::io::Write::write_all(&mut w, b"x").unwrap();
+        w.finish().unwrap().flush().unwrap();
+        let dest = work.join("out");
+        std::fs::create_dir_all(&dest).unwrap();
+        // 清单要 libzink_dri.so 而包内没有 —— 正是 v0.2.20 事故形态
+        let err = extract_zip_libs(
+            &zip_path,
+            &dest,
+            &[("libzink_dri.so", "libgallium_dri.so")],
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("libzink_dri.so"),
+            "报错应点名缺失条目：{err}"
+        );
+        assert!(!dest.join("libgallium_dri.so").exists());
+        // 空白名单（turnip 全提取模式）不受严格校验影响
+        assert!(extract_zip_libs(&zip_path, &dest, &[]).is_ok());
         std::fs::remove_dir_all(&work).ok();
     }
 }
