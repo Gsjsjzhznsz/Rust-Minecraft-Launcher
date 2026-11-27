@@ -28,8 +28,7 @@ pub enum PackSource {
     Raw(&'static [(&'static str, &'static str)]),
     /// 下载 APK 后提取 lib/arm64-v8a/*.so。
     /// 列表为空 = 提取全部；非空 = 白名单 (APK 内文件名, 落盘文件名)
-    /// —— 支持改名（zink_dri 的 SONAME 是 libgallium_dri.so，Mesa EGL
-    /// 按该名 dlopen，文件名必须对齐）。
+    /// —— 支持改名（v0.2.22 起 zink 不再用：落盘名 = ZL2 APK 原名）。
     ApkExtract(&'static str, &'static [(&'static str, &'static str)]),
     /// v0.2.17：下载 zip 后按 basename 提取（.so/.json）—— Turnip 驱动包
     /// （本仓 CI 自建 mesa ICD 的发布资产，zip 根级平铺，非 APK 布局）。
@@ -73,31 +72,27 @@ const MOBILEGLUES_APK: &str =
 /// 逐字节相同（sha256 一致），仅 libc++_shared.so 不同 —— 本版统一为 ZL2 原件。
 /// 设备侧要求：Vulkan 1.1+ 驱动可用（zink 经系统 libvulkan.so 拿设备）。
 const ZINK_PACK_ZIP: &str = "https://github.com/Gsjsjzhznsz/Rust-Minecraft-Launcher/releases/latest/download/renderer-zink-aarch64.zip";
-/// zink 包制品代数：v0.2.20 = ZL2 2.8.2 提取（rev 2）。将来随 ZL2 升版递增。
-pub const ZINK_PACK_REV: u32 = 2;
+/// zink 包制品代数：v0.2.20 = ZL2 2.8.2 提取（rev 2）；v0.2.22 = 落盘名对齐
+/// ZL2（libzink_dri.so 不再改名，rev 3 触发老用户重装）。将来随 ZL2 升版递增。
+pub const ZINK_PACK_REV: u32 = 3;
 
 /// Zink pack 提取白名单（zip 内 basename → 落盘名）。
-/// v0.2.21：zip 条目与 ZL2 2.8.2 APK lib/arm64-v8a **逐文件同名同字节**
-/// —— libzink_dri.so 保留 ZL2 原名（v0.2.20 曾在 CI 改名 libgallium_dri.so，
-/// App 清单没跟上 → 静默跳过 → gallium 未落盘 → 「zink 下载失败」实锤）；
-/// SONAME 落盘改名（ZL2 内置该库 DT_SONAME 即 libgallium_dri.so，Mesa EGL
-/// 按该名 dlopen，文件名必须对齐）由本白名单在解包时执行。
-///
-/// 实机诊断（2026-11 v9）：pack 的 libcutils.so 是依赖 libc++_shared.so 的
-/// bionic shim（DT_NEEDED 实测确认）—— 白名单缺 libc++_shared.so 时
-/// dlopen(libcutils.so) 必败，连带 libEGL_mesa / libgallium_dri 全链失败，
-/// EGL 未初始化 → LWJGL 函数指针 NULL → pc=0 SIGSEGV。
-///
-/// v0.2.0-e 实机诊断②：pack 的 libcutils.so **无 DT_SONAME** —— bionic
-/// dlopen 按完整路径注册 soinfo，libgallium_dri/libEGL_mesa 的 DT_NEEDED
-/// "libcutils.so" 按名解析在 clns 命名空间必败。对策：提取原版落位后，
-/// game_bridge::ensure_zink_cutils_shim() 在预载前用带 SONAME 的 shim
-/// 覆盖（bridge/libcutils_shim.c 交叉编译，符号集与原版对齐）。
+/// v0.2.21：zip 条目与 ZL2 2.8.2 APK lib/arm64-v8a **逐文件同名同字节**。
+/// v0.2.22（用户指令「跟 ZL2 完全一样」）：落盘名同步对齐 ZL2 —— ZL2 APK
+/// 里磁盘名就是 libzink_dri.so，解包不再改名。发现链实锤（本会话反汇编
+/// amethyst kopper_zink 构建的 libEGL_mesa.so）：Mesa 23.0.4 补丁版
+/// loader_open_driver_lib 按 search_path_vars = {LIBGL_DRIVERS_PATH,
+/// LD_LIBRARY_PATH} 逐目录尝试 dir/tls/<name>_dri.so → dir/<name>_dri.so
+/// → dir/lib<name>_dri.so（第三式为该构建新增），driver_name=zink
+///（MESA_LOADER_DRIVER_OVERRIDE）→ 命中 libzink_dri.so；该库的
+/// DT_SONAME=libgallium_dri.so 只是链接器内部标识，与磁盘名无关。
+///（历史：v0.2.19 前白名单配着 IronizedZink APK 写、v0.2.20/21 落盘改名
+/// libgallium_dri.so —— 均非 ZL2 本尊布局，v0.2.22 纠正。）
 const ZINK_ZIP_LIBS: &[(&str, &str)] = &[
     ("libEGL_mesa.so", "libEGL_mesa.so"),
     ("libglapi.so", "libglapi.so"),
     ("libglxshim.so", "libglxshim.so"),
-    ("libzink_dri.so", "libgallium_dri.so"),
+    ("libzink_dri.so", "libzink_dri.so"),
     ("libcutils.so", "libcutils.so"),
     ("libc++_shared.so", "libc++_shared.so"),
 ];
@@ -166,14 +161,16 @@ pub fn catalog() -> &'static [RendererSpec] {
                 "GL4.6→Vulkan 桌面 GL（ZL2 官方同款 Mesa，Sodium/光影推荐档；需设备 Vulkan 1.1+）",
             source: Some(PackSource::ZipExtract(ZINK_PACK_ZIP, ZINK_ZIP_LIBS)),
             // 预载顺序 = 依赖拓扑：libc++_shared（cutils 的 NEEDED）-> cutils ->
-            // glapi -> glxshim（桌面 GL 符号表）-> gallium(zink) DRI 驱动。
-            // 链路任一缺失都会让 libEGL_mesa dlopen 失败（v9 实机根因）。
+            // glapi -> glxshim（桌面 GL 符号表）-> zink DRI 驱动（ZL2 磁盘名
+            // libzink_dri.so；ZL2 本尊等价动作 = Java 侧 dlopen libglxshim +
+            // Mesa loader 按 LD_LIBRARY_PATH 搜 libzink_dri.so）。链路任一
+            // 缺失都会让 libEGL_mesa dlopen 失败（v9 实机根因）。
             preload: &[
                 "libc++_shared.so",
                 "libcutils.so",
                 "libglapi.so",
                 "libglxshim.so",
-                "libgallium_dri.so",
+                "libzink_dri.so",
             ],
             size_hint: "约 15 MB",
             rev: ZINK_PACK_REV,
@@ -517,7 +514,9 @@ pub async fn download_and_install(
     }
     if !is_installed(id) {
         // v0.2.21：缺什么列什么（此前固定报 egl_lib —— v0.2.20 zink 接缝事故
-        // 实为 preload 缺 libgallium_dri.so，用户看到的却是「缺少 libEGL_mesa.so」）
+        // 实为 preload 缺当时落盘名的 zink DRI 驱动（libgallium_dri.so，
+        // v0.2.22 已改回 ZL2 原名 libzink_dri.so），用户看到的却是「缺少
+        // libEGL_mesa.so」）
         let mut missing: Vec<&str> = Vec::new();
         if !dir.join(spec.egl_lib).exists() {
             missing.push(spec.egl_lib);
@@ -742,13 +741,16 @@ mod tests {
     fn zink_pack_has_source_and_preload() {
         let spec = spec_for("zink").unwrap();
         // v0.2.20：制品来源 = ZL2 官方提取包（ZipExtract，CI 从 ZL2 Release
-        // APK 字节级提取，见 scripts/build_zinkpack.sh）；包代数 rev=2。
+        // APK 字节级提取，见 scripts/build_zinkpack.sh）；v0.2.22 rev=3。
         match &spec.source {
             Some(PackSource::ZipExtract(_, whitelist)) => {
-                // SONAME 对齐：libzink_dri.so 落盘为 libgallium_dri.so
+                // v0.2.22 对齐 ZL2 本尊布局：libzink_dri.so 落盘名 = 原名
+                //（磁盘文件名就是它，DT_SONAME libgallium_dri.so 只是链接器
+                // 内部标识；Mesa 补丁版 loader 按 LD_LIBRARY_PATH 搜
+                // libzink_dri.so）。
                 assert!(whitelist
                     .iter()
-                    .any(|(a, b)| *a == "libzink_dri.so" && *b == "libgallium_dri.so"));
+                    .any(|(a, b)| *a == "libzink_dri.so" && *b == "libzink_dri.so"));
                 assert!(whitelist.iter().any(|(a, _)| *a == "libEGL_mesa.so"));
                 assert!(whitelist.iter().any(|(a, _)| *a == "libcutils.so"));
                 // v0.2.21：CI 制品 ↔ App 契约逐条钉死 —— zip 条目名 = ZL2 APK
@@ -758,7 +760,7 @@ mod tests {
                     ("libEGL_mesa.so", "libEGL_mesa.so"),
                     ("libglapi.so", "libglapi.so"),
                     ("libglxshim.so", "libglxshim.so"),
-                    ("libzink_dri.so", "libgallium_dri.so"),
+                    ("libzink_dri.so", "libzink_dri.so"),
                     ("libcutils.so", "libcutils.so"),
                     ("libc++_shared.so", "libc++_shared.so"),
                 ];
@@ -772,7 +774,7 @@ mod tests {
         assert_eq!(spec.rev, ZINK_PACK_REV);
         assert!(spec.rev > 0);
         // 预载清单（v9 依赖拓扑）：libc++_shared -> cutils -> glapi ->
-        // glxshim -> gallium（链接器命名空间按名解析 NEEDED）
+        // glxshim -> zink DRI 驱动（ZL2 磁盘名 libzink_dri.so）
         assert_eq!(
             spec.preload,
             [
@@ -780,7 +782,7 @@ mod tests {
                 "libcutils.so",
                 "libglapi.so",
                 "libglxshim.so",
-                "libgallium_dri.so"
+                "libzink_dri.so"
             ]
         );
         // 白名单必须包含 libc++_shared.so —— pack 的 libcutils.so 依赖它
@@ -895,14 +897,14 @@ mod tests {
         let err = extract_zip_libs(
             &zip_path,
             &dest,
-            &[("libzink_dri.so", "libgallium_dri.so")],
+            &[("libzink_dri.so", "libzink_dri.so")],
         )
         .unwrap_err();
         assert!(
             err.to_string().contains("libzink_dri.so"),
             "报错应点名缺失条目：{err}"
         );
-        assert!(!dest.join("libgallium_dri.so").exists());
+        assert!(!dest.join("libzink_dri.so").exists());
         // 空白名单（turnip 全提取模式）不受严格校验影响
         assert!(extract_zip_libs(&zip_path, &dest, &[]).is_ok());
         std::fs::remove_dir_all(&work).ok();

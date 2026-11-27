@@ -34,3 +34,4 @@ skills/
 .astro/
 .zl2-cache/
 scripts/zl2_ref/
+.zl2-src/

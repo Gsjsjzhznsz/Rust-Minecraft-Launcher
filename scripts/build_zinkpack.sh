@@ -12,14 +12,18 @@
 #   libEGL_mesa.so / libglapi.so / libglxshim.so / libcutils.so /
 #   libc++_shared.so / libzink_dri.so —— 六件全部保留 ZL2 APK 内的原始文件名
 #   （与 ZL2 lib/arm64-v8a 逐文件同名同字节，字节 + 文件名级 1:1）。
-#   落盘改名 libzink_dri.so → libgallium_dri.so 由 App 端解包白名单
-#   （renderers.rs ZINK_ZIP_LIBS）执行：ZL2 内置该库的 DT_SONAME 即
-#   libgallium_dri.so，Mesa EGL 按名 dlopen，文件名须对齐。
+#   v0.2.22 起 App 解包同样保留原名（不再落盘改名 libzink_dri.so →
+#   libgallium_dri.so，那是 v0.2.20/21 的历史契约，见下方 v0.2.22 注记）。
 #
 # v0.2.21 事故复盘：v0.2.20 曾在本脚本内 mv 改名，zip 条目变 libgallium_dri.so
 # 而 App 白名单仍找 libzink_dri.so —— extract 静默跳过 → gallium 驱动未落盘 →
 # 用户看到「zink 下载失败」。修复：zip 恢复 ZL2 原名（改名职责归 App 解包层，
 # 与 v0.2.19 前 APK 布局契约一致），App 端白名单加严格校验（缺条目硬失败点名）。
+#
+# v0.2.22（用户指令「跟 ZL2 完全一样」）：落盘名同步对齐 ZL2 —— App 白名单
+# 改为 libzink_dri.so → libzink_dri.so（不再落盘改名；ZL2 APK 磁盘名就是
+# libzink_dri.so，DT_SONAME=libgallium_dri.so 只是链接器内部标识）。本脚本
+# zip 内容不变（仍是 ZL2 原名六件），包代数 rev 2→3 触发老用户重装。
 #
 # 制品指纹（ZL2 2.8.2 arm64-v8a，发布资产 sha256 由 Release API 核验）：
 #   APK sha256 = 532503adeb3a9a5b7236ba027f2c9473fd3fb19a1cf0e1970262dca52294fca8

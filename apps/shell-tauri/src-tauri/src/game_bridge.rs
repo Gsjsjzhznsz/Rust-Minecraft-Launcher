@@ -33,12 +33,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use tauri::Emitter;
 
-/// ZL2 移植（v0.2.18）：linker namespace 旁路 —— zink 的 Vulkan 通道
-/// （driver_namespace + 全新 SONAME 的 libvulkan 实例；nsbypass.c +
-/// loadTurnipVulkan 的 Rust 移植，详见模块文档）。挂在 game_bridge 之下
-/// 仅随 Android 构建编译（父模块 #![cfg(target_os = "android")]）。
-#[path = "zl2_linker.rs"]
-mod zl2_linker;
+// v0.2.18~21 曾在此挂载 zl2_linker 模块（ZL2 nsbypass.c/loadTurnipVulkan 的
+// namespace 旁路移植 + RimDroid 救场链）。v0.2.22 对照 ZL2 2.8.2 实物源码
+// 反汇编实锤：driver_helper.c 整段包在 `#ifdef ADRENO_POSSIBLE` 且宏被注释
+// —— ZL2 编译产物中根本不存在这条链路，zink 的 Vulkan 装载是无条件
+// dlopen("libvulkan.so")。按用户指令「跟 ZL2 完全一样」，本模块整体删除
+//（git 历史保留 v0.2.18~21 移植实现）。
 
 type EnvPtr = *mut jni_sys::JNIEnv;
 type VmPtr = *mut jni_sys::JavaVM;
@@ -218,36 +218,9 @@ fn sanitize_vk_probe_env() {
 
 /// v0.2.20：按子进程胜出通道补载 ICD 的 open_icd_handle 已随探针编队删除
 ///（ZL2 无此机制）。
-
-/// v0.2.18：turnip 包内 ICD JSON 的 library_path 改写为绝对路径。
-/// Vulkan loader 对相对 library_path 的解析基线（JSON 目录 vs CWD）随实现
-/// 而异 —— 直连通道不用 JSON（句柄直传），但 ZL2 通道的全新 libvulkan
-/// 实例靠 VK_ICD_FILENAMES 找 ICD，绝对路径消除歧义。幂等 + best-effort。
-fn ensure_turnip_icd_json_absolute(dir: &Path) {
-    let json = dir.join("freedreno_icd.json");
-    let Ok(text) = std::fs::read_to_string(&json) else {
-        return;
-    };
-    let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&text) else {
-        return;
-    };
-    let lib = v["ICD"]["library_path"]
-        .as_str()
-        .unwrap_or_default()
-        .to_string();
-    if lib.is_empty() || lib.starts_with('/') {
-        return;
-    }
-    let abs = dir.join(&lib);
-    v["ICD"]["library_path"] = serde_json::json!(abs.to_string_lossy().into_owned());
-    if let Ok(out) = serde_json::to_string_pretty(&v) {
-        let _ = std::fs::write(&json, out);
-        eprintln!(
-            "[quartz] turnip ICD json library_path 已改写为绝对路径：{}",
-            abs.display()
-        );
-    }
-}
+/// v0.2.22：turnip ICD JSON 绝对路径改写（ensure_turnip_icd_json_absolute）
+/// 随 namespace 通道一并删除 —— ZL2 zink 从不设置 VK_ICD_FILENAMES，系统
+/// loader 按平台默认规则发现厂商 ICD。
 
 /// 显示桥 .so 落位：runtime_dir()/libpojavexec.so + lwjgl3/natives/libpojavexec.so
 /// （后者是 OpenJDK System.loadLibrary("pojavexec") 的 java.library.path 首目录，
@@ -285,29 +258,14 @@ pub fn ensure_hook_jar() -> Result<(), String> {
     Ok(())
 }
 
-/// zink 专用：以带正确 SONAME 的 libcutils shim 覆盖 pack 缺陷库。
-///
-/// 根因（实机 2026-11）：IronizedZink v1.1.0 的 libcutils.so 无 DT_SONAME，
-/// bionic dlopen 按完整路径注册 soinfo；libgallium_dri / libEGL_mesa 的
-/// DT_NEEDED "libcutils.so" 按名解析在 clns 命名空间必败（两次预载 pass
-/// 均失败，EGL 起不来）。shim 由交叉 gcc 编译（SONAME=libcutils.so、
-/// 无 DT_NEEDED、property_* 转发系统 bionic、atrace no-op），符号集与
-/// pack 原版完全对齐。幂等：size 一致即跳过。
-pub fn ensure_zink_cutils_shim() -> Result<(), String> {
-    const SHIM: &[u8] = include_bytes!("../bridge/libqzcutils.so");
-    let dst = crate::renderers::install_dir("zink").join("libcutils.so");
-    if !dst.parent().map(|p| p.exists()).unwrap_or(false) {
-        return Ok(()); // zink 未安装（不选 zink 渲染时目录不存在，跳过）
-    }
-    let stale = std::fs::metadata(&dst)
-        .map(|m| m.len() != SHIM.len() as u64)
-        .unwrap_or(true);
-    if stale {
-        std::fs::write(&dst, SHIM).map_err(|e| format!("写入 libcutils shim 失败：{e}"))?;
-        eprintln!("[quartz] zink libcutils shim 已落位（SONAME 修复覆盖 pack 缺陷库）");
-    }
-    Ok(())
-}
+// v0.2.22：libcutils shim（ensure_zink_cutils_shim / bridge/libcutils_shim.c /
+// libqzcutils.so）整体删除。shim 是 IronizedZink 时代（v0.2.0-e 实机）的
+// 变通 —— 当时 pack 的 libcutils 无 SONAME 且我们的装载链路靠绝对路径
+// 预载，DT_NEEDED 按名解析不通。ZL2 2.8.2 实物证明：其自带 libcutils
+// 同样无 DT_SONAME（本会话 ELF 解析实锤），zink 照常工作 —— 靠的是
+// LD_LIBRARY_PATH 目录按文件名解析（Mesa 补丁版 loader 亦按
+// LD_LIBRARY_PATH 搜 libzink_dri.so）。v0.2.22 装载链对齐 ZL2 后，
+// shim 沦为「覆盖 ZL2 原版库」的非 1:1 污染，删除。
 
 // ---------------------------------------------------------------------------
 // Vulkan 设备就绪探针（v0.2.13，zink 专用）
@@ -1983,22 +1941,38 @@ unsafe fn run_game_from_spec(
     std::env::set_var("JAVA_HOME", &jre_home);
     std::env::set_var("HOME", &workdir);
     let active_renderer = crate::renderers::active();
-    let ld = format!(
-        "{}:{}",
-        crate::renderers::install_dir(&active_renderer).display(),
-        crate::lwjgl::natives_dir().display()
-    );
+    // LD_LIBRARY_PATH = ZL2 Launcher.kt getLibraryPath() 同款顺序（角色映射：
+    // lwjglNativesDir→lwjgl natives；RendererPlugin.path→渲染层安装目录；
+    // DIR_NATIVE_LIB→runtime_dir；mod 运行时目录无对应物，省略）。amethyst
+    // kopper_zink 构建的 Mesa loader 按 {LIBGL_DRIVERS_PATH, LD_LIBRARY_PATH}
+    // 逐目录搜 libzink_dri.so（格式 dir/tls/<n>_dri.so → dir/<n>_dri.so →
+    // dir/lib<n>_dri.so，第三式为补丁新增）—— 渲染层目录在列即 ZL2 同款
+    // 发现路径；/system_ext/lib64 兼顾厂商包装层依赖。
+    let ld = [
+        crate::lwjgl::natives_dir().display().to_string(),
+        "/system/lib64".to_string(),
+        "/vendor/lib64".to_string(),
+        "/vendor/lib64/hw".to_string(),
+        "/system_ext/lib64".to_string(),
+        crate::renderers::install_dir(&active_renderer).display().to_string(),
+        crate::paths::runtime_dir().display().to_string(),
+    ]
+    .join(":");
     std::env::set_var("LD_LIBRARY_PATH", ld);
     let tmp_dir = crate::paths::runtime_dir().join("tmp");
     let _ = std::fs::create_dir_all(&tmp_dir);
     std::env::set_var("TMPDIR", &tmp_dir);
+    // POJAVEXEC_EGL = ZL2 GameLauncher.kt:469 同款裸名（无路径前缀，
+    // dlopen 按 LD_LIBRARY_PATH 解析 —— 上行已含渲染层目录）；
+    // SDL_EGL_LIBRARY = ZL2 同款绝对路径（eglName 拼库目录，文件存在才设）。
     let egl_lib = crate::renderers::spec_for(&active_renderer)
         .map(|s| s.egl_lib)
         .unwrap_or("libEGL.so");
-    std::env::set_var(
-        "POJAVEXEC_EGL",
-        crate::renderers::install_dir(&active_renderer).join(egl_lib),
-    );
+    std::env::set_var("POJAVEXEC_EGL", egl_lib);
+    let sdl_egl = crate::renderers::install_dir(&active_renderer).join(egl_lib);
+    if sdl_egl.is_file() {
+        std::env::set_var("SDL_EGL_LIBRARY", &sdl_egl);
+    }
     // Zink（Mesa GL4.6→Vulkan）走真桌面 GL 上下文（EGL_KHR_create_context）；
     // 其余渲染层维持 GLES 语义。桥按 POJAV_RENDERER 是否含 "desktopgl" 分流。
     if active_renderer == "zink" {
@@ -2007,12 +1981,10 @@ unsafe fn run_game_from_spec(
         // Pojav 系 Mesa fork 的窗口层门控 —— kopper 用 Vulkan swapchain
         // 作窗口系统（绕过 DRM），设备发现走进程内 Vulkan loader。
         std::env::set_var("POJAV_RENDERER", "opengles3_desktopgl_zink_kopper");
-        // Mesa DRI 驱动（libgallium_dri.so）搜索路径：Android 构建不从系统
-        // dri 目录找驱动，必须指向渲染层目录本身。
-        std::env::set_var(
-            "LIBGL_DRIVERS_PATH",
-            crate::renderers::install_dir(&active_renderer),
-        );
+        // LIBGL_DRIVERS_PATH：ZL2 不设（amethyst loader 的 search_path_vars
+        // = {LIBGL_DRIVERS_PATH, LD_LIBRARY_PATH}，首项未设时自然落到
+        // LD_LIBRARY_PATH —— 与 ZL2 运行时路径完全一致，v0.2.22 删除本
+        // set_var，驱动发现统一走 LD_LIBRARY_PATH）。
     } else {
         std::env::set_var("POJAV_RENDERER", format!("opengles_{active_renderer}"));
     }
@@ -2020,182 +1992,97 @@ unsafe fn run_game_from_spec(
         std::env::set_var(k, v);
     }
 
-    // 1.4) zink：SONAME 修复 shim 覆盖 pack 缺陷 libcutils（预载前必须就位）
-    if active_renderer == "zink" {
-        if let Err(e) = ensure_zink_cutils_shim() {
-            eprintln!("[quartz] libcutils shim 落位失败（zink 按名解析将失败）：{e}");
-        }
-    }
-
-    // 1.4.5) zink：Vulkan 装载 + VULKAN_PTR 落位（v0.2.20 = ZL2 egl_bridge.c
-    //        load_vulkan() 1:1，用户指令「跟 ZL2 一模一样」）。
+    // 1.4) zink：Vulkan 装载 + VULKAN_PTR 落位（v0.2.22 = ZL2 egl_bridge.c
+    //        load_vulkan() 完全 1:1，用户指令「跟 ZL2 完全一样」）。
     //
-    // ZL2 原文（ZalithLauncher2 ZalithLauncher/src/main/jni/egl_bridge.c）：
-    //   pojavInitOpenGL() kopper 分支（POJAV_RENDERER=opengles3_desktopgl_zink_kopper）：
+    // ZL2 原文（ZalithLauncher2 2.8.2 jni/egl_bridge.c）：
+    //   pojavInitOpenGL() kopper 分支：
     //     load_vulkan(); GALLIUM_DRIVER=zink; MESA_ANDROID_NO_KMS_SWRAST=1;
     //   load_vulkan()：
-    //     ① 非 POJAV_ZINK_PREFER_SYSTEM_DRIVER && API>=28 && ADRENO_POSSIBLE：
-    //        loadTurnipVulkan(DRIVER_PATH, TMPDIR) —— driver_helper.c 开头
-    //        checkAdrenoGraphics() 用默认 EGL 检 GL vendor，Mali 直接 NULL；
-    //     ② 兜底（所有设备的最终落点）：dlopen("libvulkan.so",
-    //        RTLD_LAZY|RTLD_LOCAL) —— 默认命名空间，无自定义 namespace、
-    //        无 ICD 直连、无设备验证、无探针门禁；
-    //     ③ set_vulkan_ptr(ptr) —— **无条件落位**，句柄为 NULL 也照设；
-    //        Mesa（VULKAN_PTR 补丁）从句柄只取 vkGetInstanceProcAddr。
+    //     if (zinkPreferSystemDriver == NULL && api >= 28) {
+    //         /* ADRENO_POSSIBLE 未定义 → 空块（loadTurnipVulkan 不存在） */
+    //     }
+    //     void* vulkanPtr = dlopen("libvulkan.so", RTLD_LAZY | RTLD_LOCAL);
+    //     set_vulkan_ptr(vulkanPtr);   // 无条件落位，NULL 也照设
     //
-    // v0.2.15~19 的探针编排（厂商 ICD 直连/厂商自动发现/验证制 loader 兑底）
-    // 与 ZINK_SKIP_PRECHECK fail-fast 全部删除 —— 那不是 ZL2 的机制，且实测
-    // 在天玑小米上把 zink 挡死在 EGL 之前（探针全败 → 不设 VULKAN_PTR →
-    // fail-fast → 回退 mobileglues）。ZL2 的哲学：把 loader 交给 Mesa，成败
-    // 由 EGL 初始化实战说话。fork 隔离的 EGL 预检保留为安全网（真失败 →
-    // QUARTZ_RENDERER_EGL_FAIL → 回退链），成功路径与 ZL2 完全一致。
+    // 实锤链（本会话反汇编 + 源码对照）：driver_helper.c 整段在
+    // #ifdef ADRENO_POSSIBLE 内且宏被注释 —— ZL2 2.8.2 编译产物中
+    // namespace 旁路/loadTurnipVulkan/救场链一律不存在。v0.2.18~21 的
+    // zl2_linker 模块（含 RimDroid 三级救场链）与 VK_ICD_FILENAMES 设置
+    // 全部删除；探针编队（厂商 ICD 直连/厂商自动发现/验证制 loader）
+    // 与 ZINK_SKIP_PRECHECK fail-fast 维持已删。ZL2 的哲学：把 loader
+    // 交给 Mesa，成败由 EGL 初始化实战说话。fork 隔离的 EGL 预检保留为
+    // 安全网（真失败 → QUARTZ_RENDERER_EGL_FAIL → 回退链），成功路径
+    // 与 ZL2 完全一致。
     if active_renderer == "zink" {
-        // ZL2 GameLauncher.kt initEnv 同款：DRIVER_PATH 指向驱动目录
+        // ZL2 GameLauncher.kt:189 同款：选了驱动插件（turnip 包 = 我们的
+        // 驱动插件等位物）时设 DRIVER_PATH = 插件库目录。ZL2 2.8.2 的
+        // native 端不消费该变量（消费点 driver_helper.c 已被 ifdef 关闭）
+        // —— 1:1 = 仅设不读。
         if crate::renderers::is_installed(crate::renderers::TURNIP_PACK_ID) {
             std::env::set_var(
                 "DRIVER_PATH",
                 crate::renderers::install_dir(crate::renderers::TURNIP_PACK_ID),
             );
         }
-        let mut notes: Vec<String> = Vec::new();
-        let mut report: String;
 
-        // ① Turnip 通道（仅骁龙；ZL2 loadTurnipVulkan 等价 = v0.2.18 zl2_linker
-        //    移植，隔离子进程验证 + 父进程重放）。POJAV_ZINK_PREFER_SYSTEM_
-        //    DRIVER=1 时跳过（ZL2 egl_bridge.c:115 同款开关）；Mali 设备无
-        //    /dev/kgsl-3d0 → turnip 包不会安装 → 直接落系统兜底通道。
+        // POJAV_ZINK_PREFER_SYSTEM_DRIVER（ZL2 egl_bridge.c:115 读取）：
+        // ADRENO_POSSIBLE 未编译时该开关在 ZL2 编译产物里不产生行为差异，
+        // 这里读取仅作日志证据。
         let prefer_system = std::env::var_os("POJAV_ZINK_PREFER_SYSTEM_DRIVER").is_some();
-        let turnip_dir = if prefer_system {
-            None
-        } else if crate::renderers::is_installed(crate::renderers::TURNIP_PACK_ID) {
-            Some(crate::renderers::install_dir(
-                crate::renderers::TURNIP_PACK_ID,
-            ))
+        eprintln!(
+            "[quartz] zink：load_vulkan（ZL2 1:1）POJAV_ZINK_PREFER_SYSTEM_DRIVER={}",
+            if prefer_system { "1" } else { "0" }
+        );
+        // 系统 loader 通道（ZL2 唯一路径）：默认命名空间 dlopen("libvulkan.so")，
+        // VULKAN_PTR 无条件落位 —— 句柄为 NULL 也照设（set_vulkan_ptr(NULL)
+        // 同款，Mesa 内部自兜底）。天玑/Mali 的系统 libvulkan 包装层
+        //（DT_NEEDED libgpud_sys.so，本体在 /system_ext/lib64）在默认命名
+        // 空间天然解析 —— 这正是 ZL2 在该设备跑通 zink 的通路。
+        let loader = CString::new("libvulkan.so").unwrap();
+        let vh = dlopen(loader.as_ptr(), RTLD_LAZY | RTLD_LOCAL);
+        if !vh.is_null() {
+            std::env::set_var("VULKAN_PTR", format!("{:x}", vh as usize));
+            eprintln!(
+                "[quartz] zink：VULKAN_PTR=系统 loader（默认命名空间 dlopen libvulkan.so，ZL2 OSMDroid 通道）"
+            );
         } else {
-            None
-        };
-        let mut via_turnip = false;
-        if let Some(tdir) = &turnip_dir {
-            ensure_turnip_icd_json_absolute(tdir);
-            let payload = fork_isolated_probe(8000, {
-                let tdir = tdir.clone();
-                move || unsafe {
-                    sanitize_vk_probe_env();
-                    let json = tdir.join("freedreno_icd.json");
-                    if json.exists() {
-                        std::env::set_var("VK_ICD_FILENAMES", &json);
-                        std::env::set_var("VK_DRIVER_FILES", &json);
-                    }
-                    match zl2_linker::zl2_driver_loader(Some(tdir.as_path())) {
-                        Ok((h, tier)) => match probe_vulkan_devices(h) {
-                            Ok(r) => format!("OK|turnip|{tier}|{r}"),
-                            Err(e) => format!("ERR|stage=probe:{e}"),
-                        },
-                        Err(e) => format!("ERR|{e}"),
-                    }
+            std::env::set_var("VULKAN_PTR", "0");
+            eprintln!(
+                "[quartz] zink：libvulkan.so 默认命名空间 dlopen 失败（{}）—— VULKAN_PTR=0 照设（ZL2 set_vulkan_ptr(NULL) 同款，Mesa 内部自兜底）",
+                short_dl(&last_dlerror())
+            );
+        }
+        // 诊断探针（仅日志证据，不参与任何胜负 —— ZL2 无探针，Mesa 成败由
+        // EGL 预检实战说话）：隔离子进程枚举设备，devices=N 证据落日志。
+        let report = if !vh.is_null() {
+            match fork_isolated_probe(4000, move || unsafe {
+                sanitize_vk_probe_env();
+                match probe_vulkan_devices(vh) {
+                    Ok(r) => format!("OK|{r}"),
+                    Err(e) => format!("ERR|{e}"),
                 }
-            });
-            match payload {
+            }) {
                 Ok(p) if p.starts_with("OK|") => {
-                    // 命名空间/句柄不跨 fork 存活（v0.2.18 结论）：父进程重放
-                    // 同一链自持实例落 VULKAN_PTR。
-                    let json = tdir.join("freedreno_icd.json");
-                    let json = if json.exists() { Some(json) } else { None };
-                    match zl2_linker::zl2_driver_loader(Some(tdir.as_path())) {
-                        Ok((h, _tier)) => {
-                            std::env::set_var("VULKAN_PTR", format!("{:x}", h as usize));
-                            if let Some(json) = json {
-                                std::env::set_var("VK_ICD_FILENAMES", &json);
-                                std::env::set_var("VK_DRIVER_FILES", &json);
-                            }
-                            let r = p.trim_start_matches("OK|turnip|").to_string();
-                            eprintln!(
-                                "[quartz] zink：VULKAN_PTR=ZL2 命名空间通道 Turnip loader（{r}）"
-                            );
-                            report = format!("QUARTZ_VK_PROBE:OK:zl2-ns {r}");
-                            via_turnip = true;
-                        }
-                        Err(e) => {
-                            notes.push(format!("ZL2 通道父进程重放失败：{e}"));
-                            report = String::new();
-                        }
-                    }
+                    format!("QUARTZ_VK_PROBE:OK:system {}", p.trim_start_matches("OK|"))
                 }
-                Ok(p) => {
-                    notes.push(format!(
-                        "ZL2 通道 Turnip（{}）",
-                        short_dl(p.trim_start_matches("ERR|").trim_start_matches('|'))
-                    ));
-                    report = String::new();
-                }
-                Err(e) => {
-                    notes.push(format!("ZL2 通道 Turnip：{e}"));
-                    report = String::new();
-                }
+                Ok(p) => format!(
+                    "QUARTZ_VK_PROBE:FAIL(log-only):system {}",
+                    p.trim_start_matches("ERR|")
+                ),
+                Err(e) => format!("QUARTZ_VK_PROBE:FAIL(log-only):system {e}"),
             }
         } else {
-            report = String::new();
-        }
-
-        // ② 系统 loader 兜底（ZL2 原味，所有设备的最终落点）：默认命名空间
-        //    dlopen("libvulkan.so")，VULKAN_PTR 无条件落位 —— 句柄为 NULL 也
-        //    照设（set_vulkan_ptr(NULL) 同款，Mesa 内部自兜底）。天玑/Mali 的
-        //    系统 libvulkan 包装层（DT_NEEDED libgpud_sys.so，本体在
-        //    /system_ext/lib64）在默认命名空间天然解析 —— 这正是 ZL2 在该
-        //    设备跑通 zink 的通路。
-        if !via_turnip {
-            // 防 turnip 残留污染：系统通道绝不带 VK_ICD_FILENAMES/VK_DRIVER_FILES
-            std::env::remove_var("VK_ICD_FILENAMES");
-            std::env::remove_var("VK_DRIVER_FILES");
-            let loader = CString::new("libvulkan.so").unwrap();
-            let vh = dlopen(loader.as_ptr(), RTLD_LAZY | RTLD_LOCAL);
-            if !vh.is_null() {
-                std::env::set_var("VULKAN_PTR", format!("{:x}", vh as usize));
-                eprintln!(
-                    "[quartz] zink：VULKAN_PTR=系统 loader（ZL2 兜底通道：默认命名空间 dlopen libvulkan.so）"
-                );
-            } else {
-                std::env::set_var("VULKAN_PTR", "0");
-                eprintln!(
-                    "[quartz] zink：libvulkan.so 默认命名空间 dlopen 失败（{}）—— VULKAN_PTR=0 照设（ZL2 set_vulkan_ptr(NULL) 同款，Mesa 内部自兜底）",
-                    short_dl(&last_dlerror())
-                );
-            }
-            // 诊断探针（仅日志证据，不参与任何胜负 —— ZL2 无探针，Mesa 成败由
-            // EGL 预检实战说话）：隔离子进程枚举设备，devices=N 证据落日志。
-            report = if !vh.is_null() {
-                match fork_isolated_probe(4000, move || unsafe {
-                    sanitize_vk_probe_env();
-                    match probe_vulkan_devices(vh) {
-                        Ok(r) => format!("OK|{r}"),
-                        Err(e) => format!("ERR|{e}"),
-                    }
-                }) {
-                    Ok(p) if p.starts_with("OK|") => {
-                        format!("QUARTZ_VK_PROBE:OK:system {}", p.trim_start_matches("OK|"))
-                    }
-                    Ok(p) => format!(
-                        "QUARTZ_VK_PROBE:FAIL(log-only):system {}",
-                        p.trim_start_matches("ERR|")
-                    ),
-                    Err(e) => format!("QUARTZ_VK_PROBE:FAIL(log-only):system {e}"),
-                }
-            } else {
-                "QUARTZ_VK_PROBE:FAIL(log-only):system dlopen 失败".to_string()
-            };
-        }
-        if !notes.is_empty() {
-            report.push_str(&format!("（notes：{}）", notes.join("；")));
-        }
+            "QUARTZ_VK_PROBE:FAIL(log-only):system dlopen 失败".to_string()
+        };
         let _ = VULKAN_PROBE_REPORT.set(report);
     }
 
-    // 1.5) 渲染层依赖预载（链接器命名空间按名解析 DT_NEEDED 时不搜索应用
-    //      数据目录：zink 的 libc++_shared/libcutils/libglapi/libglxshim/
-    //      libgallium_dri 必须由壳层按绝对路径先行 dlopen，之后 Mesa EGL
-    //      内部的按名 dlopen 才能命中已载 soinfo —— 否则 libEGL_mesa.so
-    //      本体都装不起来）。两遍执行：第一遍失败的多为依赖未就绪，第二遍
-    //      补刀；仍失败则记录 dlerror 详情（设备日志可直读根因）。
+    // 1.5) 渲染层依赖预载（v0.2.22 落盘名 = ZL2 原名；本预载为 Quartz 侧
+    //      诊断加厚 —— ZL2 等价动作是 Java 侧 dlopen libglxshim + Mesa
+    //      loader 按 LD_LIBRARY_PATH 搜 libzink_dri.so）。两遍执行：第一遍
+    //      失败的多为依赖未就绪，第二遍补刀；仍失败则记录 dlerror 详情
+    //      （设备日志可直读根因）。
     {
         let rdir = crate::renderers::install_dir(&active_renderer);
         let mut list: Vec<String> = crate::renderers::preload_libs(&active_renderer)
