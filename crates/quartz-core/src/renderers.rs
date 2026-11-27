@@ -33,6 +33,7 @@ pub enum PackSource {
     ApkExtract(&'static str, &'static [(&'static str, &'static str)]),
     /// v0.2.17：下载 zip 后按 basename 提取（.so/.json）—— Turnip 驱动包
     /// （本仓 CI 自建 mesa ICD 的发布资产，zip 根级平铺，非 APK 布局）。
+    /// v0.2.20：zink 包同模式 —— CI 从 ZL2 官方 Release APK 字节级提取。
     /// 列表为空 = 提取全部 .so/.json；非空 = 白名单 (zip 内 basename, 落盘名)。
     ZipExtract(&'static str, &'static [(&'static str, &'static str)]),
 }
@@ -53,19 +54,29 @@ pub struct RendererSpec {
     pub preload: &'static [&'static str],
     /// 粗略体积提示（UI 展示用）。
     pub size_hint: &'static str,
+    /// 包版本号（v0.2.20）：> 0 时安装目录落 .pack-rev 标记，
+    /// is_installed 校验不匹配即判未安装（包源/制品变更后自动重装）。
+    /// 0 = 不校验（兼容旧装包，不触发无谓重下）。
+    pub rev: u32,
 }
 
 const MOBILEGLUES_APK: &str =
     "https://github.com/MobileGL-Dev/MobileGlues-release/releases/download/V2.0.0/MobileGlues_2.0.0.apk";
 
-/// Zink（Mesa GL4.6→Vulkan + Kopper）：IronizedZink 官方发布插件 APK。
-/// 单一来源包含 Mesa 全套 bionic 构建（libEGL_mesa / libglapi / libglxshim /
-/// libgallium(zink) / libcutils 兼容层），面向 FCL/Zalith2 系（即 Pojav 约定）。
+/// Zink（Mesa GL4.6→Vulkan + Kopper）：**ZalithLauncher2 官方内置制品**（v0.2.20
+/// 起，用户指令「跟 ZL2 一模一样」）。CI（scripts/build_zinkpack.sh）从
+/// ZL2 官方 Release APK（2.8.2，sha256 锁定）字节级提取 Mesa 全套：
+/// libEGL_mesa / libglapi / libglxshim / libgallium(zink) / libcutils 兼容层 /
+/// libc++_shared（ZL2 官方 NDK r25c 构建）。
+/// 2026-11-27 比对存证：IronizedZink v1.1.0（旧源）的 Mesa 五件套与 ZL2 内置
+/// 逐字节相同（sha256 一致），仅 libc++_shared.so 不同 —— 本版统一为 ZL2 原件。
 /// 设备侧要求：Vulkan 1.1+ 驱动可用（zink 经系统 libvulkan.so 拿设备）。
-const IRONIZED_ZINK_APK: &str =
-    "https://github.com/GoyDevv/IronizedZink/releases/download/v1.1.0/Ironized-Zink-v1.1.0.apk";
+const ZINK_PACK_ZIP: &str = "https://github.com/Gsjsjzhznsz/Rust-Minecraft-Launcher/releases/latest/download/renderer-zink-aarch64.zip";
+/// zink 包制品代数：v0.2.20 = ZL2 2.8.2 提取（rev 2）。将来随 ZL2 升版递增。
+pub const ZINK_PACK_REV: u32 = 2;
 
-/// Zink pack 提取白名单（跳过插件 App 自身的支持库；libzink_dri 改名对齐 SONAME）。
+/// Zink pack 提取白名单（zip 内 basename → 落盘名；libzink_dri 改名对齐
+/// SONAME —— ZL2 内置该库的 DT_SONAME 即 libgallium_dri.so）。
 ///
 /// 实机诊断（2026-11 v9）：pack 的 libcutils.so 是依赖 libc++_shared.so 的
 /// bionic shim（DT_NEEDED 实测确认）—— 白名单缺 libc++_shared.so 时
@@ -77,7 +88,7 @@ const IRONIZED_ZINK_APK: &str =
 /// "libcutils.so" 按名解析在 clns 命名空间必败。对策：提取原版落位后，
 /// game_bridge::ensure_zink_cutils_shim() 在预载前用带 SONAME 的 shim
 /// 覆盖（bridge/libcutils_shim.c 交叉编译，符号集与原版对齐）。
-const ZINK_APK_LIBS: &[(&str, &str)] = &[
+const ZINK_ZIP_LIBS: &[(&str, &str)] = &[
     ("libEGL_mesa.so", "libEGL_mesa.so"),
     ("libglapi.so", "libglapi.so"),
     ("libglxshim.so", "libglxshim.so"),
@@ -103,6 +114,7 @@ pub fn catalog() -> &'static [RendererSpec] {
             source: Some(PackSource::Raw(&[(URL_GL4ES, "libgl4es_114.so")])),
             preload: &[],
             size_hint: "约 1.5 MB",
+            rev: 0,
         },
         RendererSpec {
             id: "mobileglues",
@@ -113,6 +125,7 @@ pub fn catalog() -> &'static [RendererSpec] {
             source: Some(PackSource::ApkExtract(MOBILEGLUES_APK, &[])),
             preload: &[],
             size_hint: "约 30 MB",
+            rev: 0,
         },
         RendererSpec {
             id: "angle",
@@ -126,6 +139,7 @@ pub fn catalog() -> &'static [RendererSpec] {
             ])),
             preload: &[],
             size_hint: "约 8 MB",
+            rev: 0,
         },
         RendererSpec {
             id: "vgpu",
@@ -136,14 +150,16 @@ pub fn catalog() -> &'static [RendererSpec] {
             source: Some(PackSource::Raw(&[(URL_VGPU, "libvgpu.so")])),
             preload: &[],
             size_hint: "约 0.6 MB",
+            rev: 0,
         },
         RendererSpec {
             id: "zink",
             name: "Zink",
             egl_lib: "libEGL_mesa.so",
             gl_lib: "libglxshim.so",
-            note: "GL4.6→Vulkan 桌面 GL（Mesa Zink+Kopper，Sodium/光影推荐档；需设备 Vulkan 1.1+）",
-            source: Some(PackSource::ApkExtract(IRONIZED_ZINK_APK, ZINK_APK_LIBS)),
+            note:
+                "GL4.6→Vulkan 桌面 GL（ZL2 官方同款 Mesa，Sodium/光影推荐档；需设备 Vulkan 1.1+）",
+            source: Some(PackSource::ZipExtract(ZINK_PACK_ZIP, ZINK_ZIP_LIBS)),
             // 预载顺序 = 依赖拓扑：libc++_shared（cutils 的 NEEDED）-> cutils ->
             // glapi -> glxshim（桌面 GL 符号表）-> gallium(zink) DRI 驱动。
             // 链路任一缺失都会让 libEGL_mesa dlopen 失败（v9 实机根因）。
@@ -154,7 +170,8 @@ pub fn catalog() -> &'static [RendererSpec] {
                 "libglxshim.so",
                 "libgallium_dri.so",
             ],
-            size_hint: "约 14 MB",
+            size_hint: "约 15 MB",
+            rev: ZINK_PACK_REV,
         },
         RendererSpec {
             id: "nggl4es",
@@ -165,6 +182,7 @@ pub fn catalog() -> &'static [RendererSpec] {
             source: None,
             preload: &[],
             size_hint: "约 5 MB",
+            rev: 0,
         },
     ]
 }
@@ -194,6 +212,7 @@ static TURNIP_SPEC: RendererSpec = RendererSpec {
     source: Some(PackSource::ZipExtract(TURNIP_ZIP, &[])),
     preload: &[],
     size_hint: "约 17 MB",
+    rev: 0,
 };
 
 /// turnip 驱动库落盘路径。
@@ -229,9 +248,20 @@ pub fn is_installed(id: &str) -> bool {
         return false;
     };
     let dir = install_dir(id);
-    dir.join(spec.egl_lib).exists()
+    if dir.join(spec.egl_lib).exists()
         && dir.join(spec.gl_lib).exists()
         && spec.preload.iter().all(|p| dir.join(p).exists())
+    {
+        // v0.2.20：包代数标记 —— rev > 0 的包要求 .pack-rev 存在且匹配
+        //（制品/来源变更后旧装包自动失效，ensure_renderer 启动前自动重装）
+        if spec.rev > 0 {
+            return std::fs::read_to_string(dir.join(".pack-rev"))
+                .map(|t| t.trim() == spec.rev.to_string())
+                .unwrap_or(false);
+        }
+        return true;
+    }
+    false
 }
 
 /// 当前选中的渲染器 id（进程级；落盘于 game_root()/renderer.json）。
@@ -294,26 +324,33 @@ pub fn launch_env(id: &str) -> Vec<(String, String)> {
             ("LIBGL_ES".into(), "3".into()),
         ],
         "vgpu" => vec![("VGPU_NOERROR".into(), "1".into())],
-        // Zink/Kopper（v0.2.13 与 FCL/Zalith2 的 zink_kopper 分支逐项对齐）：
+        // Zink/Kopper（v0.2.20 与 ZL2 GameLauncher.kt needsZinkDriverOverride
+        // 分支逐项对齐 —— KopperZinkRenderer.mesaBased=true 同源）：
         // - GALLIUM_DRIVER + MESA_LOADER_DRIVER_OVERRIDE=zink 强制 gallium zink 驱动
-        // - MESA_ANDROID_NO_KMS_SWRAST=1（FCL/ZL2 同款）：Mesa android 平台
-        //   跳过 kms_swrast 探测（对当前 23.0.4 包是无效开关 —— 包内无该
-        //   字符串；包升级到主线新版本后立即生效）
-        // - 不再设 MESA_GL_VERSION_OVERRIDE/MESA_GLSL_VERSION_OVERRIDE：
-        //   FCL/ZL2 实测配方不含版本覆盖，强制 4.6 会向 MC 虚报驱动能力
-        // - driconf 三项（FCLauncher zink 分支同款）：放宽 GLSL 编译门禁
-        // - LIBGL_ES=3 作为桥 GLES 兑底的语义开关（桌面分支失败时使用）
+        //   （ZL2 egl_bridge.c pojavInitOpenGL kopper 分支设 GALLIUM_DRIVER，
+        //   Kotlin 侧设 MESA_LOADER_DRIVER_OVERRIDE —— 两边都设，语义一致）
+        // - MESA_ANDROID_NO_KMS_SWRAST=1（ZL2 egl_bridge.c 同款）：Mesa android
+        //   平台跳过 kms_swrast 探测
+        // - MESA_GL_VERSION_OVERRIDE=4.6 / MESA_GLSL_VERSION_OVERRIDE=460：
+        //   ZL2 GameLauncher.kt 同款（v0.2.13 曾删除，实锤 ZL2 现行代码就是设，
+        //   一模一样原则恢复）
+        // - driconf 三项（ZL2 同款环境变量形式）：放宽 GLSL 编译门禁
+        // - LIB_MESA_NAME=libglxshim.so：ZL2 mesaBased 渲染器同款（mesa 桥定位）
+        // - LIBGL_ES=3：ZL2 KopperZinkRenderer.getRendererEnv 同款
         "zink" => vec![
             ("GALLIUM_DRIVER".into(), "zink".into()),
             ("MESA_LOADER_DRIVER_OVERRIDE".into(), "zink".into()),
             ("MESA_ANDROID_NO_KMS_SWRAST".into(), "1".into()),
             ("MESA_VK_IGNORE_CONFORMANCE_WARNING".into(), "1".into()),
+            ("MESA_GL_VERSION_OVERRIDE".into(), "4.6".into()),
+            ("MESA_GLSL_VERSION_OVERRIDE".into(), "460".into()),
             ("force_glsl_extensions_warn".into(), "true".into()),
             ("allow_higher_compat_version".into(), "true".into()),
             (
                 "allow_glsl_extension_directive_midshader".into(),
                 "true".into(),
             ),
+            ("LIB_MESA_NAME".into(), "libglxshim.so".into()),
             ("LIBGL_ES".into(), "3".into()),
         ],
         _ => vec![],
@@ -469,6 +506,10 @@ pub async fn download_and_install(
         std::fs::remove_dir_all(&dir)?;
     }
     std::fs::rename(&staging, &dir)?;
+    // v0.2.20：包代数标记（rev > 0 的包才落，is_installed 按此判定重装）
+    if spec.rev > 0 {
+        std::fs::write(dir.join(".pack-rev"), spec.rev.to_string())?;
+    }
     if !is_installed(id) {
         return Err(Error::Other(format!(
             "渲染层安装不完整（缺少 {}）",
@@ -607,7 +648,8 @@ mod tests {
         assert!(launch_env("gl4es").iter().any(|(k, _)| k == "LIBGL_ES"));
         assert!(!launch_env("mobileglues").is_empty());
         assert!(launch_env("angle").is_empty());
-        // zink 注入配方与 FCL/Zalith2 一致（v0.2.13）
+        // zink 注入配方与 ZL2 GameLauncher.kt needsZinkDriverOverride 分支逐项
+        // 对齐（v0.2.20 一模一样）
         let zink = launch_env("zink");
         assert!(zink
             .iter()
@@ -618,17 +660,26 @@ mod tests {
         assert!(zink
             .iter()
             .any(|(k, v)| k == "MESA_ANDROID_NO_KMS_SWRAST" && v == "1"));
-        // FCL/ZL2 实测配方不含版本覆盖（v0.2.13 移除，避免虚报驱动能力）
-        assert!(!zink.iter().any(|(k, _)| k == "MESA_GL_VERSION_OVERRIDE"));
-        assert!(!zink.iter().any(|(k, _)| k == "MESA_GLSL_VERSION_OVERRIDE"));
+        // ZL2 现行代码就是设版本覆盖（v0.2.20 实锤恢复，一模一样）
+        assert!(zink
+            .iter()
+            .any(|(k, v)| k == "MESA_GL_VERSION_OVERRIDE" && v == "4.6"));
+        assert!(zink
+            .iter()
+            .any(|(k, v)| k == "MESA_GLSL_VERSION_OVERRIDE" && v == "460"));
+        assert!(zink
+            .iter()
+            .any(|(k, v)| k == "LIB_MESA_NAME" && v == "libglxshim.so"));
         assert!(zink.iter().any(|(k, _)| k == "LIBGL_ES"));
     }
 
     #[test]
     fn zink_pack_has_source_and_preload() {
         let spec = spec_for("zink").unwrap();
+        // v0.2.20：制品来源 = ZL2 官方提取包（ZipExtract，CI 从 ZL2 Release
+        // APK 字节级提取，见 scripts/build_zinkpack.sh）；包代数 rev=2。
         match &spec.source {
-            Some(PackSource::ApkExtract(_, whitelist)) => {
+            Some(PackSource::ZipExtract(_, whitelist)) => {
                 // SONAME 对齐：libzink_dri.so 落盘为 libgallium_dri.so
                 assert!(whitelist
                     .iter()
@@ -636,8 +687,10 @@ mod tests {
                 assert!(whitelist.iter().any(|(a, _)| *a == "libEGL_mesa.so"));
                 assert!(whitelist.iter().any(|(a, _)| *a == "libcutils.so"));
             }
-            _ => panic!("zink 应使用 ApkExtract 白名单提取"),
+            _ => panic!("zink 应使用 ZipExtract 白名单提取（ZL2 制品包）"),
         }
+        assert_eq!(spec.rev, ZINK_PACK_REV);
+        assert!(spec.rev > 0);
         // 预载清单（v9 依赖拓扑）：libc++_shared -> cutils -> glapi ->
         // glxshim -> gallium（链接器命名空间按名解析 NEEDED）
         assert_eq!(
@@ -653,7 +706,7 @@ mod tests {
         // 白名单必须包含 libc++_shared.so —— pack 的 libcutils.so 依赖它
         //（v9 实机根因：缺它则 libEGL_mesa 全链 dlopen 失败）
         match &spec.source {
-            Some(PackSource::ApkExtract(_, whitelist)) => {
+            Some(PackSource::ZipExtract(_, whitelist)) => {
                 assert!(whitelist.iter().any(|(a, _)| *a == "libc++_shared.so"));
             }
             _ => unreachable!(),

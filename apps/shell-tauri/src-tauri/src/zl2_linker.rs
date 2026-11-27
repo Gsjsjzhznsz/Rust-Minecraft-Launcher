@@ -262,7 +262,11 @@ mod ffi {
             return Err(format!("stage=zl2-create-ns:{}", dlerr_text()));
         }
         // ZL2 原值三项，逐项 best-effort（失败不阻断 —— 符号解析兜底走搜索路径）
-        for soname in ["ld-android.so", "libnativeloader.so", "libnativeloader_lazy.so"] {
+        for soname in [
+            "ld-android.so",
+            "libnativeloader.so",
+            "libnativeloader_lazy.so",
+        ] {
             let c = CString::new(soname).unwrap();
             let _ = link(ns, ptr::null_mut(), c.as_ptr());
         }
@@ -436,9 +440,7 @@ mod ffi {
                 Err(e) => last_err = format!("{last_err}；{e}"),
             }
         }
-        Err(format!(
-            "stage=zl2-loader-load:救场链全败（{last_err}）"
-        ))
+        Err(format!("stage=zl2-loader-load:救场链全败（{last_err}）"))
     }
 
     /// ZL2 loadTurnipVulkan 等效链（v0.2.18 移植主入口；v0.2.19 补救场链）。
@@ -530,12 +532,12 @@ fn patch_soname_in_bytes(buf: &mut [u8], id: u16) -> bool {
         if sh_type != SHT_DYNAMIC {
             continue;
         }
-        let sh_offset = u64::from_le_bytes(buf[sh + 0x18..sh + 0x20].try_into().unwrap_or([0; 8]))
-            as usize;
+        let sh_offset =
+            u64::from_le_bytes(buf[sh + 0x18..sh + 0x20].try_into().unwrap_or([0; 8])) as usize;
         let sh_size =
             u64::from_le_bytes(buf[sh + 0x20..sh + 0x28].try_into().unwrap_or([0; 8])) as usize;
-        let sh_link = u32::from_le_bytes(buf[sh + 0x28..sh + 0x2C].try_into().unwrap_or([0; 4]))
-            as usize;
+        let sh_link =
+            u32::from_le_bytes(buf[sh + 0x28..sh + 0x2C].try_into().unwrap_or([0; 4])) as usize;
         if sh_link >= e_shnum {
             return false;
         }
@@ -554,8 +556,8 @@ fn patch_soname_in_bytes(buf: &mut [u8], id: u16) -> bool {
             }
             let tag = u64::from_le_bytes(buf[e..e + 8].try_into().unwrap_or([0; 8]));
             if tag == DT_SONAME {
-                let off = u64::from_le_bytes(buf[e + 8..e + 16].try_into().unwrap_or([0; 8]))
-                    as usize;
+                let off =
+                    u64::from_le_bytes(buf[e + 8..e + 16].try_into().unwrap_or([0; 8])) as usize;
                 let name_pos = st_offset + off;
                 if name_pos + 3 > buf.len() {
                     return false;
@@ -613,7 +615,14 @@ mod tests {
             buf[s + 0x28..s + 0x2C].copy_from_slice(&link.to_le_bytes());
         };
         put(&mut buf, 0, 6, dyn_off as u64, 32, 1);
-        put(&mut buf, 1, 3, strtab_off as u64, soname_str.len() as u64, 0);
+        put(
+            &mut buf,
+            1,
+            3,
+            strtab_off as u64,
+            soname_str.len() as u64,
+            0,
+        );
         put(&mut buf, 2, 3, shstr_off as u64, shstr.len() as u64, 0);
 
         assert!(patch_soname_in_bytes(&mut buf, 0xABC));

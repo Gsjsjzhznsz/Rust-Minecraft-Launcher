@@ -67,11 +67,18 @@ jobs:
       - name: 构建 Turnip 驱动包
         run: sh scripts/build_turnip.sh
 
+      # v0.2.20：Zink 渲染层包 —— 从 ZalithLauncher2 官方 Release APK 字节级
+      # 提取 Mesa 五件套（与 ZL2 内置逐字节相同，sha256 锁定），随 Release
+      # 发布 renderer-zink-aarch64.zip（运行时在线下载，不内置 APK）
+      - name: 构建 Zink 渲染层包
+        run: sh scripts/build_zinkpack.sh
+
       - name: 产物信息
         run: |
           ls -la /home/z/my-project/download/Quartz.apk
           sha256sum /home/z/my-project/download/Quartz.apk
           ls -la /home/z/my-project/download/renderer-turnip-aarch64.zip
+          ls -la /home/z/my-project/download/renderer-zink-aarch64.zip
 
       - name: 上传 Artifact
         uses: actions/upload-artifact@v4
@@ -80,6 +87,7 @@ jobs:
           path: |
             /home/z/my-project/download/Quartz.apk
             /home/z/my-project/download/renderer-turnip-aarch64.zip
+            /home/z/my-project/download/renderer-zink-aarch64.zip
           if-no-files-found: error
           retention-days: 30
 
@@ -103,15 +111,17 @@ jobs:
           # 带版本号（存档）+ 不带版本号（运行时 releases/latest/download 直链）双名
           cp /home/z/my-project/download/renderer-turnip-aarch64.zip "/tmp/renderer-turnip-aarch64-${TAG}.zip"
           cp /home/z/my-project/download/renderer-turnip-aarch64.zip "/tmp/renderer-turnip-aarch64.zip"
+          cp /home/z/my-project/download/renderer-zink-aarch64.zip "/tmp/renderer-zink-aarch64-${TAG}.zip"
+          cp /home/z/my-project/download/renderer-zink-aarch64.zip "/tmp/renderer-zink-aarch64.zip"
           NOTES="$REL_NOTES"
           if [ -z "$NOTES" ]; then
             NOTES=$(printf '%b' "Quartz Android debug APK（自动构建）。\n\n- 包名：\`com.quartz.launcher\`\n- ABI：arm64-v8a\n- 构建提交：${GITHUB_SHA}\n- 安装前请先卸载旧版本（签名变更会导致安装失败）")
           fi
           if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" "/tmp/Quartz-${TAG}.apk" "/tmp/renderer-turnip-aarch64-${TAG}.zip" "/tmp/renderer-turnip-aarch64.zip" --clobber
+            gh release upload "$TAG" "/tmp/Quartz-${TAG}.apk" "/tmp/renderer-turnip-aarch64-${TAG}.zip" "/tmp/renderer-turnip-aarch64.zip" "/tmp/renderer-zink-aarch64-${TAG}.zip" "/tmp/renderer-zink-aarch64.zip" --clobber
             echo "[ci] 已上传资产到已有 Release $TAG"
           else
-            gh release create "$TAG" "/tmp/Quartz-${TAG}.apk" "/tmp/renderer-turnip-aarch64-${TAG}.zip" "/tmp/renderer-turnip-aarch64.zip" \
+            gh release create "$TAG" "/tmp/Quartz-${TAG}.apk" "/tmp/renderer-turnip-aarch64-${TAG}.zip" "/tmp/renderer-turnip-aarch64.zip" "/tmp/renderer-zink-aarch64-${TAG}.zip" "/tmp/renderer-zink-aarch64.zip" \
               --title "Quartz ${TAG}" \
               --notes "$NOTES" \
               --target "$GITHUB_SHA"

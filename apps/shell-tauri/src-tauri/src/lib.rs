@@ -2972,13 +2972,19 @@ fn ensure_turnip_pack(app: &AppHandle) {
             },
         );
     };
-    log("[quartz] zink：在线获取 Turnip 开源驱动（Mesa KGSL，骁龙免 root Vulkan，约 3.5MB）……".into());
+    log(
+        "[quartz] zink：在线获取 Turnip 开源驱动（Mesa KGSL，骁龙免 root Vulkan，约 3.5MB）……"
+            .into(),
+    );
     let (tx, mut rx) = tokio::sync::mpsc::channel::<DownloadProgress>(64);
     let app2 = app.clone();
     tauri::async_runtime::spawn(async move {
         while let Some(ev) = rx.recv().await {
             let line = if ev.stage == "error" {
-                format!("[quartz] Turnip 驱动下载错误：{}", ev.error.unwrap_or_default())
+                format!(
+                    "[quartz] Turnip 驱动下载错误：{}",
+                    ev.error.unwrap_or_default()
+                )
             } else {
                 format!("[quartz] Turnip 驱动下载 {}%", ev.percent as u32)
             };

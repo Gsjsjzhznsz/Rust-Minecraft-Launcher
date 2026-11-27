@@ -32,3 +32,5 @@ skills/
 
 # Astro 文档站构建缓存
 .astro/
+.zl2-cache/
+scripts/zl2_ref/
