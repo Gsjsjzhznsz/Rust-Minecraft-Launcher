@@ -33,6 +33,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use tauri::Emitter;
 
+/// ZL2 移植（v0.2.18）：linker namespace 旁路 —— zink 的 Vulkan 通道
+/// （driver_namespace + 全新 SONAME 的 libvulkan 实例；nsbypass.c +
+/// loadTurnipVulkan 的 Rust 移植，详见模块文档）。挂在 game_bridge 之下
+/// 仅随 Android 构建编译（父模块 #![cfg(target_os = "android")]）。
+#[path = "zl2_linker.rs"]
+mod zl2_linker;
+
 type EnvPtr = *mut jni_sys::JNIEnv;
 type VmPtr = *mut jni_sys::JavaVM;
 
@@ -255,6 +262,36 @@ unsafe fn open_icd_handle(path: &Path, how: &str) -> *mut c_void {
         }
         "sphal-abs" => load_sphal_library(&cs),
         _ => dlopen(cs.as_ptr(), RTLD_LAZY | RTLD_LOCAL),
+    }
+}
+
+/// v0.2.18：turnip 包内 ICD JSON 的 library_path 改写为绝对路径。
+/// Vulkan loader 对相对 library_path 的解析基线（JSON 目录 vs CWD）随实现
+/// 而异 —— 直连通道不用 JSON（句柄直传），但 ZL2 通道的全新 libvulkan
+/// 实例靠 VK_ICD_FILENAMES 找 ICD，绝对路径消除歧义。幂等 + best-effort。
+fn ensure_turnip_icd_json_absolute(dir: &Path) {
+    let json = dir.join("freedreno_icd.json");
+    let Ok(text) = std::fs::read_to_string(&json) else {
+        return;
+    };
+    let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return;
+    };
+    let lib = v["ICD"]["library_path"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    if lib.is_empty() || lib.starts_with('/') {
+        return;
+    }
+    let abs = dir.join(&lib);
+    v["ICD"]["library_path"] = serde_json::json!(abs.to_string_lossy().into_owned());
+    if let Ok(out) = serde_json::to_string_pretty(&v) {
+        let _ = std::fs::write(&json, out);
+        eprintln!(
+            "[quartz] turnip ICD json library_path 已改写为绝对路径：{}",
+            abs.display()
+        );
     }
 }
 
@@ -2091,6 +2128,96 @@ unsafe fn run_game_from_spec(
         let mut chosen: Option<(String, String, String)> = None; // (候选描述, 加载通道, 设备报告)
         let mut notes: Vec<String> = Vec::new();
 
+        // ①′ ZL2 移植通道（v0.2.18）：driver_namespace + 全新 SONAME 的
+        // libvulkan 实例 —— ZL2/FCL 的 zink 在骁龙上跑通的根本机制
+        // （nsbypass.c + loadTurnipVulkan 的 Rust 全量移植，见 zl2_linker.rs）。
+        // v0.2.15~17 的三条死路全部被它绕开：
+        //   - clns 公共库白名单：turnip DT_NEEDED libhardware.so「not found」
+        //     的死因 —— 裸命名空间搜索 /system/lib64，无公共库过滤；
+        //   - sphal permitted 限制：/data 下 turnip「not accessible」的死因
+        //     —— driver_namespace permitted 明确含 /data/；
+        //   - 既有 loader 实例 ICD 发现落空（vkCreateInstance SIGSEGV 死因）
+        //     —— 改 SONAME 的全新 libvulkan.so 在命名空间内自持 ICD 发现，
+        //     turnip 先行落位同命名空间。
+        // 命名空间/句柄不跨 fork 存活：隔离子进程验证可行后，父进程重放
+        // 同一链自持实例落 VULKAN_PTR（见下方 chosen=="zl2-ns" 分支）。
+        let turnip_dir = if crate::renderers::is_installed(crate::renderers::TURNIP_PACK_ID) {
+            Some(crate::renderers::install_dir(
+                crate::renderers::TURNIP_PACK_ID,
+            ))
+        } else {
+            None
+        };
+        if let Some(tdir) = &turnip_dir {
+            // 通道一：ZL2 原味 —— turnip ICD 先进命名空间 + VK_ICD_FILENAMES
+            // 绝对路径 JSON（启动前改写 library_path，消除 loader 相对路径
+            // 解析歧义）
+            ensure_turnip_icd_json_absolute(tdir);
+            let payload = fork_isolated_probe(8000, {
+                let tdir = tdir.clone();
+                move || unsafe {
+                    sanitize_vk_probe_env();
+                    let json = tdir.join("freedreno_icd.json");
+                    if json.exists() {
+                        std::env::set_var("VK_ICD_FILENAMES", &json);
+                        std::env::set_var("VK_DRIVER_FILES", &json);
+                    }
+                    match zl2_linker::zl2_driver_loader(Some(tdir.as_path())) {
+                        Ok(h) => match probe_vulkan_devices(h) {
+                            Ok(r) => format!("OK|turnip|{r}"),
+                            Err(e) => format!("ERR|stage=probe:{e}"),
+                        },
+                        Err(e) => format!("ERR|{e}"),
+                    }
+                }
+            });
+            match payload {
+                Ok(p) if p.starts_with("OK|") => {
+                    chosen = Some((
+                        "zl2-ns".to_string(),
+                        "turnip".to_string(),
+                        p.trim_start_matches("OK|turnip|").to_string(),
+                    ));
+                }
+                Ok(p) => notes.push(format!(
+                    "ZL2 通道·turnip（{}）",
+                    short_dl(p.trim_start_matches("ERR|").trim_start_matches('|'))
+                )),
+                Err(e) => notes.push(format!("ZL2 通道·turnip：{e}")),
+            }
+        }
+        // 通道一′：ZL2 命名空间 + 厂商 ICD 自动发现变体（无 turnip 包，或
+        // turnip 链失败后的二次尝试）：全新 loader 实例在裸命名空间内发现
+        // /vendor|/system|/odm 的厂商 ICD JSON，sphal 语义由 permitted=/vendor
+        // 兜住 —— 厂商 blob 可能借此首次可用（搜索路径含 vendor hw 目录，
+        // blob 的 vendor DT_NEEDED 也能解析）。
+        if chosen.is_none() {
+            let payload = fork_isolated_probe(8000, || unsafe {
+                sanitize_vk_probe_env();
+                match zl2_linker::zl2_driver_loader(None) {
+                    Ok(h) => match probe_vulkan_devices(h) {
+                        Ok(r) => format!("OK|auto|{r}"),
+                        Err(e) => format!("ERR|stage=probe:{e}"),
+                    },
+                    Err(e) => format!("ERR|{e}"),
+                }
+            });
+            match payload {
+                Ok(p) if p.starts_with("OK|") => {
+                    chosen = Some((
+                        "zl2-ns".to_string(),
+                        "auto".to_string(),
+                        p.trim_start_matches("OK|auto|").to_string(),
+                    ));
+                }
+                Ok(p) => notes.push(format!(
+                    "ZL2 通道·厂商自动发现（{}）",
+                    short_dl(p.trim_start_matches("ERR|").trim_start_matches('|'))
+                )),
+                Err(e) => notes.push(format!("ZL2 通道·厂商自动发现：{e}")),
+            }
+        }
+
         // ② 厂商 ICD 直连（每候选一个隔离子进程：候选 N 崩溃不影响 N+1）。
         // v0.2.16 加载通道按序尝试：sphal 文件名（系统 loader 加载 ICD 的同款
         // 通道，真实设备上普通 dlopen 被 clns namespace 拦截 —— v0.2.15 实机
@@ -2212,6 +2339,32 @@ unsafe fn run_game_from_spec(
         let mut skip_reason: Option<String> = None;
         let report: String;
         match &chosen {
+            Some((desc, _how, r)) if desc == "zl2-ns" => {
+                // v0.2.18：父进程重放 ZL2 链 —— 命名空间/句柄不跨 fork 存活，
+                // 必须父进程自持全新实例（子进程已验证同链在同进程形态可行）。
+                let json = turnip_dir
+                    .as_ref()
+                    .map(|d| d.join("freedreno_icd.json"))
+                    .filter(|p| p.exists());
+                match zl2_linker::zl2_driver_loader(turnip_dir.as_deref()) {
+                    Ok(h) => {
+                        std::env::set_var("VULKAN_PTR", format!("{:x}", h as usize));
+                        if let Some(json) = json {
+                            std::env::set_var("VK_ICD_FILENAMES", &json);
+                            std::env::set_var("VK_DRIVER_FILES", &json);
+                        }
+                        eprintln!(
+                            "[quartz] zink：VULKAN_PTR=ZL2 命名空间通道 loader 实例（{r}）"
+                        );
+                        report = format!("QUARTZ_VK_PROBE:OK:zl2-ns {r}");
+                    }
+                    Err(e) => {
+                        eprintln!("[quartz] zink：ZL2 通道父进程重放失败（{e}）—— 按全败处理");
+                        skip_reason = Some(format!("ZL2 通道父进程重放失败：{e}"));
+                        report = format!("QUARTZ_VK_PROBE:FAIL:ZL2 通道父进程重放失败：{e}");
+                    }
+                }
+            }
             Some((desc, _how, r)) if desc == "loader" => {
                 std::env::set_var("VULKAN_PTR", format!("{:x}", vh as usize));
                 eprintln!("[quartz] zink：VULKAN_PTR=系统 loader（{r}）");
