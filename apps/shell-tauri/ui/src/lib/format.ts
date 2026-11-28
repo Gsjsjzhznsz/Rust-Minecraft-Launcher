@@ -18,11 +18,12 @@ export function fmtBytes(n: number): string {
   return mb + "MB";
 }
 
+/* 头像只输出色相变量（--av-h），形状与配色由当前设计语言的 CSS 决定 */
 export function avatarStyle(uuid: string): string {
   let h = 0;
   for (const c of uuid) h = (h * 31 + c.charCodeAt(0)) >>> 0;
   const hue = h % 360;
-  return `background: linear-gradient(135deg, hsl(${hue} 70% 62%), hsl(${(hue + 50) % 360} 70% 45%))`;
+  return `--av-h: ${hue}`;
 }
 
 export function avatarLetter(name: string): string {

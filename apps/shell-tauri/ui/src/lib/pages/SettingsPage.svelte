@@ -20,6 +20,7 @@
     viewLogTail,
   } from "../store.svelte";
   import { bytes } from "../format";
+  import ThemePicker from "../components/ThemePicker.svelte";
 
   let logSelect = $state("");
   let azureInput = $state("");
@@ -48,11 +49,25 @@
 <section class="page">
   <div class="page-head rise" style="--i:0">
     <h2>设置</h2>
-    <p class="page-sub">存储与关于</p>
+    <p class="page-sub">外观 / 存储与关于</p>
+  </div>
+
+  <!-- 外观：多设计语言实时切换 -->
+  <div class="card panel rise" style="--i:1">
+    <div class="card-title-row">
+      <Icon name="layers" />
+      <h3>外观 · 设计语言</h3>
+      <span class="badge badge-dim">实时切换</span>
+    </div>
+    <p class="page-sub">
+      每种设计语言是一套完整的 Token 契约 + 组件约束（色彩 / 形状 / 字体 / 动效节奏），
+      点击卡片即时应用全站，选择会被记住；侧栏与顶栏的色点可随时快切。
+    </p>
+    <ThemePicker />
   </div>
 
   <!-- 存储 -->
-  <div class="card glass rise" style="--i:1">
+  <div class="card panel rise" style="--i:2">
     <div class="card-title-row">
       <Icon name="folder" />
       <h3>存储</h3>
@@ -75,7 +90,7 @@
   </div>
 
   <!-- 渲染层 -->
-  <div class="card glass rise" style="--i:2">
+  <div class="card panel rise" style="--i:3">
     <div class="card-title-row">
       <Icon name="cube" />
       <h3>渲染层</h3>
@@ -123,7 +138,7 @@
   </div>
 
   <!-- 性能 -->
-  <div class="card glass rise" style="--i:3">
+  <div class="card panel rise" style="--i:4">
     <div class="card-title-row">
       <Icon name="bars" />
       <h3>性能</h3>
@@ -143,7 +158,7 @@
   </div>
 
   <!-- 启动参数 -->
-  <div class="card glass rise" style="--i:4">
+  <div class="card panel rise" style="--i:5">
     <div class="card-title-row">
       <Icon name="console" />
       <h3>启动参数</h3>
@@ -156,7 +171,7 @@
   </div>
 
   <!-- 微软登录配置 -->
-  <div class="card glass rise" style="--i:5">
+  <div class="card panel rise" style="--i:6">
     <div class="card-title-row">
       <Icon name="user" />
       <h3>微软登录配置</h3>
@@ -170,7 +185,7 @@
   </div>
 
   <!-- 游戏文件维护 -->
-  <div class="card glass rise" style="--i:6">
+  <div class="card panel rise" style="--i:7">
     <div class="card-title-row">
       <Icon name="refresh" />
       <h3>游戏文件维护</h3>
@@ -183,7 +198,7 @@
   </div>
 
   <!-- 启动日志 -->
-  <div class="card glass rise" style="--i:7">
+  <div class="card panel rise" style="--i:8">
     <div class="card-title-row">
       <Icon name="file" />
       <h3>启动日志</h3>
@@ -210,7 +225,7 @@
   </div>
 
   <!-- 目录结构 -->
-  <div class="card glass rise" style="--i:8">
+  <div class="card panel rise" style="--i:9">
     <div class="card-title-row">
       <Icon name="file" />
       <h3>标准 .minecraft 目录结构</h3>
@@ -227,7 +242,7 @@
   </div>
 
   <!-- 关于 -->
-  <div class="card glass rise" style="--i:9">
+  <div class="card panel rise" style="--i:10">
     <div class="card-title-row">
       <Icon name="check" />
       <h3>关于</h3>

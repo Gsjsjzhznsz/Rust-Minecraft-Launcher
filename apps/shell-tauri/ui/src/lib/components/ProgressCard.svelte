@@ -29,7 +29,7 @@
 </script>
 
 {#if visible}
-  <div class="progress-card glass glass-accent" transition:fade>
+  <div class="progress-card panel panel-accent" transition:fade>
     <div class="progress-head">
       <span class="progress-title">{title}</span>
       <span class="progress-stage">{stage}</span>

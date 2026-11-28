@@ -46,7 +46,7 @@
   </div>
 
   <!-- Hero：版本 + 启动 -->
-  <div class="card glass glass-accent hero-card rise" style="--i:1">
+  <div class="card panel panel-accent hero-card rise" style="--i:1">
     <div class="hero-main">
       <div class="hero-select">
         <label class="field-label" for="version-select">游戏版本</label>
@@ -105,7 +105,7 @@
 
   <!-- Bento：控制台 + 游戏目录 -->
   <div class="bento">
-    <div class="card glass console-card rise" style="--i:2">
+    <div class="card panel console-card rise" style="--i:2">
       <div class="card-title-row">
         <Icon name="console" />
         <h3>启动控制台</h3>
@@ -143,7 +143,7 @@
       />
     </div>
 
-    <div class="card glass rise" style="--i:3">
+    <div class="card panel rise" style="--i:3">
       <div class="card-title-row">
         <Icon name="folder" />
         <h3>游戏目录</h3>

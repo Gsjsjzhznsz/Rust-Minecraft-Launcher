@@ -1,0 +1,570 @@
+/* ================================================================
+   Quartz Launcher —— 设计语言层（themes.css）
+   ----------------------------------------------------------------
+   每种设计语言 = 完整 Token 覆盖 + 少量结构性识别规则。
+   Token 块挂在 [data-theme="…"] 上（html 或任意预览子树均生效）。
+   切换 = 换 html 的 data-theme 属性，零重排零刷新。
+
+   六种语言的取舍（按 Style Atlas 选型指南：先信息密度与品牌性格，
+   再谈视觉表现；全部有真实设计体系出处，拒绝「AI 味」通用拼贴）：
+   - swiss    瑞士国际主义：网格秩序、无衬线、hairline、无投影
+   - m3       Material You：语义色面、大圆角、状态层、emphasized 动效
+   - fluent   Fluent 云母：桌面分层材质、轻边框、冷静节奏
+   - terminal 开发者终端：等宽、提示符、日志结构、即时反馈
+   - brutal   新粗野主义：粗边框、硬偏移阴影、强排版
+   - pixel    像素复古：有限色板、块状浮雕、MC 气质
+   ================================================================ */
+
+/* ================================================================
+   1 · Material You（Material 3，浅色，绿色种子）
+   ================================================================ */
+[data-theme="m3"] {
+  color-scheme: light;
+
+  --bg-app: #f8faef;
+  --bg-panel: #f0f2e4;
+  --bg-panel-2: #eaecdd;
+  --bg-inset: #e5e8d6;
+  --bg-nav: #f3f4e9;
+  --bg-hover: rgba(27, 28, 21, 0.06);
+  --bg-active: rgba(27, 28, 21, 0.1);
+
+  --border-w: 1px;
+  --border: #c9cbba;
+  --border-strong: #45483b;
+  --border-dim: #dcdfcc;
+
+  --text: #1b1c15;
+  --text-dim: #45483b;
+  --text-faint: #75786a;
+  --text-on-accent: #ffffff;
+
+  --accent: #3b691f;
+  --accent-hover: #4d7d2e;
+  --accent-dim: #dce8c4;
+  --accent-border: #3b691f;
+  --accent-2: #3b691f;
+  --accent-2-dim: rgba(59, 105, 31, 0.06);
+
+  --ok: #1e6d3b;
+  --ok-dim: #d3e8d0;
+  --warn: #7a5900;
+  --warn-dim: #f2e3c2;
+  --err: #ba1a1a;
+  --err-dim: #f6d4d2;
+  --info: #265da8;
+  --info-dim: #d4e2f7;
+  --purple: #6750a4;
+  --purple-dim: #e6dcf7;
+
+  --r-lg: 24px;
+  --r-md: 16px;
+  --r-sm: 10px;
+  --r-pill: 999px;
+
+  --shadow-card: none;
+  --shadow-pop: 0 8px 24px rgba(27, 28, 21, 0.24);
+  --shadow-accent: none;
+
+  --font-body: "Roboto", system-ui, -apple-system, "Segoe UI", "Noto Sans SC", "PingFang SC", "Microsoft YaHei", sans-serif;
+  --font-display: "Roboto", system-ui, -apple-system, "Segoe UI", "Noto Sans SC", sans-serif;
+  --font-mono: "JetBrains Mono", "Cascadia Code", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --fs-body: 15px;
+  --weight-display: 800;
+  --ls-display: 0;
+  --tt-display: none;
+  --tt-label: none;
+  --ls-label: 0.02em;
+
+  --btn-hover-t: none;
+  --btn-active-t: scale(0.97);
+  --nav-indicator: 0px;
+
+  --motion-fast: 150ms;
+  --motion-nav: 220ms;
+  --motion-surface: 300ms;
+  --motion-status: 200ms;
+  --ease-out: cubic-bezier(0.2, 0, 0, 1);
+  --ease-standard: cubic-bezier(0.2, 0, 0, 1);
+  --ease-emphasized: cubic-bezier(0.05, 0.7, 0.1, 1);
+
+  --console-bg: #2c2e23;
+  --console-text: #e8e8dd;
+  --console-err: #ffb4ab;
+  --console-sys: #9ccf7f;
+  --console-dim: #8f9284;
+
+  --selection-bg: rgba(59, 105, 31, 0.18);
+}
+
+/* M3 结构规则：pill 形控件、无左侧指示条、无描边按钮、顶部主色晕染 */
+[data-theme="m3"] .backdrop {
+  background-image: radial-gradient(100% 45% at 50% 0%, rgba(59, 105, 31, 0.07), transparent 70%);
+}
+[data-theme="m3"] .nav { padding: 0 6px; }
+[data-theme="m3"] .nav-item { border-radius: 999px; }
+[data-theme="m3"] .nav-item.active::before { display: none; }
+[data-theme="m3"] .nav-item.active { background: var(--accent-dim); color: var(--accent); }
+[data-theme="m3"] .btn { border-color: transparent; border-radius: 999px; min-height: 40px; }
+[data-theme="m3"] .btn-ghost:hover { border-color: transparent; background: var(--bg-hover); }
+[data-theme="m3"] .btn-launch { border-color: transparent; }
+[data-theme="m3"] .btn-danger { border-color: transparent; }
+[data-theme="m3"] input, [data-theme="m3"] select, [data-theme="m3"] textarea {
+  border-radius: 14px 14px 4px 4px;
+}
+[data-theme="m3"] .bottom-nav { border-radius: 28px; }
+[data-theme="m3"] .logo { border-radius: 24px; }
+[data-theme="m3"] .td-dot, [data-theme="m3"] .tp-btn { border-radius: 8px; }
+[data-theme="m3"] .tp-preview .tp-btn { border-color: transparent; }
+
+/* ================================================================
+   2 · Fluent 云母（Windows 11 风格，深色石墨）
+   ================================================================ */
+[data-theme="fluent"] {
+  color-scheme: dark;
+
+  --bg-app: #20242a;
+  --bg-panel: #2b3037;
+  --bg-panel-2: #32373f;
+  --bg-inset: #262a30;
+  --bg-nav: #262b31;
+  --bg-hover: rgba(255, 255, 255, 0.055);
+  --bg-active: rgba(255, 255, 255, 0.09);
+
+  --border-w: 1px;
+  --border: rgba(255, 255, 255, 0.09);
+  --border-strong: rgba(255, 255, 255, 0.2);
+  --border-dim: rgba(255, 255, 255, 0.06);
+
+  --text: #f1f3f6;
+  --text-dim: #b9bfc9;
+  --text-faint: #8b91a0;
+  --text-on-accent: #05202e;
+
+  --accent: #6cc4f8;
+  --accent-hover: #85d1fa;
+  --accent-dim: rgba(108, 196, 248, 0.11);
+  --accent-border: #6cc4f8;
+  --accent-2: #6cc4f8;
+  --accent-2-dim: rgba(108, 196, 248, 0.06);
+
+  --ok: #6ccb5f;
+  --ok-dim: rgba(108, 203, 95, 0.12);
+  --warn: #f2c744;
+  --warn-dim: rgba(242, 199, 68, 0.12);
+  --err: #ff7c72;
+  --err-dim: rgba(255, 124, 114, 0.12);
+  --info: #60cdff;
+  --info-dim: rgba(96, 205, 255, 0.12);
+  --purple: #b49df0;
+  --purple-dim: rgba(180, 157, 240, 0.12);
+
+  --r-lg: 8px;
+  --r-md: 8px;
+  --r-sm: 5px;
+  --r-pill: 999px;
+
+  --shadow-card: inset 0 1px 0 rgba(255, 255, 255, 0.045), 0 2px 8px rgba(0, 0, 0, 0.2);
+  --shadow-pop: 0 8px 20px rgba(0, 0, 0, 0.34);
+  --shadow-accent: none;
+
+  --font-body: "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Noto Sans SC", "PingFang SC", "Microsoft YaHei", sans-serif;
+  --font-display: "Segoe UI Variable Display", "Segoe UI", system-ui, "Noto Sans SC", sans-serif;
+  --font-mono: "Cascadia Code", "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --fs-body: 15px;
+  --weight-display: 800;
+  --ls-display: 0;
+  --tt-display: none;
+  --tt-label: none;
+  --ls-label: 0.01em;
+
+  --btn-hover-t: none;
+  --btn-active-t: scale(0.98);
+  --nav-indicator: 3px;
+
+  --motion-fast: 140ms;
+  --motion-nav: 200ms;
+  --motion-surface: 280ms;
+  --motion-status: 180ms;
+  --ease-out: cubic-bezier(0.2, 0, 0, 1);
+  --ease-standard: cubic-bezier(0.2, 0, 0, 1);
+  --ease-emphasized: cubic-bezier(0.05, 0.7, 0.1, 1);
+
+  --console-bg: #17191d;
+  --console-text: #d5d9e0;
+  --console-err: #ff99a4;
+  --console-sys: #6cc4f8;
+  --console-dim: #71767f;
+
+  --selection-bg: rgba(108, 196, 248, 0.2);
+}
+
+/* Fluent 结构规则：云母材质、轻量分层、小圆角、冷静高光 */
+[data-theme="fluent"] .backdrop {
+  background:
+    radial-gradient(90% 55% at 18% 0%, rgba(108, 196, 248, 0.055), transparent 62%),
+    radial-gradient(80% 55% at 92% 100%, rgba(155, 140, 250, 0.045), transparent 60%),
+    linear-gradient(180deg, #21252b, #1d2026 60%, #20242a);
+}
+[data-theme="fluent"] .btn { border-radius: 5px; }
+[data-theme="fluent"] .btn-launch { border-radius: 6px; }
+[data-theme="fluent"] .nav-item { border-radius: 6px; }
+[data-theme="fluent"] .panel { box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.05), 0 2px 8px rgba(0, 0, 0, 0.18); }
+[data-theme="fluent"] .toast, [data-theme="fluent"] .bottom-nav {
+  background: rgba(43, 48, 55, 0.9);
+}
+
+/* ================================================================
+   3 · 开发者终端（等宽 / 提示符 / 日志结构）
+   ================================================================ */
+[data-theme="terminal"] {
+  color-scheme: dark;
+
+  --bg-app: #0b0f0b;
+  --bg-panel: #101510;
+  --bg-panel-2: #131a13;
+  --bg-inset: #0d120d;
+  --bg-nav: #0d120d;
+  --bg-hover: rgba(67, 214, 117, 0.08);
+  --bg-active: rgba(67, 214, 117, 0.14);
+
+  --border-w: 1px;
+  --border: rgba(67, 214, 117, 0.3);
+  --border-strong: rgba(67, 214, 117, 0.6);
+  --border-dim: rgba(67, 214, 117, 0.14);
+
+  --text: #c9e3c0;
+  --text-dim: #8aa886;
+  --text-faint: #5a7458;
+  --text-on-accent: #041007;
+
+  --accent: #43d675;
+  --accent-hover: #5ce689;
+  --accent-dim: rgba(67, 214, 117, 0.12);
+  --accent-border: #43d675;
+  --accent-2: #43d675;
+  --accent-2-dim: rgba(67, 214, 117, 0.06);
+
+  --ok: #43d675;
+  --ok-dim: rgba(67, 214, 117, 0.1);
+  --warn: #e8c840;
+  --warn-dim: rgba(232, 200, 64, 0.1);
+  --err: #ff5f56;
+  --err-dim: rgba(255, 95, 86, 0.1);
+  --info: #58b7ff;
+  --info-dim: rgba(88, 183, 255, 0.1);
+  --purple: #b48bff;
+  --purple-dim: rgba(180, 139, 255, 0.1);
+
+  --r-lg: 0px;
+  --r-md: 0px;
+  --r-sm: 0px;
+  --r-pill: 0px;
+
+  --shadow-card: none;
+  --shadow-pop: 0 0 0 1px rgba(67, 214, 117, 0.3), 0 8px 24px rgba(0, 0, 0, 0.55);
+  --shadow-accent: none;
+
+  --font-body: "JetBrains Mono", "Cascadia Code", ui-monospace, SFMono-Regular, Menlo, Consolas, "Noto Sans SC", monospace;
+  --font-display: "JetBrains Mono", "Cascadia Code", ui-monospace, SFMono-Regular, Menlo, Consolas, "Noto Sans SC", monospace;
+  --font-mono: "JetBrains Mono", "Cascadia Code", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --fs-body: 14px;
+  --weight-display: 700;
+  --ls-display: 0;
+  --tt-display: none;
+  --tt-label: none;
+  --ls-label: 0.04em;
+
+  --btn-hover-t: none;
+  --btn-active-t: none;
+  --nav-indicator: 0px;
+
+  --motion-fast: 90ms;
+  --motion-nav: 140ms;
+  --motion-surface: 200ms;
+  --motion-status: 120ms;
+  --ease-out: cubic-bezier(0, 0, 0.2, 1);
+  --ease-standard: cubic-bezier(0, 0, 0.2, 1);
+  --ease-emphasized: cubic-bezier(0, 0, 0.2, 1);
+
+  --console-bg: #050705;
+  --console-text: #b8d8b0;
+  --console-err: #ff5f56;
+  --console-sys: #43d675;
+  --console-dim: #4f6b4d;
+
+  --selection-bg: rgba(67, 214, 117, 0.22);
+}
+
+/* Terminal 结构规则：CRT 扫描线、提示符、注释式标题、反色按钮 */
+[data-theme="terminal"] .backdrop {
+  background:
+    repeating-linear-gradient(0deg, rgba(0, 0, 0, 0.16) 0px, rgba(0, 0, 0, 0.16) 1px, transparent 1px, transparent 3px),
+    radial-gradient(100% 40% at 50% 0%, rgba(67, 214, 117, 0.05), transparent 70%),
+    var(--bg-app);
+}
+[data-theme="terminal"] .card-title-row h3::before { content: "// "; color: var(--text-faint); }
+[data-theme="terminal"] .page-head h2::before { content: "$ "; color: var(--accent); }
+[data-theme="terminal"] .nav-item { font-family: var(--font-mono); }
+[data-theme="terminal"] .nav-item.active::before {
+  content: ">";
+  position: static;
+  transform: none;
+  width: auto; height: auto;
+  border-radius: 0;
+  background: none;
+  font-family: var(--font-mono);
+  font-weight: 700;
+}
+[data-theme="terminal"] .btn-primary { border-style: solid; }
+[data-theme="terminal"] .btn-ghost { border-color: transparent; }
+[data-theme="terminal"] .logo {
+  background: transparent;
+  border: 1px solid var(--accent);
+  color: var(--accent);
+}
+[data-theme="terminal"] .kv { border-bottom-style: solid; }
+[data-theme="terminal"] .path-line { color: var(--accent); }
+[data-theme="terminal"] .field-label::after { content: ":"; }
+
+/* ================================================================
+   4 · 新粗野主义（硬阴影 / 粗边框 / 强排版）
+   ================================================================ */
+[data-theme="brutal"] {
+  color-scheme: light;
+
+  --bg-app: #f2ede0;
+  --bg-panel: #fffdf6;
+  --bg-panel-2: #fffdf6;
+  --bg-inset: #e9e3d2;
+  --bg-nav: #f2ede0;
+  --bg-hover: rgba(17, 17, 17, 0.06);
+  --bg-active: rgba(17, 17, 17, 0.12);
+
+  --border-w: 2px;
+  --border: #111111;
+  --border-strong: #111111;
+  --border-dim: rgba(17, 17, 17, 0.28);
+
+  --text: #111111;
+  --text-dim: #333333;
+  --text-faint: #6b6b6b;
+  --text-on-accent: #111111;
+
+  --accent: #ffd613;
+  --accent-hover: #ffdf3d;
+  --accent-dim: rgba(255, 214, 19, 0.25);
+  --accent-border: #111111;
+  --accent-2: #2563eb;
+  --accent-2-dim: rgba(37, 99, 235, 0.08);
+
+  --ok: #00a878;
+  --ok-dim: rgba(0, 168, 120, 0.12);
+  --warn: #ff8800;
+  --warn-dim: rgba(255, 136, 0, 0.12);
+  --err: #e5484d;
+  --err-dim: rgba(229, 72, 77, 0.12);
+  --info: #2563eb;
+  --info-dim: rgba(37, 99, 235, 0.1);
+  --purple: #9d5bd2;
+  --purple-dim: rgba(157, 91, 210, 0.12);
+
+  --r-lg: 0px;
+  --r-md: 0px;
+  --r-sm: 0px;
+  --r-pill: 0px;
+
+  --shadow-card: 4px 4px 0 #111111;
+  --shadow-pop: 6px 6px 0 #111111;
+  --shadow-accent: 4px 4px 0 #111111;
+
+  --font-body: "Helvetica Neue", Helvetica, Arial, "Noto Sans SC", "PingFang SC", "Microsoft YaHei", sans-serif;
+  --font-display: "Arial Black", "Helvetica Neue", Arial, "Noto Sans SC", "PingFang SC", sans-serif;
+  --font-mono: "JetBrains Mono", "Cascadia Code", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --fs-body: 15px;
+  --weight-display: 900;
+  --ls-display: 0;
+  --tt-display: uppercase;
+  --tt-label: uppercase;
+  --ls-label: 0.08em;
+
+  --btn-hover-t: translate(-2px, -2px);
+  --btn-active-t: translate(2px, 2px);
+  --nav-indicator: 0px;
+
+  --motion-fast: 90ms;
+  --motion-nav: 120ms;
+  --motion-surface: 160ms;
+  --motion-status: 100ms;
+  --ease-out: cubic-bezier(0.3, 0, 0.2, 1);
+  --ease-standard: cubic-bezier(0.3, 0, 0.2, 1);
+  --ease-emphasized: cubic-bezier(0.3, 0, 0.2, 1);
+
+  --console-bg: #fffdf6;
+  --console-text: #111111;
+  --console-err: #e5484d;
+  --console-sys: #00a878;
+  --console-dim: #6b6b6b;
+
+  --selection-bg: #ffd613;
+}
+
+/* Brutalism 结构规则：按钮阴影随位移增减、标题荧光衬底、黑底激活导航 */
+[data-theme="brutal"] .btn:hover { box-shadow: 6px 6px 0 #111111; }
+[data-theme="brutal"] .btn:active { box-shadow: 1px 1px 0 #111111; }
+[data-theme="brutal"] .btn-ghost { box-shadow: none; }
+[data-theme="brutal"] .btn-ghost:hover { box-shadow: 4px 4px 0 #111111; background: var(--accent); color: #111; }
+[data-theme="brutal"] .btn-ghost:active { box-shadow: none; }
+[data-theme="brutal"] .btn-launch:hover { box-shadow: 6px 6px 0 #111111; }
+[data-theme="brutal"] .btn-launch:active { box-shadow: 1px 1px 0 #111111; }
+[data-theme="brutal"] .page-head h2 {
+  background: linear-gradient(transparent 55%, var(--accent) 55%, var(--accent) 92%, transparent 92%);
+  width: fit-content;
+  padding: 0 4px;
+}
+[data-theme="brutal"] .nav-item.active { background: #111111; color: #ffd613; }
+[data-theme="brutal"] .nav-item.active::before { display: none; }
+[data-theme="brutal"] .badge { border-width: 1.5px; }
+[data-theme="brutal"] .badge-dim { background: var(--bg-inset); }
+[data-theme="brutal"] .chip.active { background: var(--accent); color: #111; }
+[data-theme="brutal"] .avatar { color: #111; background: var(--accent); }
+[data-theme="brutal"] .version-list { box-shadow: 4px 4px 0 #111111; }
+[data-theme="brutal"] .toast { border-width: 2px; }
+[data-theme="brutal"] .panel-accent { border-width: 2px; }
+[data-theme="brutal"] .logo { color: #111; }
+
+/* ================================================================
+   5 · 像素复古（8-bit / 块状浮雕 / MC 气质）
+   ================================================================ */
+[data-theme="pixel"] {
+  color-scheme: dark;
+
+  --bg-app: #15171a;
+  --bg-panel: #23262b;
+  --bg-panel-2: #2b2e34;
+  --bg-inset: #1a1c20;
+  --bg-nav: #1d1f23;
+  --bg-hover: rgba(255, 255, 255, 0.06);
+  --bg-active: rgba(91, 189, 76, 0.18);
+
+  --border-w: 2px;
+  --border: #000000;
+  --border-strong: #000000;
+  --border-dim: rgba(255, 255, 255, 0.12);
+
+  --text: #e8e6df;
+  --text-dim: #a7a49a;
+  --text-faint: #6f6d66;
+  --text-on-accent: #0c2408;
+
+  --accent: #5bbd4c;
+  --accent-hover: #6ecf5e;
+  --accent-dim: rgba(91, 189, 76, 0.16);
+  --accent-border: #000000;
+  --accent-2: #f5c542;
+  --accent-2-dim: rgba(245, 197, 66, 0.1);
+
+  --ok: #5bbd4c;
+  --ok-dim: rgba(91, 189, 76, 0.14);
+  --warn: #f5c542;
+  --warn-dim: rgba(245, 197, 66, 0.14);
+  --err: #e0524a;
+  --err-dim: rgba(224, 82, 74, 0.14);
+  --info: #58c0f0;
+  --info-dim: rgba(88, 192, 240, 0.14);
+  --purple: #a874e8;
+  --purple-dim: rgba(168, 116, 232, 0.14);
+
+  --r-lg: 0px;
+  --r-md: 0px;
+  --r-sm: 0px;
+  --r-pill: 0px;
+
+  --shadow-card: inset 2px 2px 0 rgba(255, 255, 255, 0.06), inset -2px -2px 0 rgba(0, 0, 0, 0.45);
+  --shadow-pop: 0 0 0 2px #000000, 4px 4px 0 rgba(0, 0, 0, 0.5);
+  --shadow-accent: inset 2px 2px 0 rgba(255, 255, 255, 0.25), inset -2px -2px 0 rgba(0, 0, 0, 0.4);
+
+  --font-body: ui-monospace, "JetBrains Mono", "Cascadia Code", SFMono-Regular, Menlo, Consolas, "Noto Sans SC", monospace;
+  --font-display: ui-monospace, "JetBrains Mono", "Cascadia Code", SFMono-Regular, Menlo, Consolas, "Noto Sans SC", monospace;
+  --font-mono: ui-monospace, "JetBrains Mono", SFMono-Regular, Menlo, Consolas, monospace;
+  --fs-body: 14px;
+  --weight-display: 700;
+  --ls-display: 0.02em;
+  --tt-display: uppercase;
+  --tt-label: none;
+  --ls-label: 0.05em;
+
+  --btn-hover-t: none;
+  --btn-active-t: translate(1px, 1px);
+  --nav-indicator: 0px;
+
+  --motion-fast: 100ms;
+  --motion-nav: 140ms;
+  --motion-surface: 180ms;
+  --motion-status: 120ms;
+  --ease-out: steps(4, end);
+  --ease-standard: steps(4, end);
+  --ease-emphasized: steps(5, end);
+
+  --console-bg: #0e0f11;
+  --console-text: #cfd2c8;
+  --console-err: #e0524a;
+  --console-sys: #5bbd4c;
+  --console-dim: #6f6d66;
+
+  --selection-bg: rgba(91, 189, 76, 0.3);
+}
+
+/* Pixel 结构规则：8px 方格底纹、按钮浮雕反转、像素徽标 */
+[data-theme="pixel"] .backdrop {
+  background:
+    radial-gradient(120% 90% at 50% 110%, rgba(0, 0, 0, 0.4), transparent 55%),
+    conic-gradient(#17191d 25%, #1a1c21 0 50%, #17191d 0 75%, #1a1c21 0);
+  background-size: auto, 16px 16px;
+}
+[data-theme="pixel"] .btn { box-shadow: inset 2px 2px 0 rgba(255, 255, 255, 0.09), inset -2px -2px 0 rgba(0, 0, 0, 0.5); }
+[data-theme="pixel"] .btn:active { box-shadow: inset -2px -2px 0 rgba(255, 255, 255, 0.07), inset 2px 2px 0 rgba(0, 0, 0, 0.5); }
+[data-theme="pixel"] .btn-ghost { box-shadow: none; background: transparent; }
+[data-theme="pixel"] .btn-launch:active {
+  box-shadow: inset -2px -2px 0 rgba(255, 255, 255, 0.2), inset 2px 2px 0 rgba(0, 0, 0, 0.4);
+}
+[data-theme="pixel"] .nav-item.active { background: var(--accent); color: var(--text-on-accent); box-shadow: inset 2px 2px 0 rgba(255, 255, 255, 0.25), inset -2px -2px 0 rgba(0, 0, 0, 0.4); }
+[data-theme="pixel"] .nav-item.active::before { display: none; }
+[data-theme="pixel"] .badge { border-width: 1px; border-color: #000; box-shadow: 1px 1px 0 rgba(0, 0, 0, 0.6); }
+[data-theme="pixel"] .progress-bar { border-color: #000; }
+[data-theme="pixel"] .progress-fill { box-shadow: inset 0 2px 0 rgba(255, 255, 255, 0.3), inset 0 -2px 0 rgba(0, 0, 0, 0.3); border-radius: 0; }
+[data-theme="pixel"] .logo { box-shadow: inset 2px 2px 0 rgba(255, 255, 255, 0.3), inset -2px -2px 0 rgba(0, 0, 0, 0.4); }
+[data-theme="pixel"] .avatar { border-radius: 0; }
+[data-theme="pixel"] .toast { border-width: 2px; }
+[data-theme="pixel"] .tp-btn { border-radius: 0; }
+[data-theme="pixel"] .td-dot { border-radius: 0; }
+[data-theme="pixel"] .motion-switch .knob { border-radius: 0; }
+[data-theme="pixel"] .motion-switch .knob::after { border-radius: 0; }
+[data-theme="pixel"] input[type="range"]::-webkit-slider-thumb { border-radius: 0; }
+[data-theme="pixel"] .icon { stroke-width: 2.2; stroke-linecap: square; stroke-linejoin: miter; }
+
+/* ================================================================
+   瑞士国际主义结构规则（Token 默认值在 base.css，这里只补识别性细节）
+   ================================================================ */
+[data-theme="swiss"] .backdrop {
+  background-image:
+    linear-gradient(rgba(17, 17, 17, 0.033) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(17, 17, 17, 0.033) 1px, transparent 1px);
+  background-size: 24px 24px;
+}
+[data-theme="swiss"] .page-head { border-bottom: 2px solid #111; padding-bottom: 10px; }
+[data-theme="swiss"] .panel-accent { border-width: 2px; border-color: #111; }
+[data-theme="swiss"] .btn-launch { background: #111; border-color: #111; color: #fff; }
+[data-theme="swiss"] .btn-launch:hover { background: var(--accent); border-color: var(--accent); }
+[data-theme="swiss"] .logo { background: #111; border-color: #111; color: #fff; }
+[data-theme="swiss"] .nav-item.active::before { border-radius: 0; }
+[data-theme="swiss"] .avatar { border-radius: 0; }
+
+/* ================================================================
+   动效总开关（data-motion="off"：与 prefers-reduced-motion 同级处理）
+   ================================================================ */
+[data-motion="off"] *, [data-motion="off"] *::before, [data-motion="off"] *::after {
+  animation-duration: 0.01ms !important;
+  animation-iteration-count: 1 !important;
+  transition-duration: 0.01ms !important;
+}

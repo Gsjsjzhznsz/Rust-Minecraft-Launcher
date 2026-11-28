@@ -126,7 +126,7 @@
   {/if}
 
   <!-- Modloader 安装 -->
-  <div class="card glass rise" style="--i:3">
+  <div class="card panel rise" style="--i:3">
     <div class="card-title-row">
       <Icon name="note" />
       <h3>安装 Modloader</h3>

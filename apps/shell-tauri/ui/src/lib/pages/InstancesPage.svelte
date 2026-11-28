@@ -29,7 +29,7 @@
     <p class="page-sub">版本隔离：saves / mods / config 独立，资源与库全局共享（FCL 同款语义）</p>
   </div>
 
-  <div class="card glass rise" style="--i:1">
+  <div class="card panel rise" style="--i:1">
     <div class="card-title-row">
       <Icon name="grid" />
       <h3>新建实例</h3>
@@ -59,10 +59,10 @@
 
   <div class="account-list rise" style="--i:2">
     {#if instancesState.list.length === 0}
-      <div class="list-note glass">还没有实例：在上方创建，或直接使用全局 .minecraft</div>
+      <div class="list-note panel">还没有实例：在上方创建，或直接使用全局 .minecraft</div>
     {:else}
       {#each instancesState.list as inst (inst.id)}
-        <div class="card glass account-card" class:selected={inst.selected}>
+        <div class="card panel account-card" class:selected={inst.selected}>
           <span class="avatar">{inst.name.slice(0, 1).toUpperCase()}</span>
           <div class="account-info">
             <div class="account-name">

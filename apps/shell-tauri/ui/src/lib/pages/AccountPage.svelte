@@ -62,7 +62,7 @@
     <p class="page-sub">离线 / 微软 / authlib 外置登录，登录状态与下载完全解耦</p>
   </div>
 
-  <div class="card glass rise" style="--i:1">
+  <div class="card panel rise" style="--i:1">
     <div class="card-title-row">
       <Icon name="user" />
       <h3>添加离线账号</h3>
@@ -82,7 +82,7 @@
     {/if}
   </div>
 
-  <div class="card glass rise" style="--i:2">
+  <div class="card panel rise" style="--i:2">
     <div class="card-title-row">
       <Icon name="cube" />
       <h3>微软账号（设备码登录）</h3>
@@ -99,7 +99,7 @@
     {/if}
   </div>
 
-  <div class="card glass rise" style="--i:3">
+  <div class="card panel rise" style="--i:3">
     <div class="card-title-row">
       <Icon name="shield" />
       <h3>外置登录（authlib-injector）</h3>
@@ -129,10 +129,10 @@
 
   <div class="account-list rise" style="--i:4">
     {#if accountsState.list.length === 0}
-      <div class="list-note glass">还没有账号，先添加一个离线账号</div>
+      <div class="list-note panel">还没有账号，先添加一个离线账号</div>
     {:else}
       {#each accountsState.list as a (a.uuid)}
-        <div class="card glass account-card" class:selected={a.selected}>
+        <div class="card panel account-card" class:selected={a.selected}>
           <span class="avatar" style={avatarStyle(a.uuid)}>{avatarLetter(a.username)}</span>
           <div class="account-info">
             <div class="account-name">

@@ -11,7 +11,7 @@
 </script>
 
 <section class="screen login-screen">
-  <div class="login-card glass glass-accent" in:fly={{ y: 26, duration: 420 }}>
+  <div class="login-card panel panel-accent" in:fly={{ y: 26, duration: 300 }}>
     <div class="login-brand">
       <div class="logo rise" style="--i:0">Q</div>
       <h1 class="login-title rise" style="--i:1">Quartz Launcher</h1>

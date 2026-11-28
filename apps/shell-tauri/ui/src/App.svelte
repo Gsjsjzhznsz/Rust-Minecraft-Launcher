@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import AuroraBackground from "./lib/components/AuroraBackground.svelte";
+  import Backdrop from "./lib/components/Backdrop.svelte";
   import Toasts from "./lib/components/Toasts.svelte";
   import DiagBanner from "./lib/components/DiagBanner.svelte";
   import LoginScreen from "./lib/components/LoginScreen.svelte";
@@ -17,7 +17,7 @@
   });
 </script>
 
-<AuroraBackground />
+<Backdrop />
 <DiagBanner />
 
 {#if session.entered}

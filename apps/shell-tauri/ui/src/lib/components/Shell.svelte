@@ -1,6 +1,7 @@
 <script lang="ts">
   import { fade } from "svelte/transition";
   import Icon from "./Icon.svelte";
+  import ThemeDots from "./ThemeDots.svelte";
   import { showPage, session, permBanners, requestPermission, envState } from "../store.svelte";
   import { avatarLetter, avatarStyle } from "../format";
   import { IS_DEMO } from "../demo";
@@ -54,6 +55,7 @@
       {/each}
     </nav>
     <div class="sidebar-foot">
+      <ThemeDots />
       <div class="mini-account">
         <span class="avatar avatar-sm" style={avatarBg()}>
           {session.account ? avatarLetter(session.account.username) : "?"}
@@ -83,6 +85,7 @@
       </span>
       <span class="mini-name">{session.account?.username ?? "未登录"}</span>
     </button>
+    <ThemeDots />
     {#if IS_DEMO}
       <span class="demo-tag" title="网页演示：数据为模拟，完整功能请下载 APK">演示</span>
     {/if}
