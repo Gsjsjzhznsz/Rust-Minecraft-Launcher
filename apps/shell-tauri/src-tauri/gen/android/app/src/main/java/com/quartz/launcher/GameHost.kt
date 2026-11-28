@@ -32,8 +32,8 @@ object GameHost {
     var gameActive: Boolean = false
 
     /**
-     * v0.2.14：Surface 创建代次计数（每次 surfaceCreated 递增）。
-     * surfaceDestroyed 后的恢复计时器比对代次：期间有新 Surface 则取消恢复，
+     * v0.2.14：Surface 创建代次计数（每次 onSurfaceTextureAvailable 递增）。
+     * onSurfaceTextureDestroyed 后的恢复计时器比对代次：期间有新 Surface 则取消恢复，
      * 没有则由 MainActivity 强制重建游戏层。
      */
     @JvmStatic

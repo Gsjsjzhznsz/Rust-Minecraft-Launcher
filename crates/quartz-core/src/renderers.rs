@@ -817,7 +817,11 @@ mod tests {
             .join("../../apps/shell-tauri/src-tauri/bridge/libcutils.so");
         let data = std::fs::read(&path)
             .unwrap_or_else(|e| panic!("ZL2 jniLibs 契约件缺失 {}：{e}", path.display()));
-        assert_eq!(data.len(), 21320, "libcutils.so 大小漂移（ZL2 2.8.2 原版 = 21320 B）");
+        assert_eq!(
+            data.len(),
+            21320,
+            "libcutils.so 大小漂移（ZL2 2.8.2 原版 = 21320 B）"
+        );
         let digest = {
             use sha2::Digest as _;
             let mut h = sha2::Sha256::new();
@@ -829,7 +833,90 @@ mod tests {
             }
             out
         };
-        assert_eq!(digest, LIBCUTILS_SHA, "libcutils.so sha256 漂移（ZL2 契约破坏）");
+        assert_eq!(
+            digest, LIBCUTILS_SHA,
+            "libcutils.so sha256 漂移（ZL2 契约破坏）"
+        );
+    }
+
+    /// v0.2.24：游戏表面必须是 TextureView（ZalithLauncher2 2.8.2 完全 1:1）。
+    ///
+    /// zink 90° 反转根因：kopper swapchain 以 `preTransform = currentTransform`
+    /// 创建（Mesa 23.0-kopper-android fork zink_kopper.c），厂商驱动按
+    /// 「已预旋转」标记送合成器；SurfaceView 的专用合成层直接吃该标记，
+    /// 未 pre-rotate 的画面被转 90°。ZL2 官方 issue #1586/#1587 同款问题，
+    /// 官方解法「Disable surfaceview rendering」，2.8.2 起源码内 SurfaceView
+    /// 路径整体删除。本测试钉死 GameView.kt 不得回退 SurfaceView：
+    /// ① 必须继承 TextureView；② 必须挂 SurfaceTextureListener
+    /// （Surface(SurfaceTexture) 交接，ZL2 onSurfaceTextureAvailable 同款）；
+    /// ③ 剥离注释后不得出现任何 SurfaceView/SurfaceHolder 用法。
+    #[test]
+    fn game_surface_textureview_contract() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(
+            "../../apps/shell-tauri/src-tauri/gen/android/app/src/main/java/com/quartz/launcher/GameView.kt",
+        );
+        let raw = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("GameView.kt 缺失 {}：{e}", path.display()));
+        // 剥离块注释与行注释（文档里可以提 SurfaceView 历史，代码不得用）
+        let mut code = String::with_capacity(raw.len());
+        let mut in_block = false;
+        for line in raw.lines() {
+            let mut out = String::new();
+            let mut rest = line;
+            while !rest.is_empty() {
+                if in_block {
+                    match rest.find("*/") {
+                        Some(i) => {
+                            rest = &rest[i + 2..];
+                            in_block = false;
+                        }
+                        None => {
+                            rest = "";
+                        }
+                    }
+                } else {
+                    let line_comment = rest.find("//");
+                    let block_start = rest.find("/*");
+                    match (line_comment, block_start) {
+                        (Some(a), Some(b)) if a < b => {
+                            out.push_str(&rest[..a]);
+                            rest = "";
+                        }
+                        (_, Some(b)) => {
+                            out.push_str(&rest[..b]);
+                            rest = &rest[b + 2..];
+                            in_block = true;
+                        }
+                        (Some(a), None) => {
+                            out.push_str(&rest[..a]);
+                            rest = "";
+                        }
+                        (None, None) => {
+                            out.push_str(rest);
+                            rest = "";
+                        }
+                    }
+                }
+            }
+            code.push_str(&out);
+            code.push('\n');
+        }
+        assert!(
+            code.contains(": TextureView(context), TextureView.SurfaceTextureListener"),
+            "GameView 必须是 TextureView + SurfaceTextureListener（ZL2 2.8.2 同款；SurfaceView 会被 kopper zink pre-rotation 标记转 90°）"
+        );
+        assert!(
+            code.contains("GameIpc.sendSurface(Surface(st))"),
+            "onSurfaceTextureAvailable 必须 Surface(SurfaceTexture) 交接（ZL2 同款）"
+        );
+        assert!(
+            code.contains("setDefaultBufferSize(width, height)"),
+            "onSurfaceTextureSizeChanged 必须 setDefaultBufferSize（ZL2 同款）"
+        );
+        assert!(
+            !code.contains("SurfaceView") && !code.contains("SurfaceHolder"),
+            "GameView 代码不得引用 SurfaceView/SurfaceHolder（ZL2 2.8.2 已删除该路径）"
+        );
     }
 
     #[test]
@@ -929,12 +1016,8 @@ mod tests {
         let dest = work.join("out");
         std::fs::create_dir_all(&dest).unwrap();
         // 清单要 libzink_dri.so 而包内没有 —— 正是 v0.2.20 事故形态
-        let err = extract_zip_libs(
-            &zip_path,
-            &dest,
-            &[("libzink_dri.so", "libzink_dri.so")],
-        )
-        .unwrap_err();
+        let err = extract_zip_libs(&zip_path, &dest, &[("libzink_dri.so", "libzink_dri.so")])
+            .unwrap_err();
         assert!(
             err.to_string().contains("libzink_dri.so"),
             "报错应点名缺失条目：{err}"

@@ -2,14 +2,26 @@ package com.quartz.launcher
 
 import android.annotation.SuppressLint
 import android.content.Context
+import android.graphics.SurfaceTexture
 import android.view.MotionEvent
 import android.view.Surface
-import android.view.SurfaceHolder
-import android.view.SurfaceView
+import android.view.TextureView
 import kotlin.math.abs
 
 /**
- * 游戏 Surface 视图（v0.1.5 游戏显示接入，v0.1.7 改走 :game 进程 IPC）：
+ * 游戏 Surface 视图（v0.1.5 游戏显示接入，v0.1.7 改走 :game 进程 IPC，
+ * v0.2.24 SurfaceView → TextureView 与 ZalithLauncher2 2.8.2 完全 1:1）：
+ *
+ * - 为什么必须是 TextureView（zink 90° 反转根因，ZL2 官方同款解法）：
+ *   kopper zink 的 swapchain 以 `preTransform = currentTransform` 创建
+ *   （Mesa 23.0-kopper-android fork 的 zink_kopper.c），厂商 Vulkan 驱动
+ *   （Mali 等）据此把缓冲按「已预旋转」标记送合成器；SurfaceView 的专用
+ *   合成层直接走该标记 → 未做 pre-rotation 的画面被 DPU/SF 再转 90°，
+ *   表现为整帧反转（ZL2 官方 issue #1586/#1587 同款问题，官方答复
+ *   「Disable surfaceview rendering」，2.8.2 起源码内 SurfaceView 路径
+ *   整体删除、TextureView 唯一）。TextureView 经 SurfaceTexture 在应用
+ *   UI 层消费缓冲，缓冲变换在视图渲染时相消，方向正确。
+ *   MobileGlues/gl4es 等系统 GLES 生产者不打预旋转标记，此前不受影响。
  * - Surface/尺寸事件经 GameIpc（Messenger）转发给 ：game 进程的 GameService，
  *   由游戏进程内 QuartzBridge（ANativeWindow_fromSurface）接管；
  * - 触摸 -> 鼠标映射（v0.2.1-f 真实鼠标语义，与 FCL 对齐）：
@@ -22,7 +34,7 @@ import kotlin.math.abs
  * - 物理键盘（含蓝牙键鼠）由 Activity.dispatchKeyEvent 统一转发。
  */
 @SuppressLint("ViewConstructor")
-class GameView(context: Context) : SurfaceView(context, null, 0), SurfaceHolder.Callback {
+class GameView(context: Context) : TextureView(context), TextureView.SurfaceTextureListener {
 
     /** 控制层引用（光标可视化/灵敏度面板由其承载；MainActivity 装配时注入）。 */
     var controls: GameControls? = null
@@ -58,29 +70,39 @@ class GameView(context: Context) : SurfaceView(context, null, 0), SurfaceHolder.
     var lookSensitivity = 1.0f
 
     init {
-        holder.addCallback(this)
+        // ZL2 2.8.2 TextureView 同款参数（isOpaque/alpha）+ 表面回调自持
+        isOpaque = true
+        alpha = 1.0f
+        surfaceTextureListener = this
         setFocusable(true)
         setFocusableInTouchMode(true)
     }
 
-    override fun surfaceCreated(holder: SurfaceHolder) {
+    /** ZL2 2.8.2 onSurfaceTextureAvailable 同款：Surface(SurfaceTexture) 交接。 */
+    override fun onSurfaceTextureAvailable(st: SurfaceTexture, width: Int, height: Int) {
         // v0.2.14：代次递增（取消未决的 surface 恢复计时）+ 交接新 Surface
         GameHost.surfaceSeq++
-        val surface: Surface = holder.surface
-        GameIpc.sendSurface(surface)
+        GameIpc.sendSurface(Surface(st))
+        // 旧 SurfaceView 流程 surfaceChanged 首挂必带初始尺寸回调；TextureView
+        // 首次 available 不会再触发 sizeChanged —— 显式补发一次，语义等价
+        //（ZL2 同为 available 后 refreshWindowSize），v0.2.9 重试补发链的
+        // latestSize 缓存也由此保证非空。
+        GameIpc.size(width, height)
     }
 
-    override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
+    override fun onSurfaceTextureSizeChanged(st: SurfaceTexture, width: Int, height: Int) {
         // v0.2.10 自愈：游戏层存活期间 surface 变成竖屏（高>宽）说明 ROM 把窗口
         // 瞬时转了方向 —— 立即把 Activity 锁回横屏，避免 MC 收到竖屏尺寸重算
         // GUI 缩放（分辨率/DPI 突变、控件错位、虚拟光标出界）。
         if (height > width) {
             (context as? MainActivity)?.ensureGameLandscape("surfaceChanged ${width}x${height}")
         }
+        // ZL2 2.8.2 同款：尺寸变化时渲染缓冲回落视图尺寸
+        st.setDefaultBufferSize(width, height)
         GameIpc.size(width, height)
     }
 
-    override fun surfaceDestroyed(holder: SurfaceHolder) {
+    override fun onSurfaceTextureDestroyed(st: SurfaceTexture): Boolean {
         GameIpc.releaseSurface()
         // v0.2.14：游戏会话进行中丶Surface 被壳层销毁（Activity 重建/ROM 布局抖动）
         // —— 2.5s 内无新 Surface 则由 MainActivity 强制重挂游戏层，
@@ -88,6 +110,13 @@ class GameView(context: Context) : SurfaceView(context, null, 0), SurfaceHolder.
         if (GameHost.gameActive) {
             (context as? MainActivity)?.scheduleSurfaceRestore(GameHost.surfaceSeq)
         }
+        // 允许框架回收 SurfaceTexture（TextureView re-attach 必再触发
+        // onSurfaceTextureAvailable，与原 SurfaceView surfaceCreated 语义一致）
+        return true
+    }
+
+    override fun onSurfaceTextureUpdated(st: SurfaceTexture) {
+        // ZL2 2.8.2 用此回调抓放大镜帧；Quartz 无此需求，保留占位
     }
 
     /** 重置虚拟光标（窗口尺寸变化后由 Activity 调用）。 */

@@ -13,7 +13,7 @@ import android.view.Surface
  */
 object GameIpc {
 
-    /** 连接前收到的 Surface（GameView.surfaceCreated 先于服务连接时暂存）。 */
+    /** 连接前收到的 Surface（GameView.onSurfaceTextureAvailable 先于服务连接时暂存）。 */
     private var pendingSurface: Surface? = null
 
     /** 最近一次有效 Surface/尺寸（v0.2.9 渲染层失败重试：GameView 不重建，
@@ -53,7 +53,7 @@ object GameIpc {
         GameService.serviceMessenger = null
     }
 
-    /** Surface 创建（GameView.surfaceCreated）。 */
+    /** Surface 创建（GameView.onSurfaceTextureAvailable）。 */
     fun sendSurface(s: Surface) {
         android.util.Log.i("QuartzGame", "sendSurface: valid=${s.isValid} messenger=${GameService.serviceMessenger != null}")
         if (s.isValid) latestSurface = s
@@ -68,7 +68,7 @@ object GameIpc {
         trySend(m)
     }
 
-    /** Surface 销毁（GameView.surfaceDestroyed）。 */
+    /** Surface 销毁（GameView.onSurfaceTextureDestroyed）。 */
     fun releaseSurface() {
         android.util.Log.i("QuartzGame", "releaseSurface（主进程 surfaceDestroyed）")
         pendingSurface = null

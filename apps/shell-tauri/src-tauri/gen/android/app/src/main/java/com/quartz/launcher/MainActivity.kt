@@ -63,8 +63,11 @@ class MainActivity : TauriActivity() {
     }
 
     /**
-     * 显示游戏层（Rust 显示桥启动前调用）：横屏 + SurfaceView 覆盖 WebView +
-     * 虚拟按键层 + 屏幕常亮。Surface 创建回调交接给 quartz-bridge。
+     * 显示游戏层（Rust 显示桥启动前调用）：横屏 + TextureView 游戏表面覆盖
+     * WebView + 虚拟按键层 + 屏幕常亮。SurfaceTexture 回调交接给 quartz-bridge
+     * （v0.2.24 SurfaceView → TextureView，与 ZalithLauncher2 2.8.2 完全 1:1
+     * —— SurfaceView 专用合成层会被 kopper zink 的 pre-rotation 标记转 90°，
+     * ZL2 官方 issue #1586/#1587 同款问题，官方终解即 TextureView）。
      */
     @JvmStatic
     fun showGameSurfaceStatic() {
@@ -402,7 +405,7 @@ class MainActivity : TauriActivity() {
     }, 2500)
   }
 
-  /** 重挂同一 GameView 实例（SurfaceView re-attach 必触发 surfaceCreated/Changed）。 */
+  /** 重挂同一 GameView 实例（TextureView re-attach 必触发 onSurfaceTextureAvailable）。 */
   private fun restoreGameView() {
     try {
       val gv = gameView ?: return
