@@ -1076,6 +1076,126 @@ mod tests {
         paths::set_runtime_jres_root(std::env::temp_dir().join("quartz-test-jres"));
     }
 
+    /// v0.2.27：内嵌资产（显示桥 libpojavexec.so / 退出捕获 hook jar /
+    /// tagfix shim）刷新必须是**内容级**比对 + 原子替换，禁止 size 判定。
+    ///
+    /// 事故实锤（game-1795870655964，Mali-G57 MC2）：v0.2.26 的 EGL_NONE
+    /// 修复（0x3053→0x3038）是等长单字节改动，旧版 `m.len() != BRIDGE_SO.len()`
+    /// 判定新鲜度 —— 覆盖安装后长度相等 → 跳过重写 → 设备继续运行 v0.2.25
+    /// 旧桥 → eglChooseConfig 属性表永不终止 → Mesa 越界解析 →
+    /// EGL_BAD_ATTRIBUTE(0x3004) → 无 GL 上下文崩溃。发布 APK 内修复字节
+    /// 经逐字节 diff 实锤存在，但因漏刷从未落盘生效。本测试钉死：
+    /// ①write_if_changed 内容比对 + 临时文件 rename 原子替换；
+    /// ②桥/hook jar/tagfix shim 三处全部走该通道；
+    /// ③size 判定写法整体禁入（剥注释后扫描）。
+    #[test]
+    fn embedded_assets_content_refresh_contract() {
+        fn strip_comments(src: &str) -> String {
+            let mut out = String::with_capacity(src.len());
+            let mut in_block = false;
+            for line in src.lines() {
+                let mut out_line = String::new();
+                let mut rest = line;
+                while !rest.is_empty() {
+                    if in_block {
+                        match rest.find("*/") {
+                            Some(i) => {
+                                rest = &rest[i + 2..];
+                                in_block = false;
+                            }
+                            None => rest = "",
+                        }
+                    } else {
+                        let line_comment = rest.find("//");
+                        let block_start = rest.find("/*");
+                        match (line_comment, block_start) {
+                            (Some(a), Some(b)) if a < b => {
+                                out_line.push_str(&rest[..a]);
+                                rest = "";
+                            }
+                            (_, Some(b)) => {
+                                out_line.push_str(&rest[..b]);
+                                rest = &rest[b + 2..];
+                                in_block = true;
+                            }
+                            (Some(a), None) => {
+                                out_line.push_str(&rest[..a]);
+                                rest = "";
+                            }
+                            (None, None) => {
+                                out_line.push_str(rest);
+                                rest = "";
+                            }
+                        }
+                    }
+                }
+                out.push_str(&out_line);
+                out.push('\n');
+            }
+            out
+        }
+
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../apps/shell-tauri/src-tauri/src");
+        let gb_path = base.join("game_bridge.rs");
+        let gb_raw = std::fs::read_to_string(&gb_path)
+            .unwrap_or_else(|e| panic!("game_bridge.rs 缺失 {}：{e}", gb_path.display()));
+        let gb = strip_comments(&gb_raw);
+
+        // ① 内容级比对 + 原子替换的实现本体
+        assert!(
+            gb.contains(
+                "pub(crate) fn write_if_changed(dst: &Path, bytes: &[u8]) -> Result<bool, String>"
+            ),
+            "必须存在内容级刷新通道 write_if_changed"
+        );
+        assert!(
+            gb.contains(
+                "let unchanged = std::fs::read(dst).map(|cur| cur == bytes).unwrap_or(false);"
+            ),
+            "新鲜度判定必须逐字节比对既有文件内容（长度相等 ≠ 内容相同）"
+        );
+        assert!(
+            gb.contains("std::fs::rename(&tmp, dst)"),
+            "落盘必须临时文件 + rename 原子替换（老 :game 进程 mmap 保护）"
+        );
+
+        // ② 三处内嵌资产全部走内容级刷新
+        assert!(
+            gb.contains("write_if_changed(&dst, BRIDGE_SO)"),
+            "显示桥 libpojavexec.so 必须经 write_if_changed 刷新（0x3004 事故主通道）"
+        );
+        assert!(
+            gb.contains("write_if_changed(&dst, HOOK_JAR)"),
+            "退出捕获 hook jar 必须经 write_if_changed 刷新（同类隐患）"
+        );
+        let lib_path = base.join("lib.rs");
+        let lib_raw = std::fs::read_to_string(&lib_path)
+            .unwrap_or_else(|e| panic!("lib.rs 缺失 {}：{e}", lib_path.display()));
+        let lib = strip_comments(&lib_raw);
+        assert!(
+            lib.contains("game_bridge::write_if_changed(&dst, SHIM)"),
+            "tagfix shim 必须经 write_if_changed 刷新（同类隐患）"
+        );
+
+        // ③ size 判定写法禁入（剥注释后扫描 —— 注释里的事故记载不算数）
+        for banned in [
+            "m.len() != BRIDGE_SO.len()",
+            "m.len() != HOOK_JAR.len()",
+            "meta.len() == SHIM.len()",
+        ] {
+            assert!(
+                !gb.contains(banned) && !lib.contains(banned),
+                "内嵌资产禁止 size 判定新鲜度（0x3004 漏刷事故根源）：{banned}"
+            );
+        }
+        // ensure_bridge_lib 必须把刷新结果写进日志（实机日志自证桥版本）
+        assert!(
+            gb.contains("[quartz] 显示桥：内容变更，已刷新"),
+            "显示桥刷新必须打日志（实机日志需能区分新旧桥）"
+        );
+    }
+
     /// v0.2.17：turnip 伪渲染层 —— 不进 catalog（UI 不可见），但 spec_for
     /// 可解析（下载/安装/完整性检查复用）；set_active 明确拒绝。
     #[test]

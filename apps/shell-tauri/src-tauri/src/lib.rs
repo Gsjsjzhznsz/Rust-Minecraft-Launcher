@@ -2275,17 +2275,18 @@ fn build_plan_for(
 fn ensure_tagfix_lib() -> Option<PathBuf> {
     const SHIM: &[u8] = include_bytes!("../tagfix/libqztagfix.so");
     let dst = paths::runtime_dir().join("libqztagfix.so");
-    if let Ok(meta) = std::fs::metadata(&dst) {
-        if meta.len() == SHIM.len() as u64 {
-            return Some(dst);
+    // v0.2.27：新鲜度判定从「比长度」改为「比内容」（write_if_changed，
+    // 事故实锤见其文档：v0.2.26 等长单字节修复因 size 判定漏刷未生效）。
+    match game_bridge::write_if_changed(&dst, SHIM) {
+        Ok(refreshed) => {
+            if refreshed {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o644));
+            }
+            Some(dst)
         }
+        Err(_) => None,
     }
-    if std::fs::write(&dst, SHIM).is_ok() {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o644));
-        return Some(dst);
-    }
-    None
 }
 
 /// 拉起 JVM 子进程并托管日志/退出（`launch://log` / `launch://exit` 事件）。

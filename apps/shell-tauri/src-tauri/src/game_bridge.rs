@@ -222,22 +222,48 @@ fn sanitize_vk_probe_env() {
 /// 随 namespace 通道一并删除 —— ZL2 zink 从不设置 VK_ICD_FILENAMES，系统
 /// loader 按平台默认规则发现厂商 ICD。
 
+/// 内嵌资产刷新 = 内容级比对 + 临时文件原子替换（v0.2.27）。
+///
+/// 事故实锤（game-1795870655964，Mali-G57 MC2，v0.2.26 发布后 12 分钟）：
+/// v0.2.26 的 EGL_NONE 修复（0x3053→0x3038）是**等长单字节**改动，旧版
+/// 按 `m.len() != BRIDGE_SO.len()` 判定新鲜度 —— 覆盖安装后新旧桥长度
+/// 完全相等 → 判「未过期」→ 跳过重写 → 设备继续运行 v0.2.25 旧桥
+/// → eglChooseConfig 属性表永不终止 → Mesa 越界解析 →
+/// EGL_BAD_ATTRIBUTE(0x3004) → 无 GL 上下文崩溃（v0.2.26 发布 APK 的
+/// 修复字节经 sha256 diff 实锤已在内嵌 blob 内，但从未落盘生效）。
+/// 教训：嵌入制品的新鲜度必须比对内容本身，长度相等 ≠ 内容相同。
+///
+/// 原子替换：老 :game 进程若仍 mmap 旧 .so，就地覆写会破坏其映射；
+/// rename 只替换目录项，旧 inode 由运行中进程持有直至退出。
+/// 返回 true 表示发生了刷新（调用方可据此打日志）。
+pub(crate) fn write_if_changed(dst: &Path, bytes: &[u8]) -> Result<bool, String> {
+    let unchanged = std::fs::read(dst).map(|cur| cur == bytes).unwrap_or(false);
+    if unchanged {
+        return Ok(false);
+    }
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("创建目录失败：{e}"))?;
+    }
+    let tmp = PathBuf::from(format!("{}.tmp", dst.to_string_lossy()));
+    std::fs::write(&tmp, bytes).map_err(|e| format!("写入临时文件失败：{e}"))?;
+    std::fs::rename(&tmp, dst).map_err(|e| format!("原子替换失败：{e}"))?;
+    Ok(true)
+}
+
 /// 显示桥 .so 落位：runtime_dir()/libpojavexec.so + lwjgl3/natives/libpojavexec.so
 /// （后者是 OpenJDK System.loadLibrary("pojavexec") 的 java.library.path 首目录，
 /// 必须覆盖掉 Pojav APK 提取的旧 C 版 —— gladiolus 发布包 jar↔so 版本错位）。
+/// v0.2.27：新鲜度判定从「比长度」改为「比内容」（见 write_if_changed 事故
+/// 实锤）—— 内容不一致必刷新，刷新与否均打日志以便实机日志自证版本。
 pub fn ensure_bridge_lib() -> Result<(), String> {
     const BRIDGE_SO: &[u8] = include_bytes!("../bridge/libpojavexec.so");
     let dst1 = super::paths::runtime_dir().join("libpojavexec.so");
     let dst2 = super::lwjgl::natives_dir().join("libpojavexec.so");
     for dst in [dst1, dst2] {
-        let stale = std::fs::metadata(&dst)
-            .map(|m| m.len() != BRIDGE_SO.len() as u64)
-            .unwrap_or(true);
-        if stale {
-            if let Some(parent) = dst.parent() {
-                std::fs::create_dir_all(parent).map_err(|e| format!("创建目录失败：{e}"))?;
-            }
-            std::fs::write(&dst, BRIDGE_SO).map_err(|e| format!("写入显示桥失败：{e}"))?;
+        if write_if_changed(&dst, BRIDGE_SO)? {
+            eprintln!("[quartz] 显示桥：内容变更，已刷新 {}", dst.display());
+        } else {
+            eprintln!("[quartz] 显示桥：内容一致 {}", dst.display());
         }
     }
     Ok(())
@@ -246,15 +272,11 @@ pub fn ensure_bridge_lib() -> Result<(), String> {
 /// 游戏退出捕获 hook jar 落位（自研 SecurityManager：checkExit 否决
 /// System.exit/halt 并抛 ExitSignal，让崩溃/退出回到启动器而非杀死进程）。
 /// jar 由 scripts/build-android.sh 在构建期用 javac --release 17 编译。
+/// v0.2.27：同款内容级刷新（size 判定对 jar 内容等长改动同样漏刷）。
 pub fn ensure_hook_jar() -> Result<(), String> {
     const HOOK_JAR: &[u8] = include_bytes!("../bridge/quartz-game-hook.jar");
     let dst = super::paths::runtime_dir().join("quartz-game-hook.jar");
-    let stale = std::fs::metadata(&dst)
-        .map(|m| m.len() != HOOK_JAR.len() as u64)
-        .unwrap_or(true);
-    if stale {
-        std::fs::write(&dst, HOOK_JAR).map_err(|e| format!("写入退出捕获 hook 失败：{e}"))?;
-    }
+    write_if_changed(&dst, HOOK_JAR)?;
     Ok(())
 }
 
