@@ -37,6 +37,21 @@ KS=/home/z/my-project/keystore/quartz-debug.keystore
 
 mkdir -p /tmp/apkwork /home/z/my-project/download
 
+# 0) v0.2.23：ZL2 2.8.2 原版 libcutils.so 注入（jniLibs 通道）。
+#    Mesa 栈唯一无 DT_SONAME 的按名依赖（libEGL_mesa/libzink_dri 的
+#    DT_NEEDED）；clns 搜索路径 = nativeLibraryDir（进程创建时冻结），
+#    数据目录里的预载无法按名命中 —— 与 ZL2 同款：其 APK lib/arm64-v8a
+#    原样携带此文件，安装后落 nativeLibraryDir，按文件名解析。
+#    sha256 锁定 = ZL2 2.8.2 APK 提取件（与 renderer-zink zip 内逐字节
+#    相同，build_zinkpack.sh 同源），错位即构建失败。
+LIBCUTILS_SRC=/home/z/my-project/apps/shell-tauri/src-tauri/bridge/libcutils.so
+LIBCUTILS_SHA=04258bb1ccef8f5097ddc32ae1fb2d57142ffc5999e96fa36bfab85e02e9e347
+mkdir -p /tmp/apkwork/jniextra
+[ -f "$LIBCUTILS_SRC" ] || { echo "[pack] ERROR: $LIBCUTILS_SRC 缺失（ZL2 jniLibs 契约件）"; exit 1; }
+echo "$LIBCUTILS_SHA  $LIBCUTILS_SRC" | sha256sum -c - || { echo "[pack] ERROR: libcutils.so sha256 不符（ZL2 2.8.2 契约破坏）"; exit 1; }
+cp "$LIBCUTILS_SRC" /tmp/apkwork/jniextra/libcutils.so
+echo "[pack] jniextra: libcutils.so 已锁定（ZL2 2.8.2 原版）"
+
 # 1) 提取壳层 so 并 strip
 python3 - "$SRC_APK" <<'EOF'
 import zipfile, sys
@@ -73,6 +88,13 @@ with zipfile.ZipFile(p) as z:
     print(f"[pack] entries={len(names)} so.compress={so_info.compress_type}(0=STORED) services={len(services)}")
     assert so_info.compress_type == 0, "so must be STORED"
     assert len(services) >= 5, "META-INF/services lost"
+    # v0.2.23：ZL2 jniLibs 契约 —— libcutils.so 必须在 APK 且 STORED
+    cu = z.getinfo("lib/arm64-v8a/libcutils.so")
+    assert cu.compress_type == 0, "libcutils.so must be STORED"
+    assert hashlib.sha256(z.read("lib/arm64-v8a/libcutils.so")).hexdigest() == \
+        "04258bb1ccef8f5097ddc32ae1fb2d57142ffc5999e96fa36bfab85e02e9e347", \
+        "libcutils.so sha256 mismatch in final APK"
+    print("[pack] libcutils.so (ZL2 2.8.2) in APK: OK")
 data = open(p, "rb").read()
 print("[pack] SHA-256 =", hashlib.sha256(data).hexdigest())
 print("[pack] size =", len(data), "bytes")

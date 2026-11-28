@@ -165,6 +165,10 @@ pub fn catalog() -> &'static [RendererSpec] {
             // libzink_dri.so；ZL2 本尊等价动作 = Java 侧 dlopen libglxshim +
             // Mesa loader 按 LD_LIBRARY_PATH 搜 libzink_dri.so）。链路任一
             // 缺失都会让 libEGL_mesa dlopen 失败（v9 实机根因）。
+            // v0.2.23：libcutils.so 无 DT_SONAME，DT_NEEDED 按名解析不走
+            // 本目录预载（:game 的 clns 搜索路径 = nativeLibraryDir，进程
+            // 创建时冻结）—— 由 APK jniLibs 携带同款文件命中（ZL2 同款，
+            // 见 zink_libcutils_jni_libs_contract 测试）。
             preload: &[
                 "libc++_shared.so",
                 "libcutils.so",
@@ -795,6 +799,37 @@ mod tests {
         }
         assert!(preload_libs("gl4es").is_empty());
         assert_eq!(preload_libs("zink").len(), 5);
+    }
+
+    /// v0.2.23：libcutils jniLibs 契约 —— Mesa 栈唯一无 DT_SONAME 的按名
+    /// 依赖（libEGL_mesa/libzink_dri 的 DT_NEEDED "libcutils.so"）必须由
+    /// APK jniLibs 携带（clns 搜索路径 = nativeLibraryDir，按文件名解析；
+    /// :game 是 Zygote 派生进程，数据目录预载对按名解析无效 —— ZL2 的
+    /// APK lib/arm64-v8a 原样携带此文件，我们在 finalize_apk.sh 注入同款）。
+    /// 本测试钉死仓库内契约件的 sha256 = ZL2 2.8.2 APK 提取件（与
+    /// renderer-zink zip 内 libcutils.so 逐字节相同）；文件被替换/损坏时
+    /// 本测试先红，CI sha256 -c 再拦一道。
+    #[test]
+    fn zink_libcutils_jni_libs_contract() {
+        const LIBCUTILS_SHA: &str =
+            "04258bb1ccef8f5097ddc32ae1fb2d57142ffc5999e96fa36bfab85e02e9e347";
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../apps/shell-tauri/src-tauri/bridge/libcutils.so");
+        let data = std::fs::read(&path)
+            .unwrap_or_else(|e| panic!("ZL2 jniLibs 契约件缺失 {}：{e}", path.display()));
+        assert_eq!(data.len(), 21320, "libcutils.so 大小漂移（ZL2 2.8.2 原版 = 21320 B）");
+        let digest = {
+            use sha2::Digest as _;
+            let mut h = sha2::Sha256::new();
+            sha2::Digest::update(&mut h, &data);
+            let mut out = String::new();
+            use std::fmt::Write as _;
+            for b in sha2::Digest::finalize(h) {
+                write!(out, "{b:02x}").unwrap();
+            }
+            out
+        };
+        assert_eq!(digest, LIBCUTILS_SHA, "libcutils.so sha256 漂移（ZL2 契约破坏）");
     }
 
     #[test]

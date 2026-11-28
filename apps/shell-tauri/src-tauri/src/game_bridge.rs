@@ -1948,6 +1948,15 @@ unsafe fn run_game_from_spec(
     // 逐目录搜 libzink_dri.so（格式 dir/tls/<n>_dri.so → dir/<n>_dri.so →
     // dir/lib<n>_dri.so，第三式为补丁新增）—— 渲染层目录在列即 ZL2 同款
     // 发现路径；/system_ext/lib64 兼顾厂商包装层依赖。
+    //
+    // 【v0.2.23 机制注记】:game 是 Zygote 派生的 Android 子进程，Rust 壳层
+    // 跑在 APK PathClassLoader 的 classloader namespace（clns）里：其搜索
+    // 路径 = nativeLibraryDir，在进程创建时就冻结 —— 这里的 set_var 改
+    // LD_LIBRARY_PATH 只影响「自己读环境变量再拼绝对路径」的读者（Mesa
+    // loader，正合需求），对 clns 的按名解析**无效**。因此无 SONAME 的
+    // 按名依赖（libcutils.so，libEGL_mesa/libzink_dri 的 DT_NEEDED）必须
+    // 由 APK jniLibs 携带（= ZL2 的做法：其 APK lib/arm64-v8a 原样带着
+    // libcutils.so，finalize_apk.py 注入 lib/arm64-v8a/，sha256 锁定）。
     let ld = [
         crate::lwjgl::natives_dir().display().to_string(),
         "/system/lib64".to_string(),
@@ -1962,13 +1971,20 @@ unsafe fn run_game_from_spec(
     let tmp_dir = crate::paths::runtime_dir().join("tmp");
     let _ = std::fs::create_dir_all(&tmp_dir);
     std::env::set_var("TMPDIR", &tmp_dir);
-    // POJAVEXEC_EGL = ZL2 GameLauncher.kt:469 同款裸名（无路径前缀，
-    // dlopen 按 LD_LIBRARY_PATH 解析 —— 上行已含渲染层目录）；
-    // SDL_EGL_LIBRARY = ZL2 同款绝对路径（eglName 拼库目录，文件存在才设）。
+    // POJAVEXEC_EGL = 绝对路径（v0.2.23 回滚 v0.2.22 的「ZL2 裸名」改动）。
+    // ZL2 GameLauncher.kt:469 的裸名（libEGL_mesa.so）能在它的进程里成立，
+    // 是因为 ZL2 把 Mesa 六件库打进自家 APK lib/arm64-v8a —— nativeLibraryDir
+    // 天生在 classloader namespace 搜索路径里，按名 dlopen 直接命中。Quartz
+    // 的 Mesa 在数据目录（renderers/zink/），clns 搜索路径里没有它，裸名
+    // dlopen 必败（v0.2.23 修 jniLibs 只补 libcutils 一件，EGL 库仍走数据
+    // 目录绝对路径）。SDL_EGL_LIBRARY = ZL2 同款绝对路径（eglName 拼库目录）。
     let egl_lib = crate::renderers::spec_for(&active_renderer)
         .map(|s| s.egl_lib)
         .unwrap_or("libEGL.so");
-    std::env::set_var("POJAVEXEC_EGL", egl_lib);
+    std::env::set_var(
+        "POJAVEXEC_EGL",
+        crate::renderers::install_dir(&active_renderer).join(egl_lib),
+    );
     let sdl_egl = crate::renderers::install_dir(&active_renderer).join(egl_lib);
     if sdl_egl.is_file() {
         std::env::set_var("SDL_EGL_LIBRARY", &sdl_egl);
@@ -2083,6 +2099,10 @@ unsafe fn run_game_from_spec(
     //      loader 按 LD_LIBRARY_PATH 搜 libzink_dri.so）。两遍执行：第一遍
     //      失败的多为依赖未就绪，第二遍补刀；仍失败则记录 dlerror 详情
     //      （设备日志可直读根因）。
+    //      v0.2.23：libcutils.so 的按名解析改由 APK jniLibs 携带（见 1)
+    //      机制注记）—— 数据目录这份预载只为诊断与 soinfo 占位，真正的
+    //      DT_NEEDED 命中走 nativeLibraryDir 的同名文件（无 SONAME，按
+    //      clns 搜索路径按文件名解析，ZL2 同款）。
     {
         let rdir = crate::renderers::install_dir(&active_renderer);
         let mut list: Vec<String> = crate::renderers::preload_libs(&active_renderer)

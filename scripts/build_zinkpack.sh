@@ -25,6 +25,13 @@
 # libzink_dri.so，DT_SONAME=libgallium_dri.so 只是链接器内部标识）。本脚本
 # zip 内容不变（仍是 ZL2 原名六件），包代数 rev 2→3 触发老用户重装。
 #
+# v0.2.23（zink 死因终局）：六件库中唯一无 DT_SONAME 的按名依赖 libcutils.so
+# 必须住 nativeLibraryDir（clns 搜索路径，:game 进程创建时冻结；数据目录预载
+# 无法按名命中）。ZL2 的解法 = 其 APK lib/arm64-v8a 原样携带 libcutils.so
+# —— 我们在 finalize_apk.sh 里把仓库内同字节契约件（bridge/libcutils.so，
+# sha256 04258bb1…e347，与本 zip 内逐字节相同）注入 APK lib/arm64-v8a/。
+# 本脚本不变，仅注记；zip 仍为六件原名。
+#
 # 制品指纹（ZL2 2.8.2 arm64-v8a，发布资产 sha256 由 Release API 核验）：
 #   APK sha256 = 532503adeb3a9a5b7236ba027f2c9473fd3fb19a1cf0e1970262dca52294fca8
 #   libEGL_mesa.so  302520 B
