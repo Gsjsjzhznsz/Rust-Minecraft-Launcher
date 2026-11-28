@@ -369,12 +369,16 @@ pub mod egl {
     pub const EGL_DEFAULT_DISPLAY: *mut c_void = ptr::null_mut();
     pub const EGL_OPENGL_ES_API: u32 = 0x30A0;
     pub const EGL_OPENGL_API: u32 = 0x30A2;
-    // v0.2.25 颜色畸变终局修复：以下 8 个常量此前全部写错（0x12xx/0x3038，
-    // 疑似 GLX 系数值混入）。真实值以 Khronos EGL/egl.h 为准 —— ZL2 的
-    // egl_bridge.c/gl_bridge.c 就是用这组真值编译的。错值后果（game-1795863899976
-    // 实机实锤）：Mesa libEGL 严格校验属性 id，阶梯 #0-#6（含 ZL2 原版属性集）
-    // 全部 EGL_BAD_ATTRIBUTE(0x3004) 拒绝 → 落「垃圾属性」兜底拿到任意 config
-    // → kopper 按错配 config 选交换链格式 → MC 渲染颜色畸变。
+    // EGL config 属性真值表（Khronos EGL/egl.h；GLFW egl_context.h 同值行级可查）
+    // —— ZL2 的 egl_bridge.c/gl_bridge.c #include <EGL/egl.h>，编译即此表。
+    // 错值两段史（都实机实锤）：①v0.2.25 前 SURFACE_TYPE/BLUE/GREEN/RED/
+    // ALPHA/DEPTH/RENDERABLE_TYPE 写成 0x12xx 系，Mesa 严格实现以未知属性 id
+    // 拒掉全部正经属性档（EGL_BAD_ATTRIBUTE 0x3004），垃圾兜底 config →
+    // kopper 交换链格式错配 → MC 颜色畸变（game-1795863899976）；②v0.2.25
+    // 改对 7 个 0x12xx 却把原本正确的 EGL_NONE 误改为 0x3053（=
+    // EGL_MATCH_NATIVE_PIXMAP），属性表永不终止，Mesa 越界解析 →
+    // eglChooseConfig EGL_FALSE(0x3004) → 无 GL 上下文直接崩
+    //（game-1795866976312）。v0.2.26 恢复 EGL_NONE=0x3038，全表对齐。
     pub const EGL_SURFACE_TYPE: i32 = 0x3033;
     pub const EGL_WINDOW_BIT: i32 = 0x0004;
     pub const EGL_PBUFFER_BIT: i32 = 0x0001;
@@ -386,7 +390,7 @@ pub mod egl {
     pub const EGL_RENDERABLE_TYPE: i32 = 0x3040;
     pub const EGL_OPENGL_ES2_BIT: i32 = 0x0004;
     pub const EGL_OPENGL_ES3_BIT: i32 = 0x0040;
-    pub const EGL_NONE: i32 = 0x3053;
+    pub const EGL_NONE: i32 = 0x3038;
     pub const EGL_CONTEXT_CLIENT_VERSION: i32 = 0x3098;
     // v0.2.25：EGL_KHR_create_context 的 MAJOR/MINOR/PROFILE_MASK 常量随自造
     // core 阶梯一并删除 —— ZL2 gl_bridge.c 不使用它们（0x3098 在
@@ -2556,10 +2560,12 @@ pub extern "C" fn quartz_bridge_api_version() -> c_int {
 }
 
 // ---------------------------------------------------------------------------
-// v0.2.25：EGL 常量 spec 契约 —— 历史错值（0x12xx/0x3038）让 Mesa 严格实现
-// 把全部正经 config 属性档 EGL_BAD_ATTRIBUTE 拒掉，zink 落错配 config 颜色
-// 畸变（game-1795863899976 实机实锤）。此处把 Khronos EGL/egl.h 真值钉死，
-// 再写错一个字节先红。
+// EGL 常量 spec 契约 —— 错值两段史（都实机实锤）：0x12xx 系（v0.2.25 前）
+// 被 Mesa 以 EGL_BAD_ATTRIBUTE(0x3004) 拒掉全部正经属性档 → 错配 config →
+// zink 颜色畸变（game-1795863899976）；v0.2.25 把 EGL_NONE 误改为 0x3053
+//（=EGL_MATCH_NATIVE_PIXMAP），属性表不终止，Mesa 越界解析 →
+// eglChooseConfig EGL_FALSE → 无上下文崩溃（game-1795866976312）。
+// 此处把 Khronos EGL/egl.h 真值钉死，再写错一个字节先红。
 // ---------------------------------------------------------------------------
 #[cfg(test)]
 mod egl_const_tests {
@@ -2577,8 +2583,9 @@ mod egl_const_tests {
         assert_eq!(egl::EGL_ALPHA_SIZE, 0x3021);
         assert_eq!(egl::EGL_DEPTH_SIZE, 0x3025);
         assert_eq!(egl::EGL_RENDERABLE_TYPE, 0x3040);
-        // 终止符（0x3038 是历史错值，非 EGL_NONE）
-        assert_eq!(egl::EGL_NONE, 0x3053);
+        // 终止符（Khronos：EGL_NONE=0x3038；0x3053 是 EGL_MATCH_NATIVE_PIXMAP，
+        // v0.2.25 曾误用致属性表不终止 → Mesa 越界解析 → 本崩溃）
+        assert_eq!(egl::EGL_NONE, 0x3038);
         // 位掩码
         assert_eq!(egl::EGL_WINDOW_BIT, 0x0004);
         assert_eq!(egl::EGL_PBUFFER_BIT, 0x0001);
@@ -2596,9 +2603,10 @@ mod egl_const_tests {
         assert_eq!(egl::EGL_HEIGHT, 0x3056);
     }
 
-    /// 历史错值禁止回归：0x12xx 系与 0x3038 都不得出现在 quartz-bridge 代码
-    /// 中（egl_sim 的匹配键已同步真值）。剥注释后检查 —— 文档里可以讲历史，
-    /// 代码里不得再写。
+    /// 历史错值禁止回归：0x12xx 系（v0.2.25 前的属性 id 错值）与 0x3053
+    ///（v0.2.25 误改的 EGL_NONE，真值 0x3038）都不得出现在 quartz-bridge
+    /// 代码中（egl_sim 的匹配键已同步真值）。剥注释后检查 —— 文档里可以
+    /// 讲历史，代码里不得再写。
     #[test]
     fn wrong_const_values_banned() {
         fn strip_comments(src: &str) -> String {
@@ -2616,7 +2624,7 @@ mod egl_const_tests {
         let sim = strip_comments(include_str!("egl_sim.rs"));
         // 十进制字面量在运行时格式化为十六进制 —— 源码文本里不得出现禁值
         // 字面量，否则本测试会被自己命中。
-        for v in [4672u32, 4659, 4642, 4643, 4644, 4641, 4645, 12344] {
+        for v in [4672u32, 4659, 4642, 4643, 4644, 4641, 4645, 12371] {
             let bad = format!("0x{v:04x}");
             assert!(
                 !bridge.contains(&bad),

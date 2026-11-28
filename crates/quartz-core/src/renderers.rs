@@ -842,8 +842,8 @@ mod tests {
     /// v0.2.25：zink EGL 上下文链必须与 ZL2 gl_bridge.c 完全 1:1。
     ///
     /// 颜色畸变根因（game-1795863899976 实机实锤）：quartz-bridge 的 EGL
-    /// 常量写错（0x12xx/0x3038），Mesa 严格实现把阶梯 #0-#6（含 ZL2 原版
-    /// 属性集）全部 EGL_BAD_ATTRIBUTE 拒掉 → 落「垃圾属性」拿到任意 config
+    /// 常量写错（0x12xx 系），Mesa 严格实现把阶梯 #0-#6（含 ZL2 原版
+    /// 属性集）全部 EGL_BAD_ATTRIBUTE(0x3004) 拒掉 → 落「垃圾属性」拿到任意 config
     /// → kopper 按错配 config 选交换链格式 → MC 颜色畸变。修复 = ①常量改
     /// Khronos EGL/egl.h 真值；②zink 路径按 ZL2 gl_bridge.c 逐项对齐：
     /// 19 字符前缀 "opengles3_desktopgl" 分流、单次 eglChooseConfig
@@ -851,6 +851,11 @@ mod tests {
     /// 取首个 config、bind EGL_OPENGL_API、上下文仅
     /// {EGL_CONTEXT_CLIENT_VERSION, LIBGL_ES}，删除自造 core 档阶梯。
     /// 本测试从源码层钉死以上每一条。
+    ///
+    /// v0.2.26 续实锤（game-1795866976312）：v0.2.25 修对 0x12xx 却误改
+    /// EGL_NONE（0x3038→0x3053），属性表不终止 → Mesa 越界解析 →
+    /// eglChooseConfig EGL_FALSE(0x3004) → 无上下文崩溃。本测试禁值清单
+    /// 与 EGL_NONE 真值随之修正。
     #[test]
     fn zl2_gl_bridge_1_1_contract() {
         let bridge_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -877,7 +882,7 @@ mod tests {
                 "pub const EGL_RENDERABLE_TYPE: i32 = 0x3040;",
                 "EGL_RENDERABLE_TYPE",
             ),
-            ("pub const EGL_NONE: i32 = 0x3053;", "EGL_NONE"),
+            ("pub const EGL_NONE: i32 = 0x3038;", "EGL_NONE"),
         ] {
             assert!(
                 raw.contains(needle),
@@ -951,10 +956,13 @@ mod tests {
             "不得使用 EGL_KHR_create_context 的 profile/版本阶梯（ZL2 上下文属性仅 CLIENT_VERSION 一项）"
         );
 
-        // ⑤ 历史错值禁止回归（剥注释后，代码不得出现 0x12xx/0x3038）
+        // ⑤ 历史错值禁止回归（剥注释后，代码不得出现 0x12xx 系与 0x3053 ——
+        // 后者 = EGL_MATCH_NATIVE_PIXMAP，v0.2.25 曾误当 EGL_NONE 致属性表
+        // 不终止、Mesa 越界解析、eglChooseConfig 整体失败
+        //（game-1795866976312 无上下文崩溃）；EGL_NONE 真值 = 0x3038）
         let code_sim = strip_comments(&raw_sim);
         for bad in [
-            "0x1240", "0x1233", "0x1222", "0x1223", "0x1224", "0x1221", "0x1225", "0x3038",
+            "0x1240", "0x1233", "0x1222", "0x1223", "0x1224", "0x1221", "0x1225", "0x3053",
         ] {
             assert!(
                 !code.contains(bad),
