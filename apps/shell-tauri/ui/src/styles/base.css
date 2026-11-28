@@ -3,109 +3,117 @@
    ----------------------------------------------------------------
    架构（参考 Style Atlas 的「Token + 组件 + 约束」方法论）：
    1. 本文件定义语义 Token 契约与全部组件类——只消费语义变量，
-      不出现任何具体配色/字体/圆角/时长。
-   2. themes.css 提供 N 种完整设计语言（每种 = 一组 Token 覆盖 +
-      少量结构性识别规则），通过 html[data-theme] 实时切换。
+      不出现具体配色/字体/圆角/时长（默认值 = 玻璃拟态，Atlas 主打款）。
+   2. themes.css 提供 21 种完整设计语言（每种 = 一组 Token 覆盖 +
+      少量结构性识别规则），通过 html[data-theme] 实时切换；
+      配色全部以 Atlas 各款风格的 palette + tokens 实测值为蓝本。
    3. 动效四档节奏（对齐 motion-lab）：
       fast   120–160ms  按钮 / 开关 / 收藏        ease-out
       nav    180–240ms  导航 / 选择 / 选项卡      standard
       surface 240–320ms 容器 / 抽屉 / 弹窗        emphasized
       status 160–220ms  提示 / 通知 / 保存        ease-out
-      红线：只动 transform / opacity；不动画 blur；
+      红线：只动 transform / opacity；不动画 blur（blur 仅静态挂 token）；
       prefers-reduced-motion 与手动开关（data-motion="off"）全关。
    ================================================================ */
 
-/* ============ Token 契约（默认值 = 瑞士国际主义） ============ */
+/* ============ Token 契约（默认值 = 玻璃拟态，Style Atlas 主打款） ============
+   配色 / 材质 / 动效取自 Atlas 01 号卡实测值：
+   palette #E5E1FF #FF9B8B #6B79FF #66E3CD #242143 ·
+   surface rgba(255,255,255,.28) · blur 18px · border rgba(255,255,255,.72) ·
+   radius 24px · shadow 0 20px 55px rgba(71,54,120,.22) */
 :root,
-[data-theme="swiss"] {
+[data-theme="glass"] {
   color-scheme: light;
 
   /* 表面 */
-  --bg-app: #f4f4f2;
-  --bg-panel: #ffffff;
-  --bg-panel-2: #fafaf8;
-  --bg-inset: #ececea;
-  --bg-nav: #ffffff;
-  --bg-hover: rgba(17, 17, 17, 0.05);
-  --bg-active: rgba(17, 17, 17, 0.09);
+  --bg-app: #e5e1ff;
+  --bg-panel: rgba(255, 255, 255, 0.3);
+  --bg-panel-2: rgba(255, 255, 255, 0.44);
+  --bg-inset: rgba(255, 255, 255, 0.52);
+  --bg-nav: rgba(255, 255, 255, 0.26);
+  --bg-hover: rgba(36, 33, 67, 0.06);
+  --bg-active: rgba(36, 33, 67, 0.11);
 
   /* 边框 */
   --border-w: 1px;
-  --border: rgba(17, 17, 17, 0.32);
-  --border-strong: #111111;
-  --border-dim: rgba(17, 17, 17, 0.12);
+  --border: rgba(255, 255, 255, 0.72);
+  --border-strong: rgba(255, 255, 255, 0.92);
+  --border-dim: rgba(255, 255, 255, 0.5);
 
   /* 文本 */
-  --text: #111111;
-  --text-dim: #4a4a48;
-  --text-faint: #86868a;
+  --text: #242143;
+  --text-dim: #4a4670;
+  --text-faint: #75719b;
   --text-on-accent: #ffffff;
 
-  /* 主色 */
-  --accent: #d5281b;
-  --accent-hover: #b81f14;
-  --accent-dim: rgba(213, 40, 27, 0.08);
-  --accent-border: #d5281b;
-  --accent-2: #111111;
-  --accent-2-dim: rgba(17, 17, 17, 0.06);
+  /* 主色（periwinkle / mint / coral 三色全部来自 Atlas palette） */
+  --accent: #6b79ff;
+  --accent-hover: #5766f0;
+  --accent-dim: rgba(107, 121, 255, 0.14);
+  --accent-border: rgba(255, 255, 255, 0.8);
+  --accent-2: #9b6bff;
+  --accent-2-dim: rgba(155, 107, 255, 0.1);
 
   /* 状态 */
-  --ok: #1a7f37;
-  --ok-dim: rgba(26, 127, 55, 0.08);
-  --warn: #9a5b00;
-  --warn-dim: rgba(154, 91, 0, 0.09);
-  --err: #c5261b;
-  --err-dim: rgba(197, 38, 27, 0.08);
-  --info: #1f5fbf;
-  --info-dim: rgba(31, 95, 191, 0.08);
-  --purple: #6b21a8;
-  --purple-dim: rgba(107, 33, 168, 0.08);
+  --ok: #157f6e;
+  --ok-dim: rgba(102, 227, 205, 0.24);
+  --warn: #a85c00;
+  --warn-dim: rgba(255, 155, 139, 0.28);
+  --err: #c43d3d;
+  --err-dim: rgba(255, 139, 139, 0.24);
+  --info: #3c5bd9;
+  --info-dim: rgba(107, 121, 255, 0.14);
+  --purple: #7c5cd6;
+  --purple-dim: rgba(124, 92, 214, 0.14);
 
-  /* 形状 */
-  --r-lg: 2px;
-  --r-md: 2px;
-  --r-sm: 0px;
-  --r-pill: 0px;
+  /* 形状（Atlas glass radius 24px） */
+  --r-lg: 24px;
+  --r-md: 18px;
+  --r-sm: 12px;
+  --r-pill: 999px;
 
-  /* 阴影（瑞士 = 无投影，层级靠边框与留白） */
-  --shadow-card: none;
-  --shadow-pop: 0 10px 28px rgba(17, 17, 17, 0.16);
-  --shadow-accent: none;
+  /* 阴影（Atlas glass shadow：紫罗兰大柔影） */
+  --shadow-card: 0 20px 55px rgba(71, 54, 120, 0.22);
+  --shadow-pop: 0 16px 44px rgba(71, 54, 120, 0.3);
+  --shadow-accent: 0 12px 32px rgba(107, 121, 255, 0.35);
 
   /* 字体 */
-  --font-body: "Helvetica Neue", Helvetica, Arial, "Noto Sans SC", "PingFang SC", "Microsoft YaHei", sans-serif;
-  --font-display: "Helvetica Neue", Helvetica, Arial, "Noto Sans SC", "PingFang SC", sans-serif;
+  --font-body: "Inter", "SF Pro Text", system-ui, -apple-system, "Segoe UI", "Noto Sans SC", "PingFang SC", "Microsoft YaHei", sans-serif;
+  --font-display: "Inter", "SF Pro Display", system-ui, -apple-system, "Segoe UI", "Noto Sans SC", "PingFang SC", sans-serif;
   --font-mono: "JetBrains Mono", "Cascadia Code", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   --fs-body: 15px;
   --weight-display: 800;
   --ls-display: -0.01em;
   --tt-display: none;
-  --tt-label: uppercase;
-  --ls-label: 0.12em;
+  --tt-label: none;
+  --ls-label: 0.04em;
 
   /* 控件姿态（悬停 / 按压的位移语言） */
-  --btn-hover-t: none;
+  --btn-hover-t: translateY(-1px);
   --btn-active-t: scale(0.97);
   --nav-indicator: 4px;
 
-  /* 动效四档 */
-  --motion-fast: 120ms;
-  --motion-nav: 160ms;
-  --motion-surface: 220ms;
-  --motion-status: 140ms;
-  --ease-out: cubic-bezier(0.2, 0, 0, 1);
-  --ease-standard: cubic-bezier(0.2, 0, 0, 1);
-  --ease-emphasized: cubic-bezier(0.05, 0.7, 0.1, 1);
+  /* 动效四档（motion-lab：fast 120–160 / nav 180–240 / surface 240–320 / status 160–220） */
+  --motion-fast: 140ms;
+  --motion-nav: 200ms;
+  --motion-surface: 280ms;
+  --motion-status: 180ms;
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-standard: cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-emphasized: cubic-bezier(0.34, 1.3, 0.5, 1);
+
+  /* 玻璃材质：静态 backdrop-filter，只挂 token 不动画（Android WebView 红线） */
+  --panel-blur: blur(18px) saturate(150%);
 
   /* 控制台 / 终端文本 */
-  --console-bg: #111111;
-  --console-text: #d8d8d4;
-  --console-err: #ff8a80;
-  --console-sys: #ff6b5e;
-  --console-dim: #7c7c78;
+  --console-bg: rgba(36, 33, 67, 0.92);
+  --console-text: #e6e4ff;
+  --console-err: #ff9b8b;
+  --console-sys: #66e3cd;
+  --console-dim: #8f8bb8;
 
   /* 选区 */
-  --selection-bg: rgba(213, 40, 27, 0.16);
+  --selection-bg: rgba(107, 121, 255, 0.25);
 
   /* 结构 */
   --sidebar-w: 232px;
@@ -153,6 +161,8 @@ html, body {
   border: var(--border-w) solid var(--border);
   border-radius: var(--r-lg);
   box-shadow: var(--shadow-card);
+  -webkit-backdrop-filter: var(--panel-blur, none);
+  backdrop-filter: var(--panel-blur, none);
 }
 .panel-accent {
   background: var(--bg-panel);
@@ -354,6 +364,8 @@ input[type="range"]::-webkit-slider-thumb {
   gap: 20px;
   position: sticky; top: 0;
   height: 100vh;
+  -webkit-backdrop-filter: var(--panel-blur, none);
+  backdrop-filter: var(--panel-blur, none);
 }
 .brand { display: flex; align-items: center; gap: 11px; padding: 0 6px; }
 .brand-name {
@@ -435,6 +447,8 @@ input[type="range"]::-webkit-slider-thumb {
   background: var(--bg-nav);
   border-bottom: var(--border-w) solid var(--border-dim);
   position: sticky; top: 0; z-index: 10;
+  -webkit-backdrop-filter: var(--panel-blur, none);
+  backdrop-filter: var(--panel-blur, none);
 }
 #topbar-account { cursor: pointer; max-width: 60%; }
 
@@ -524,6 +538,8 @@ input[type="range"]::-webkit-slider-thumb {
   border-radius: var(--r-sm);
   padding: 0 14px;
   color: var(--text-faint);
+  -webkit-backdrop-filter: var(--panel-blur, none);
+  backdrop-filter: var(--panel-blur, none);
   transition:
     border-color var(--motion-fast) var(--ease-out),
     box-shadow var(--motion-fast) var(--ease-out);
@@ -538,6 +554,8 @@ input[type="range"]::-webkit-slider-thumb {
   border: var(--border-w) solid var(--border);
   border-radius: var(--r-lg);
   overflow: hidden;
+  -webkit-backdrop-filter: var(--panel-blur, none);
+  backdrop-filter: var(--panel-blur, none);
 }
 .list-note { padding: 30px; text-align: center; color: var(--text-faint); font-size: 13px; }
 .v-row {
@@ -638,6 +656,8 @@ input[type="range"]::-webkit-slider-thumb {
   animation: toast-in var(--motion-status) var(--ease-emphasized) both;
   max-width: 90vw;
   text-align: center;
+  -webkit-backdrop-filter: var(--panel-blur, none);
+  backdrop-filter: var(--panel-blur, none);
 }
 .toast.ok { border-color: var(--ok); }
 .toast.err { border-color: var(--err); }
@@ -655,6 +675,8 @@ input[type="range"]::-webkit-slider-thumb {
   padding: 6px 8px;
   box-shadow: var(--shadow-pop);
   z-index: 50;
+  -webkit-backdrop-filter: var(--panel-blur, none);
+  backdrop-filter: var(--panel-blur, none);
 }
 .bottom-nav .nav-item { flex-direction: column; gap: 3px; padding: 8px 0; font-size: 11px; }
 .bottom-nav .nav-item.active::before { display: none; }
@@ -822,12 +844,16 @@ input[type="range"]::-webkit-slider-thumb {
   display: flex;
   align-items: center;
   gap: 6px;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
+  overflow-x: auto;
+  scrollbar-width: none;
   padding: 0 4px;
 }
+.theme-dots::-webkit-scrollbar { display: none; }
 .td-dot {
   width: 18px; height: 18px;
   padding: 0;
+  flex-shrink: 0;
   border: var(--border-w) solid var(--border-strong);
   border-radius: var(--r-sm);
   cursor: pointer;
@@ -846,7 +872,16 @@ input[type="range"]::-webkit-slider-thumb {
 }
 
 /* ============ 主题图鉴（ThemePicker，设置页） ============ */
-.tp-grid { display: grid; grid-template-columns: 1fr; gap: 12px; margin-top: 4px; }
+.tp-group {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--text-faint);
+  text-transform: var(--tt-label, none);
+  letter-spacing: var(--ls-label, 0.04em);
+  margin: 14px 0 -4px;
+  padding-left: 2px;
+}
+.tp-grid { display: grid; grid-template-columns: 1fr; gap: 12px; margin-top: 8px; }
 @media (min-width: 640px) {
   .tp-grid { grid-template-columns: 1fr 1fr; }
 }
@@ -878,6 +913,8 @@ input[type="range"]::-webkit-slider-thumb {
   background: var(--bg-app);
   padding: 10px;
   display: flex; flex-direction: column; gap: 6px;
+  -webkit-backdrop-filter: var(--panel-blur, none);
+  backdrop-filter: var(--panel-blur, none);
 }
 .tp-preview .tp-bar {
   display: flex; gap: 4px; align-items: center;

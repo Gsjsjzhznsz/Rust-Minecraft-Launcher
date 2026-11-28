@@ -19,8 +19,9 @@ Prism Launcher、Amethyst-iOS（Pojav_iOS 继任），以及 Rust 侧先例 Modr
 - **UI 网页演示**：<https://gsjsjzhznsz.github.io/Rust-Minecraft-Launcher/demo/>
   （Svelte 5 UI + 内置模拟后端，仅供演示 —— 下载/启动均为模拟动画，真实功能请用 APK；
   源码在 `apps/shell-tauri/ui/`，由 `VITE_DEMO=1` 构建开关注入 mock）
-  支持六种设计语言实时切换（瑞士国际主义 / Material You / Fluent 云母 /
-  开发者终端 / 新粗野主义 / 像素复古），Token 契约见 [docs/UI-THEMES.md](docs/UI-THEMES.md)
+  支持 21 种设计语言实时切换（五组：玻璃与光 / 产品语言 / 极简理性 / 质感趣味 / 极客霓虹；
+  主打玻璃拟态 Glassmorphism），配色取材 [Style Atlas](https://weepwood.github.io/style-atlas/)
+  各风格实测值，Token 契约见 [docs/UI-THEMES.md](docs/UI-THEMES.md)
 
 ## 当前状态（M0 基础已就位）
 

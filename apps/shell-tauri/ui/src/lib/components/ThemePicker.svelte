@@ -3,46 +3,53 @@
   import { toast } from "../store.svelte";
   import Icon from "./Icon.svelte";
 
-  /* 图鉴卡片：悬停只高亮，点击才应用全站主题（对齐 Style Atlas 交互约定） */
+  /* 图鉴卡片：悬停只高亮，点击才应用全站主题（对齐 Style Atlas 交互约定）。
+     21 种设计语言按 Atlas 选型维度分组；预览小窗用 scoped data-theme。 */
+  const groups = [...new Set(THEMES.map((t) => t.group))];
+
+  /* 动效四档节奏（对齐 Atlas motion-lab 实测区间） */
   const tempos = [
-    { name: "fast", desc: "按钮、收藏、开关", time: "90–150ms" },
-    { name: "nav", desc: "导航与选择", time: "120–220ms" },
-    { name: "surface", desc: "容器展开、弹窗", time: "160–300ms" },
-    { name: "status", desc: "成功反馈、通知", time: "100–200ms" },
+    { name: "fast", desc: "按钮、收藏、开关", time: "120–160ms" },
+    { name: "nav", desc: "选项卡、筛选、选中态", time: "180–240ms" },
+    { name: "surface", desc: "抽屉、弹窗、内容面板", time: "240–320ms" },
+    { name: "status", desc: "成功反馈、通知、保存", time: "160–220ms" },
   ];
 </script>
 
-<div class="tp-grid">
-  {#each THEMES as t (t.id)}
-    <button
-      class="tp-card"
-      class:active={themeState.id === t.id}
-      onclick={() => setTheme(t.id)}
-      aria-pressed={themeState.id === t.id}
-    >
-      {#if themeState.id === t.id}
-        <span class="badge badge-ok">使用中</span>
-      {/if}
-      <!-- 预览小窗：scoped data-theme，主题 Token 在子树内生效 -->
-      <div class="tp-preview" data-theme={t.id}>
-        <div class="tp-bar"><i></i><i></i><i></i></div>
-        <div class="tp-title">Quartz</div>
-        <div class="tp-line"></div>
-        <div class="tp-line short"></div>
-        <span class="tp-btn">启动</span>
-      </div>
-      <div class="tp-info">
-        <span class="tp-name">{t.name}<span class="tp-en">{t.en}</span></span>
-        <span class="tp-tagline">{t.tagline}</span>
-        <span class="tp-tags">
-          {#each t.tags as tag (tag)}
-            <span class="tp-tag">{tag}</span>
-          {/each}
-        </span>
-      </div>
-    </button>
-  {/each}
-</div>
+{#each groups as g (g)}
+  <div class="tp-group">{g}</div>
+  <div class="tp-grid">
+    {#each THEMES.filter((t) => t.group === g) as t (t.id)}
+      <button
+        class="tp-card"
+        class:active={themeState.id === t.id}
+        onclick={() => setTheme(t.id)}
+        aria-pressed={themeState.id === t.id}
+      >
+        {#if themeState.id === t.id}
+          <span class="badge badge-ok">使用中</span>
+        {/if}
+        <!-- 预览小窗：scoped data-theme，主题 Token 在子树内生效 -->
+        <div class="tp-preview" data-theme={t.id}>
+          <div class="tp-bar"><i></i><i></i><i></i></div>
+          <div class="tp-title">Quartz</div>
+          <div class="tp-line"></div>
+          <div class="tp-line short"></div>
+          <span class="tp-btn">启动</span>
+        </div>
+        <div class="tp-info">
+          <span class="tp-name">{t.name}<span class="tp-en">{t.en}</span></span>
+          <span class="tp-tagline">{t.tagline}</span>
+          <span class="tp-tags">
+            {#each t.tags as tag (tag)}
+              <span class="tp-tag">{tag}</span>
+            {/each}
+          </span>
+        </div>
+      </button>
+    {/each}
+  </div>
+{/each}
 
 <!-- 动效实验室：四档节奏 + 总开关 + 即时体验 -->
 <div class="motion-row">
