@@ -22,10 +22,14 @@ import {
   type MsResult,
   type Page,
   type Preflight,
+  type ProjectVersion,
   type RendererInfo,
+  type SearchHit,
+  type SearchResp,
   type SettingsInfo,
   type VersionInfo,
 } from "./types";
+import { IS_DEMO } from "./demo";
 import { bytes, fmtBytes } from "./format";
 
 /* ============ Toast ============ */
@@ -77,6 +81,13 @@ async function loadVersions(showLoading = true) {
     const prev = versionsState.selected;
     if (!prev || !(list.some((v) => v.id === prev) || versionsState.installed.includes(prev))) {
       versionsState.selected = list[0]?.id ?? "";
+    }
+    // ZL2/FCL 语义：主页「当前版本」应是已安装实例 —— 默认选中优先落到已安装版本
+    if (
+      versionsState.installed.length > 0 &&
+      !versionsState.installed.includes(versionsState.selected)
+    ) {
+      versionsState.selected = versionsState.installed[0];
     }
     window.localStorage.setItem("quartz.selectedVersion", versionsState.selected);
   } catch (e) {
@@ -528,11 +539,25 @@ function onProgress(p: DownloadProgress) {
     refreshInstalled();
     toast("下载完成", "ok");
     refreshAssetsStatus();
+    // ZL2/FCL 同款：启动前自动补全完成后，若在等待启动则继续启动
+    if (autoRepairThenLaunch) {
+      const v = autoRepairThenLaunch;
+      autoRepairThenLaunch = null;
+      void doLaunch(v);
+    }
   } else if (p.stage === "error") {
     versionsState.busy = false;
     toast("下载失败", "err");
+    if (autoRepairThenLaunch) {
+      autoRepairThenLaunch = null;
+      setLaunchBadge("启动失败", "err");
+    }
   }
 }
+
+/** 启动前自动补全链（ZL2 VERIFY_AND_REPAIR / FCL checkGameCompletion 同款）：
+ *  资产缺失 → 自动修复 → 修复完成自动继续启动。 */
+let autoRepairThenLaunch: string | null = null;
 
 export async function startDownload(versionId: string) {
   if (!versionId) {
@@ -833,6 +858,7 @@ export async function launch() {
     const pf = await invoke<Preflight>("launch_preflight", { versionId });
     if (!pf.accountOk) {
       toast("请先在「账户」页登录", "err");
+      session.page = "account";
       return;
     }
     if (!pf.versionInstalled) {
@@ -849,6 +875,23 @@ export async function launch() {
       showRtProgress();
       await invoke("download_runtime", { javaMajor: pf.javaMajor });
       return; // 完成事件回调里继续 doLaunch
+    }
+    // 自动补全链：启动前检查资产，缺失则自动修复后继续（可跳过手动修复）
+    try {
+      const st = await invoke<AssetsStatus>("assets_status", { versionId });
+      if (st.indexPresent && st.missing > 0) {
+        appendLog(
+          "quartz",
+          `[quartz] 检测到 ${st.missing} 个缺失资源文件（约 ${bytes(st.missingBytes)}），启动前自动补全…`,
+        );
+        setLaunchBadge("自动补全资源…", "warn");
+        autoRepairThenLaunch = versionId;
+        downloadState.visible = true;
+        await invoke("repair_assets", { versionId });
+        return;
+      }
+    } catch {
+      /* 资产检查失败不阻塞启动（启动后端还会做完整校验） */
     }
     await doLaunch(versionId);
   } catch (e) {
@@ -1043,6 +1086,11 @@ export async function startMsLogin() {
 function onMsPrompt(dc: MsPrompt) {
   settingsState.msPrompt = `请在浏览器打开 ${dc.verificationUri} 并输入代码 ${dc.userCode}，等待授权完成…`;
   settingsState.msResult = null;
+  // ZL2 同款自动化：设备码自动复制到剪贴板，用户打开验证页后直接粘贴
+  void navigator.clipboard?.writeText(dc.userCode).then(
+    () => toast("验证代码已复制到剪贴板", "ok"),
+    () => {},
+  );
 }
 
 function onMsResult(r: MsResult) {
@@ -1111,7 +1159,6 @@ export async function copyExitDetail() {
 export function showPage(page: Page) {
   session.page = page;
   if (page === "instances") void refreshInstances();
-  if (page === "content") void refreshContent();
   if (page === "settings") void loadSettings();
   if (page === "account") void refreshAuthlib();
 }
@@ -1133,6 +1180,17 @@ export function enterApp() {
   loadSettings();
   refreshInstances();
   refreshAuthlib();
+  refreshJavaRuntimes();
+  void takePendingImport();
+}
+
+/** 前台回来时再检查一次外部投递的整合包（onNewIntent 无事件通道，轮询兑底） */
+if (typeof document !== "undefined") {
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible" && session.entered) {
+      void takePendingImport();
+    }
+  });
 }
 
 /* ============ 事件通道（一次性注册） ============ */
@@ -1179,6 +1237,7 @@ export async function initEvents() {
     }
   });
   await listen<DownloadProgress>("loader://progress", (ev) => onLoaderProgress(ev.payload));
+  await listen<DownloadProgress>("modrinth://progress", (ev) => onModrinthProgress(ev.payload));
   await listen<MsPrompt>("ms://prompt", (ev) => onMsPrompt(ev.payload));
   await listen<MsResult>("ms://result", (ev) => onMsResult(ev.payload));
   await listen<{ done: boolean; version?: string | null; error?: string | null }>(
@@ -1194,17 +1253,336 @@ export async function initEvents() {
   );
   await listen<DownloadProgress>("mrpack://progress", (ev) => {
     const p = ev.payload;
+    const pr = importState.progress;
     if (p.error) {
       toast(`整合包导入失败：${p.error}`, "err");
       appendLog("quartz", `[quartz] 整合包导入失败：${p.error}`);
+      pr.status = { kind: "err", text: p.error ?? "未知错误" };
     } else if (p.done) {
       toast("整合包导入完成", "ok");
       appendLog("quartz", "[quartz] 整合包导入完成");
+      pr.percent = 100;
+      pr.stage = "完成";
+      pr.status = { kind: "ok", text: "导入完成！新实例已就绪，可在「实例」页查看。" };
+      pr.file = p.file || "";
       void refreshInstances();
     } else {
+      pr.visible = true;
+      pr.percent = Math.max(0, Math.min(100, p.percent || 0));
+      pr.stage = STAGE_LABELS[p.stage] ?? p.stage;
+      pr.file = p.file || p.stage;
+      pr.status = null;
       appendLog("quartz", `[quartz] 整合包导入 ${Math.round(p.percent)}%：${p.file || p.stage}`);
     }
   });
+}
+
+/* ============ Modrinth 内容生态（ZL2/FCL 下载页同款分区） ============ */
+export type ModrinthKind = "mod" | "resourcepack" | "shaderpack" | "modpack";
+
+export const modrinthState = $state({
+  query: "",
+  loaders: [] as string[],
+  gameVersions: "",
+  sort: "relevance",
+  hits: null as SearchHit[] | null,
+  totalHits: 0,
+  loading: false,
+  error: "",
+  shown: 20,
+  /* 当前生效的分区（切 Tab 时触发重搜） */
+  lastKind: null as ModrinthKind | null,
+  /* 项目详情（版本列表） */
+  detail: null as { hit: SearchHit; versions: ProjectVersion[] } | null,
+  detailLoading: false,
+  /* 安装进度 */
+  progress: { visible: false, stage: "", percent: 0, file: "", status: null as ProgressStatus },
+});
+
+export function modrinthFiltersFor(kind: ModrinthKind): { loaders: string[]; gameVersions: string[] } {
+  const gv = modrinthState.gameVersions.trim();
+  return {
+    loaders: kind === "mod" ? modrinthState.loaders : [],
+    gameVersions: gv ? [gv] : [],
+  };
+}
+
+export async function modrinthSearch(kind: ModrinthKind, reset = true) {
+  if (reset) {
+    modrinthState.shown = 20;
+    modrinthState.error = "";
+  }
+  modrinthState.lastKind = kind;
+  modrinthState.loading = true;
+  try {
+    const f = modrinthFiltersFor(kind);
+    const resp = await invoke<SearchResp>("modrinth_search", {
+      query: modrinthState.query,
+      projectType: kind,
+      loaders: f.loaders,
+      gameVersions: f.gameVersions,
+      index: modrinthState.sort,
+      offset: 0,
+      limit: 50,
+    });
+    modrinthState.hits = resp.hits;
+    modrinthState.totalHits = resp.total_hits;
+  } catch (e) {
+    modrinthState.hits = [];
+    modrinthState.error = String(e);
+  } finally {
+    modrinthState.loading = false;
+  }
+}
+
+export async function modrinthOpen(hit: SearchHit, kind: ModrinthKind) {
+  modrinthState.detail = { hit, versions: [] };
+  modrinthState.detailLoading = true;
+  try {
+    const f = modrinthFiltersFor(kind);
+    const list = await invoke<ProjectVersion[]>("modrinth_versions", {
+      projectId: hit.project_id,
+      loaders: f.loaders,
+      gameVersions: f.gameVersions,
+    });
+    modrinthState.detail.versions = list;
+  } catch (e) {
+    toast(`版本列表加载失败：${String(e)}`, "err");
+  } finally {
+    modrinthState.detailLoading = false;
+  }
+}
+
+export function modrinthCloseDetail() {
+  modrinthState.detail = null;
+}
+
+function onModrinthProgress(p: DownloadProgress) {
+  const pr = modrinthState.progress;
+  if (p.error) {
+    pr.status = { kind: "err", text: p.error };
+  } else if (p.done) {
+    pr.percent = 100;
+    pr.stage = "完成";
+    pr.file = p.file ?? "";
+    pr.status = { kind: "ok", text: "安装完成！内容已写入当前作用域目录。" };
+  } else {
+    pr.status = null;
+    pr.percent = Math.max(0, Math.min(100, p.percent || 0));
+    pr.stage = STAGE_LABELS[p.stage] ?? p.stage;
+    pr.file = p.file ?? "";
+  }
+  if (p.done || p.error) {
+    if (instancesState.selectedId || contentState.list !== null) {
+      void refreshContent();
+    }
+  }
+}
+
+export async function modrinthInstall(versionId: string, kind: ModrinthKind) {
+  if (modrinthState.progress.visible) {
+    toast("已有内容安装任务", "");
+    return;
+  }
+  modrinthState.progress = {
+    visible: true,
+    stage: "准备中",
+    percent: 0,
+    file: "",
+    status: null,
+  };
+  try {
+    await invoke("modrinth_install", {
+      versionId,
+      kind,
+      instanceId: instancesState.selectedId,
+    });
+  } catch (e) {
+    modrinthState.progress.visible = false;
+    toast(String(e), "err");
+  }
+}
+
+/* ============ 本地整合包导入（.mrpack / .zip） ============ */
+export const importState = $state({
+  busy: false,
+  fileName: "",
+  /* 导入管线进度（mrpack://progress 驱动；Modrinth 整合包下载完成后转入本管线） */
+  progress: { visible: false, stage: "", percent: 0, file: "", status: null as ProgressStatus },
+});
+
+export async function importModpackFile(file: File): Promise<boolean> {
+  if (importState.busy) {
+    toast("已有导入任务进行中", "err");
+    return false;
+  }
+  importState.busy = true;
+  importState.fileName = file.name;
+  try {
+    const buf = await file.arrayBuffer();
+    // Tauri v2 raw IPC：字节流直传后端（WebView 原生文件选择器 + 系统文件关联双通道）
+    await invoke("import_modpack_bytes", new Uint8Array(buf));
+    toast(`整合包「${file.name}」导入已开始`, "ok");
+    return true;
+  } catch (e) {
+    toast(`整合包导入失败：${String(e)}`, "err");
+    return false;
+  } finally {
+    importState.busy = false;
+  }
+}
+
+/** 外部「打开方式」投递的整合包自动导入（ZL2/FCL 文件关联同款自动化）。 */
+export async function takePendingImport() {
+  try {
+    const path = await invoke<string | null>("take_pending_import");
+    if (!path) return;
+    toast("检测到外部整合包，自动导入…", "ok");
+    appendLog("quartz", `[quartz] 文件关联导入：${path}`);
+    await invoke("import_mrpack", { path });
+    await invoke("consume_pending_import", { path });
+  } catch {
+    /* 桌面端/演示模式无此能力 */
+  }
+}
+
+/* ============ Java 运行时管理（ZL2 JavaManage / FCL JavaManageDialog 同款） ============ */
+export const JAVA_MAJORS = [8, 17, 21, 25] as const;
+
+export const javaState = $state({
+  list: null as { major: number; installed: boolean; version: string | null; specAvailable: boolean }[] | null,
+});
+
+export async function refreshJavaRuntimes() {
+  const out: { major: number; installed: boolean; version: string | null; specAvailable: boolean }[] = [];
+  for (const major of JAVA_MAJORS) {
+    try {
+      const st = await invoke<{ installed: boolean; version: string | null; specAvailable: boolean }>(
+        "get_runtime_status",
+        { javaMajor: major },
+      );
+      out.push({ major, ...st });
+    } catch {
+      out.push({ major, installed: false, version: null, specAvailable: false });
+    }
+  }
+  javaState.list = out;
+}
+
+export async function downloadJavaRuntime(major: number) {
+  if (runtimeDownloading) {
+    toast("已有运行时下载任务", "");
+    return;
+  }
+  appendLog("quartz", `[quartz] 手动下载 Java ${major} 运行时…`);
+  showRtProgress();
+  try {
+    await invoke("download_runtime", { javaMajor: major });
+  } catch (e) {
+    runtimeDownloading = false;
+    rtState.visible = false;
+    toast(String(e), "err");
+  }
+}
+
+/* ============ 日志上传分享（ZL2 mclo.gs / FCL logshare 同款） ============ */
+export const logUpload = $state({ busy: false, url: null as string | null, error: "" });
+
+export async function uploadLogTail(name: string) {
+  if (!name) {
+    toast("暂无日志", "err");
+    return;
+  }
+  if (IS_DEMO) {
+    logUpload.url = "https://api.mclo.gs/1/demo";
+    toast("演示模式：真实 APK 中会把日志上传 mclo.gs 生成分享链接", "");
+    return;
+  }
+  logUpload.busy = true;
+  logUpload.error = "";
+  logUpload.url = null;
+  try {
+    const text = await invoke<string>("read_log_tail", { name });
+    const body = new URLSearchParams({ content: text });
+    const resp = await fetch("https://api.mclo.gs/1/log", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: body.toString(),
+    });
+    const data = (await resp.json()) as { success: boolean; url?: string; error?: string };
+    if (data.success && data.url) {
+      logUpload.url = data.url;
+      await navigator.clipboard?.writeText(data.url).catch(() => {});
+      toast("已上传 mclo.gs，链接已复制", "ok");
+    } else {
+      throw new Error(data.error ?? "上传失败");
+    }
+  } catch (e) {
+    logUpload.error = String(e);
+    toast(`日志上传失败：${String(e)}`, "err");
+  } finally {
+    logUpload.busy = false;
+  }
+}
+
+/* ============ 实例扩展操作（重命名 / 复制） ============ */
+export async function renameInstance(id: string, name: string) {
+  if (!name.trim()) {
+    toast("名称不能为空", "err");
+    return;
+  }
+  try {
+    await invoke("rename_instance_cmd", { id, name: name.trim() });
+    toast("实例已重命名", "ok");
+    await refreshInstances();
+  } catch (e) {
+    toast(String(e), "err");
+  }
+}
+
+export async function duplicateInstance(id: string) {
+  try {
+    const newId = await invoke<string>("duplicate_instance_cmd", { id });
+    toast(`实例已复制为 ${newId}`, "ok");
+    await refreshInstances();
+  } catch (e) {
+    toast(String(e), "err");
+  }
+}
+
+export async function toggleContent(name: string) {
+  try {
+    const newName = await invoke<string>("toggle_content_cmd", {
+      kind: contentState.kind,
+      name,
+      instanceId: instancesState.selectedId,
+    });
+    toast(newName.endsWith(".disabled") ? "已禁用（文件保留）" : "已启用", "ok");
+    await refreshContent();
+  } catch (e) {
+    toast(String(e), "err");
+  }
+}
+
+/* ============ 实例内存/渲染器按实例覆盖（FCL VersionSetting 同款） ============ */
+export async function setInstanceMemory(id: string, mb: number) {
+  try {
+    await invoke("set_instance_memory", { id, memoryMb: mb });
+    toast(`实例内存已保存为 ${mb} MB`, "ok");
+    await refreshInstances();
+  } catch (e) {
+    toast(String(e), "err");
+  }
+}
+
+export async function setInstanceRenderer(id: string, renderer: string | null) {
+  try {
+    await invoke("set_instance_renderer", { id, renderer });
+    toast(renderer ? "实例渲染层已覆盖" : "已恢复跟随全局", "ok");
+    await refreshInstances();
+  } catch (e) {
+    toast(String(e), "err");
+  }
 }
 
 /* ============ Boot ============ */

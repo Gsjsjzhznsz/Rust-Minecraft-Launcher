@@ -9,6 +9,7 @@
     downloadAuthlibAgent,
     refreshAuthlib,
     removeAccount,
+    saveAzureClientId,
     startMsLogin,
     switchAccount,
     settingsState,
@@ -21,6 +22,10 @@
   let authlibServer = $state("");
   let authlibUser = $state("");
   let authlibPass = $state("");
+
+  /* 微软登录一次性配置（ZL2/FCL 内置凭据不暴露；本项目凭据由使用者自备，
+     仅在首次使用微软登录时按需展示，平时不占设置页） */
+  let azureInput = $state("");
 
   const confirmArmed = $state<{ uuid: string | null }>({ uuid: null });
   let armTimer: number | undefined;
@@ -87,7 +92,16 @@
       <Icon name="cube" />
       <h3>微软账号（设备码登录）</h3>
     </div>
-    <p class="page-sub">需先在设置页配置项目自有 Azure client_id；登录后自动写入会话</p>
+    <p class="page-sub">设备码流程：验证代码自动复制到剪贴板 → 浏览器完成授权 → 自动回到应用</p>
+    {#if settingsState.azureState.startsWith("未配置")}
+      <div class="alert alert-warn" style="margin-top:8px">
+        首次使用微软登录需要配置一次 Azure Public Client ID（ZL2/FCL 为内置凭据；本项目凭据由使用者自备）。
+        <div class="add-row" style="margin-top:8px">
+          <input placeholder="Azure client_id（GUID）" autocomplete="off" bind:value={azureInput} />
+          <button class="btn btn-sm btn-primary" onclick={() => saveAzureClientId(azureInput.trim())}>保存</button>
+        </div>
+      </div>
+    {/if}
     <button class="btn btn-primary" style="margin-top:10px" onclick={startMsLogin}>开始微软登录</button>
     {#if settingsState.msPrompt}
       <div class="alert alert-warn" transition:fade>{settingsState.msPrompt}</div>

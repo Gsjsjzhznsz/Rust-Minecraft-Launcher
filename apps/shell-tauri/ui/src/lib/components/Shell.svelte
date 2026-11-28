@@ -8,15 +8,15 @@
   import HomePage from "../pages/HomePage.svelte";
   import DownloadPage from "../pages/DownloadPage.svelte";
   import InstancesPage from "../pages/InstancesPage.svelte";
-  import ContentPage from "../pages/ContentPage.svelte";
   import AccountPage from "../pages/AccountPage.svelte";
   import SettingsPage from "../pages/SettingsPage.svelte";
 
+  /* 一级导航收编为 ZL2/FCL 同构：主页 / 下载 / 实例(管理) / 账户 / 设置；
+     原「内容」一级页并入实例页分区（FCL ManageUI 7 Tab / ZL2 版本详情 10 分区同款语义） */
   const nav = [
     { page: "home", label: "主页", icon: "home" },
-    { page: "download", label: "下载游戏", icon: "download" },
+    { page: "download", label: "下载", icon: "download" },
     { page: "instances", label: "实例", icon: "grid" },
-    { page: "content", label: "内容", icon: "layers" },
     { page: "account", label: "账户", icon: "user" },
     { page: "settings", label: "设置", icon: "settings" },
   ] as const;
@@ -25,7 +25,6 @@
     { page: "home", label: "主页", icon: "home" },
     { page: "download", label: "下载", icon: "download" },
     { page: "instances", label: "实例", icon: "grid" },
-    { page: "content", label: "内容", icon: "layers" },
     { page: "account", label: "账户", icon: "user" },
     { page: "settings", label: "设置", icon: "settings" },
   ] as const;
@@ -109,8 +108,6 @@
           <DownloadPage />
         {:else if session.page === "instances"}
           <InstancesPage />
-        {:else if session.page === "content"}
-          <ContentPage />
         {:else if session.page === "account"}
           <AccountPage />
         {:else if session.page === "settings"}

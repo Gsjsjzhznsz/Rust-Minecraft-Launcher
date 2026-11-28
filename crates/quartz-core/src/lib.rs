@@ -29,6 +29,7 @@ pub mod meta;
 pub mod mirror;
 pub mod model;
 pub mod modkit;
+pub mod modrinth;
 pub mod paths;
 pub mod platform;
 pub mod renderbus;

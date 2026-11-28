@@ -9,21 +9,25 @@
     envState,
     permBanners,
     refreshAssetsStatus,
+    refreshJavaRuntimes,
+    javaState,
+    downloadJavaRuntime,
     repairAssets,
     requestPermission,
     rendererState,
-    saveAzureClientId,
+    rtState,
     saveJvmArgs,
     saveMemorySetting,
     settingsState,
     switchRenderer,
+    uploadLogTail,
+    logUpload,
     viewLogTail,
   } from "../store.svelte";
   import { bytes } from "../format";
   import ThemePicker from "../components/ThemePicker.svelte";
 
   let logSelect = $state("");
-  let azureInput = $state("");
   let jvmInput = $state("");
   let memSlider = $state(1024);
   let jvmInit = $state(false);
@@ -32,14 +36,12 @@
   $effect(() => {
     if (settingsState.jvmArgs !== "" && !jvmInit) {
       jvmInput = settingsState.jvmArgs;
-      azureInput = settingsState.azureId;
       memSlider = settingsState.memory;
       jvmInit = true;
     }
   });
 
   const memPercent = $derived(((memSlider - 512) / (4096 - 512)) * 100);
-  const selectedLog = $derived(settingsState.logs.find((l) => l.name === logSelect));
 
   function onMemInput(e: Event) {
     memSlider = Number((e.target as HTMLInputElement).value);
@@ -158,8 +160,54 @@
     <button class="btn btn-sm btn-primary" onclick={() => saveMemorySetting(memSlider)}>保存内存设置</button>
   </div>
 
-  <!-- 启动参数 -->
+  <!-- Java 运行时管理（ZL2 JavaManage / FCL JavaManageDialog 同款） -->
   <div class="card panel rise" style="--i:5">
+    <div class="card-title-row">
+      <Icon name="cube" />
+      <h3>Java 运行时管理</h3>
+    </div>
+    <p class="page-sub">
+      按游戏版本自动选择合适的 Java 大版本（启动前自动下载对应运行时）；也可在此手动预下载。
+    </p>
+    {#if javaState.list === null}
+      <div class="list-note">检测中…</div>
+    {:else}
+      {#each javaState.list as j (j.major)}
+        <div class="kv" style="flex-direction:row;align-items:center;gap:12px">
+          <span class="kv-key" style="min-width:70px">Java {j.major}</span>
+          <span class="kv-val" style="flex:1">
+            {#if j.installed}
+              已就绪{j.version ? `（${j.version}）` : ""}
+            {:else if j.specAvailable}
+              未下载（启动需要时自动获取）
+            {:else}
+              暂无下载源
+            {/if}
+          </span>
+          {#if j.installed}
+            <span class="badge badge-ok">就绪</span>
+          {:else if j.specAvailable}
+            <button class="btn btn-sm btn-primary" onclick={() => downloadJavaRuntime(j.major)}>下载</button>
+          {:else}
+            <span class="badge badge-dim">无源</span>
+          {/if}
+        </div>
+      {/each}
+    {/if}
+    <ProgressCard
+      title="Java 运行时"
+      stage={rtState.stage}
+      percent={rtState.percent}
+      current={rtState.current}
+      total={rtState.total}
+      file={rtState.file}
+      visible={rtState.visible}
+      status={null}
+    />
+  </div>
+
+  <!-- 启动参数 -->
+  <div class="card panel rise" style="--i:6">
     <div class="card-title-row">
       <Icon name="console" />
       <h3>启动参数</h3>
@@ -169,20 +217,6 @@
     <button class="btn btn-sm btn-primary" style="margin-top:10px" onclick={() => saveJvmArgs(jvmInput)}>
       保存 JVM 参数
     </button>
-  </div>
-
-  <!-- 微软登录配置 -->
-  <div class="card panel rise" style="--i:6">
-    <div class="card-title-row">
-      <Icon name="user" />
-      <h3>微软登录配置</h3>
-    </div>
-    <p class="page-sub">项目自有 Azure Public Client ID（Public Client 允许公开，不涉密钥）</p>
-    <div class="add-row" style="margin-top:10px">
-      <input placeholder="Azure client_id（GUID）" autocomplete="off" bind:value={azureInput} />
-      <button class="btn btn-sm btn-primary" onclick={() => saveAzureClientId(azureInput.trim())}>保存</button>
-    </div>
-    <div class="kv"><span class="kv-key">当前状态</span><span class="kv-val">{settingsState.azureState}</span></div>
   </div>
 
   <!-- 游戏文件维护 -->
@@ -204,7 +238,7 @@
       <Icon name="file" />
       <h3>启动日志</h3>
     </div>
-    <p class="page-sub">游戏崩溃时把这里的日志尾部一并发给开发者</p>
+    <p class="page-sub">崩溃排障：查看 / 复制 / 上传 mclo.gs 生成分享链接（ZL2/FCL 同款，自动脱敏场景由上传服务处理）</p>
     <div class="kv" style="gap:8px">
       <select bind:value={logSelect}>
         {#if settingsState.logs.length === 0}
@@ -215,11 +249,22 @@
           {/each}
         {/if}
       </select>
-      <div style="display:flex;gap:8px;margin-top:6px">
+      <div style="display:flex;gap:8px;margin-top:6px;flex-wrap:wrap">
         <button class="btn btn-sm btn-primary" onclick={() => viewLogTail(logSelect)}>查看尾部</button>
         <button class="btn btn-sm btn-ghost" onclick={() => copyLogTail(logSelect)}>复制</button>
+        <button class="btn btn-sm btn-ghost" disabled={logUpload.busy} onclick={() => uploadLogTail(logSelect)}>
+          {logUpload.busy ? "上传中…" : "上传 mclo.gs"}
+        </button>
       </div>
     </div>
+    {#if logUpload.url}
+      <div class="alert alert-ok" transition:fade>
+        分享链接：<a href={logUpload.url} target="_blank" rel="noreferrer" style="word-break:break-all">{logUpload.url}</a>
+      </div>
+    {/if}
+    {#if logUpload.error}
+      <div class="alert alert-error" transition:fade>{logUpload.error}</div>
+    {/if}
     {#if settingsState.logText !== null}
       <pre class="tree" style="max-height:240px;overflow:auto">{settingsState.logText}</pre>
     {/if}

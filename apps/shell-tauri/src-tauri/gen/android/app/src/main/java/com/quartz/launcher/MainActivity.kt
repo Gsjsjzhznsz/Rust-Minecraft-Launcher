@@ -175,6 +175,37 @@ class MainActivity : TauriActivity() {
     // 竖屏 UI 修复配套：禁用 WebView 缩放（viewport meta 同时 user-scalable=no）。
     // Tauri 的 WebView 为异步创建，轮询等待并配置。
     scheduleWebViewZoomConfigure(0)
+    // 文件关联（对标 ZL2 ImportModpackActivity / FCL ImportActivity）:
+    // 文件管理器点开 .mrpack/.zip → 复制到 pending 目录 → UI 侧自动导入。
+    handleImportIntent(intent)
+  }
+
+  override fun onNewIntent(intent: Intent) {
+    super.onNewIntent(intent)
+    // singleTask + 已在前台时，外部 VIEW 投递走 onNewIntent。
+    handleImportIntent(intent)
+  }
+
+  /**
+   * 外部「打开方式」投递的整合包：contentResolver 读字节流落盘到
+   * filesDir/qz_pending_import/（Rust 侧 take_pending_import 扫描同一目录，
+   * /data/data/<pkg>/files 与 getFilesDir() 等价）。后台线程执行，失败静默
+   * （导入入口还有下载页按钮与 UI 文件选择器兑底）。
+   */
+  private fun handleImportIntent(intent: Intent?) {
+    if (intent?.action != Intent.ACTION_VIEW) return
+    val uri = intent.data ?: return
+    Thread {
+      try {
+        val dir = java.io.File(filesDir, "qz_pending_import").apply { mkdirs() }
+        dir.listFiles()?.forEach { it.delete() }
+        val out = java.io.File(dir, "import-${System.currentTimeMillis()}.mrpack")
+        contentResolver.openInputStream(uri)?.use { input ->
+          out.outputStream().use { output -> input.copyTo(output) }
+        }
+      } catch (_: Throwable) {
+      }
+    }.start()
   }
 
   override fun onResume() {

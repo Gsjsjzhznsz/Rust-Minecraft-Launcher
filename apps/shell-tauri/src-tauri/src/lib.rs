@@ -30,14 +30,14 @@
 use quartz_core::instance::DownloadProgress;
 use quartz_core::renderbus::{self, DeviceCaps};
 use quartz_core::{
-    auth, content, host_arch, instance, jvmops, lwjgl, meta, model, modkit, paths, platform,
-    renderers, rules, runtime, settings, RuntimeCtx,
+    auth, content, host_arch, instance, jvmops, lwjgl, meta, model, modkit, modrinth, paths,
+    platform, renderers, rules, runtime, settings, RuntimeCtx,
 };
 use serde::Serialize;
 use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 #[cfg(target_os = "android")]
 mod game_bridge;
@@ -2007,11 +2007,28 @@ async fn import_mrpack(
         memory_mb: get_memory_mb_inner(),
     };
     let inst = instances_store().create(input).map_err(|e| e.to_string())?;
-    let inst_dir = instances_store().instance_dir(&inst.id);
+    spawn_modpack_install(app, state.downloading.clone(), inst, index);
+    Ok(())
+}
 
-    *state.downloading.lock().map_err(|_| "内部状态锁异常")? = true;
-    let busy = state.downloading.clone();
-    let app = app.clone();
+/// 整合包安装管线（ZL2 ModpackImporter / FCL ModpackHelper 同款编排）：
+/// loader 链式安装 → 基版本 → overrides 内容文件下载。调用方已完成
+/// 索引解析与实例创建；busy 由本函数置位并在任务结束时复位。
+fn spawn_modpack_install(
+    app: AppHandle,
+    busy: std::sync::Arc<std::sync::Mutex<bool>>,
+    inst: instance::Instance,
+    index: modkit::mrpack::MrpackIndex,
+) {
+    if let Ok(mut b) = busy.lock() {
+        *b = true;
+    }
+    let mc = index
+        .dependencies
+        .get("minecraft")
+        .cloned()
+        .unwrap_or_default();
+    let inst_dir = instances_store().instance_dir(&inst.id);
     tauri::async_runtime::spawn(async move {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<instance::DownloadProgress>(128);
         let forwarder_app = app.clone();
@@ -2053,13 +2070,358 @@ async fn import_mrpack(
                     error: Some(e.clone()),
                 },
             );
+        } else {
+            let _ = app.emit(
+                "mrpack://progress",
+                &instance::DownloadProgress {
+                    stage: "done".to_string(),
+                    current: 1,
+                    total: 1,
+                    percent: 100.0,
+                    file: inst.id.clone(),
+                    done: true,
+                    error: None,
+                },
+            );
         }
-        if let Ok(mut busy) = busy.lock() {
-            *busy = false;
+        if let Ok(mut b) = busy.lock() {
+            *b = false;
         }
         let _ = forwarder.await;
     });
+}
+
+// ---- 内容生态与实例操作（对标 ZL2/FCL）----
+
+/// 网页/移动端通用整合包导入：raw IPC 字节流（WebView 原生文件选择器
+/// 读取 .mrpack/.zip 字节 → 落临时文件 → 走 import_mrpack 同一管线）。
+#[tauri::command]
+async fn import_modpack_bytes(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    request: tauri::ipc::Request<'_>,
+) -> Result<(), String> {
+    let bytes = match request.body() {
+        tauri::ipc::InvokeBody::Raw(b) => b.clone(),
+        _ => return Err("导入载荷必须为原始字节流".to_string()),
+    };
+    if bytes.is_empty() {
+        return Err("整合包文件为空".to_string());
+    }
+    let tmp_dir = app
+        .path()
+        .app_cache_dir()
+        .map_err(|e| format!("缓存目录不可用：{e}"))?;
+    let dest = tmp_dir.join(format!("import-{}.mrpack", chrono_like_id()));
+    std::fs::write(&dest, &bytes).map_err(|e| format!("临时文件写入失败：{e}"))?;
+    import_mrpack(app, state, dest.to_string_lossy().into_owned(), None).await
+}
+
+/// pending 导入目录（MainActivity 文件关联接收后落盘的位置）。
+fn pending_import_dir(app: &AppHandle) -> Vec<std::path::PathBuf> {
+    let id = app.config().identifier.clone();
+    let mut candidates = vec![
+        std::path::PathBuf::from(format!("/data/data/{id}/files/qz_pending_import")),
+        std::path::PathBuf::from(format!(
+            "/storage/emulated/0/Android/data/{id}/files/qz_pending_import"
+        )),
+    ];
+    if let Ok(cache) = app.path().app_cache_dir() {
+        candidates.push(cache.join("qz_pending_import"));
+    }
+    candidates
+}
+
+/// 检查外部「打开方式」投递的整合包（MainActivity 已复制到 pending 目录）。
+/// 返回待导入文件路径；无则 None。
+#[tauri::command]
+fn take_pending_import(app: AppHandle) -> Option<String> {
+    for dir in pending_import_dir(&app) {
+        if let Ok(rd) = std::fs::read_dir(&dir) {
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_file() {
+                    return Some(p.to_string_lossy().into_owned());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// 导入完成后清理 pending 文件。
+#[tauri::command]
+fn consume_pending_import(app: AppHandle, path: String) -> bool {
+    let p = std::path::PathBuf::from(&path);
+    if p.exists() {
+        let _ = std::fs::remove_file(&p);
+    }
+    for dir in pending_import_dir(&app) {
+        if dir.parent().is_some() {
+            let _ = std::fs::remove_dir(&dir);
+        }
+    }
+    true
+}
+
+/// Modrinth 搜索（模组/资源包/光影/整合包聚合下载入口，ZL2/FCL 同款分区）。
+#[tauri::command]
+async fn modrinth_search(
+    query: Option<String>,
+    project_type: String,
+    loaders: Option<Vec<String>>,
+    game_versions: Option<Vec<String>>,
+    index: Option<String>,
+    offset: Option<u32>,
+    limit: Option<u32>,
+) -> Result<modrinth::SearchResp, String> {
+    let q = modrinth::SearchQuery {
+        query: query.unwrap_or_default(),
+        project_type,
+        loaders: loaders.unwrap_or_default(),
+        game_versions: game_versions.unwrap_or_default(),
+        index: index.unwrap_or_else(|| "relevance".to_string()),
+        offset: offset.unwrap_or(0),
+        limit: limit.unwrap_or(20).min(50),
+    };
+    modrinth::search(&meta::http_client(), &q)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Modrinth 项目版本列表。
+#[tauri::command]
+async fn modrinth_versions(
+    project_id: String,
+    loaders: Option<Vec<String>>,
+    game_versions: Option<Vec<String>>,
+) -> Result<Vec<modrinth::ProjectVersion>, String> {
+    modrinth::versions(
+        &meta::http_client(),
+        &project_id,
+        &loaders.unwrap_or_default(),
+        &game_versions.unwrap_or_default(),
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// Modrinth 一键安装：mod/resourcepack/shaderpack 直落内容目录
+/// （含 REQUIRED 依赖闭包自动解析）；modpack 下载 .mrpack 后自动走导入管线。
+#[tauri::command]
+async fn modrinth_install(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    version_id: String,
+    kind: String,
+    instance_id: Option<String>,
+) -> Result<(), String> {
+    if state
+        .downloading
+        .lock()
+        .map_err(|_| "内部状态锁异常")?
+        .clone()
+    {
+        return Err("已有下载任务正在进行，请等待完成后再试".to_string());
+    }
+    if kind != "mod" && kind != "resourcepack" && kind != "shaderpack" && kind != "modpack" {
+        return Err(format!("不支持的内容类型：{kind}"));
+    }
+    let app = app.clone();
+    let busy = state.downloading.clone();
+    if let Ok(mut b) = busy.lock() {
+        *b = true;
+    }
+    tauri::async_runtime::spawn(async move {
+        let emit_app = app.clone();
+        let emit = move |stage: &str,
+                         current: usize,
+                         total: usize,
+                         file: &str,
+                         done: bool,
+                         error: Option<String>| {
+            let _ = emit_app.emit(
+                "modrinth://progress",
+                &DownloadProgress {
+                    stage: stage.to_string(),
+                    current: current as u64,
+                    total: total as u64,
+                    percent: if total > 0 {
+                        (current as f64 / total as f64) * 100.0
+                    } else if done {
+                        100.0
+                    } else {
+                        0.0
+                    },
+                    file: file.to_string(),
+                    done,
+                    error,
+                },
+            );
+        };
+        let result: Result<(), String> = async {
+            let client = meta::http_client();
+            emit("resolve", 0, 0, &version_id, false, None);
+            let v = modrinth::version(&client, &version_id)
+                .await
+                .map_err(|e| format!("版本解析失败：{e}"))?;
+            if kind == "modpack" {
+                let tmp_dir = app
+                    .path()
+                    .app_cache_dir()
+                    .map_err(|e| format!("缓存目录不可用：{e}"))?;
+                emit("modpack-download", 0, 1, &version_id, false, None);
+                let src = modrinth::download_mrpack(&client, &v, &tmp_dir)
+                    .await
+                    .map_err(|e| format!("整合包下载失败：{e}"))?;
+                spawn_modpack_install_from_file(app.clone(), busy.clone(), src, None).await
+            } else {
+                let dir_kind = match kind.as_str() {
+                    "mod" => "mods",
+                    "resourcepack" => "resourcepacks",
+                    _ => "shaderpacks",
+                };
+                let base = instance_dir_for(&instance_id).unwrap_or_else(paths::minecraft_dir);
+                let dest = base.join(dir_kind);
+                let r = modrinth::install_version(
+                    &client,
+                    v,
+                    &dest,
+                    |p: quartz_core::modrinth::InstallProgress| {
+                        emit(
+                            if p.stage == "resolve" {
+                                "resolve"
+                            } else {
+                                "download"
+                            },
+                            p.current,
+                            p.total,
+                            &p.file,
+                            false,
+                            None,
+                        );
+                    },
+                )
+                .await
+                .map_err(|e| format!("安装失败：{e}"))?;
+                emit("done", 1, 1, &r.installed.join(", "), true, None);
+                Ok(())
+            }
+        }
+        .await;
+        if let Err(e) = &result {
+            emit("error", 0, 0, "", false, Some(e.clone()));
+        }
+        // modpack：busy 由整合包安装管线负责复位（下载完成只是导入了开始）
+        if kind != "modpack" {
+            if let Ok(mut b) = busy.lock() {
+                *b = false;
+            }
+        }
+    });
     Ok(())
+}
+
+/// 从本地 .mrpack 文件解析索引并创建实例后进入安装管线（供 Modrinth
+/// 整合包下载与外部导入共用）。下载/解析错误转为 Err；管线自身异步执行。
+async fn spawn_modpack_install_from_file(
+    app: AppHandle,
+    busy: std::sync::Arc<std::sync::Mutex<bool>>,
+    src: std::path::PathBuf,
+    instance_name: Option<String>,
+) -> Result<(), String> {
+    let index = modkit::mrpack::read_index(&src).map_err(|e| format!("整合包解析失败：{e}"))?;
+    if index.game != "minecraft" {
+        return Err(format!("不支持的整合包游戏：{}", index.game));
+    }
+    let mc = index
+        .dependencies
+        .get("minecraft")
+        .cloned()
+        .ok_or("整合包缺少 minecraft 版本依赖")?;
+    let loader_kind: Option<(&str, String)> = index
+        .dependencies
+        .get("fabric-loader")
+        .map(|v| ("fabric", v.clone()))
+        .or_else(|| {
+            index
+                .dependencies
+                .get("quilt-loader")
+                .map(|v| ("quilt", v.clone()))
+        })
+        .or_else(|| {
+            index
+                .dependencies
+                .get("forge")
+                .map(|v| ("forge", v.clone()))
+        })
+        .or_else(|| {
+            index
+                .dependencies
+                .get("neoforge")
+                .map(|v| ("neoforge", v.clone()))
+        });
+    let name = instance_name.unwrap_or_else(|| index.name.clone());
+    let (spec, java_major) = match &loader_kind {
+        Some((k, v)) => (
+            Some(parse_loader_spec(k, v)?),
+            modkit::loader_requires_jvm_major(k),
+        ),
+        None => (None, 17),
+    };
+    let input = instance::CreateInstance {
+        id: format!("mrpack-{}", chrono_like_id()),
+        name: name.trim().to_string(),
+        mc_version: mc,
+        loader: spec,
+        java_major,
+        memory_mb: get_memory_mb_inner(),
+    };
+    let inst = instances_store().create(input).map_err(|e| e.to_string())?;
+    let app2 = app.clone();
+    let busy2 = busy.clone();
+    // 交给 tauri 异步运行时：管线较长，避免阻塞当前 worker
+    tauri::async_runtime::spawn(async move {
+        spawn_modpack_install(app2, busy2, inst, index);
+    });
+    Ok(())
+}
+
+/// 实例重命名（FCL/ZL2 同款：仅改显示名，目录 id 不变）。
+#[tauri::command]
+fn rename_instance_cmd(id: String, name: String) -> Result<(), String> {
+    instances_store()
+        .update(&id, |i| i.name = name.trim().to_string())
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+/// 复制实例（FCL「复制实例」/ ZL2「复制版本」同款）。返回新实例 id。
+#[tauri::command]
+fn duplicate_instance_cmd(id: String, new_name: Option<String>) -> Result<String, String> {
+    let src = instances_store()
+        .get(&id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("实例不存在：{id}"))?;
+    let new_id = format!("{}-copy-{}", src.id, chrono_like_id());
+    let name = new_name.unwrap_or_else(|| format!("{} 副本", src.name));
+    instances_store()
+        .duplicate(&id, &new_id, name.trim())
+        .map(|i| i.id)
+        .map_err(|e| e.to_string())
+}
+
+/// 内容启用/禁用（FCL/ZL2 同款语义：改名 .disabled，不删文件）。
+/// 返回切换后的新文件名。
+#[tauri::command]
+fn toggle_content_cmd(
+    kind: String,
+    name: String,
+    instance_id: Option<String>,
+) -> Result<String, String> {
+    let k = content::ContentKind::parse(&kind).ok_or_else(|| format!("未知内容类型：{kind}"))?;
+    let dir = instance_dir_for(&instance_id);
+    content::toggle_content(k, &name, dir.as_deref()).map_err(|e| e.to_string())
 }
 
 // ---- 内容管理 ----
@@ -3226,6 +3588,15 @@ pub fn run() {
             authlib_status,
             download_authlib,
             import_mrpack,
+            import_modpack_bytes,
+            take_pending_import,
+            consume_pending_import,
+            modrinth_search,
+            modrinth_versions,
+            modrinth_install,
+            rename_instance_cmd,
+            duplicate_instance_cmd,
+            toggle_content_cmd,
             list_content_cmd,
             delete_content_cmd,
             get_settings,

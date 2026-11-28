@@ -59,7 +59,7 @@ export type InstanceEntry = {
   createdAt: string;
   selected: boolean;
 };
-export type ContentEntry = { name: string; kind: string; sizeBytes: number; isDir: boolean; modifiedAt: number };
+export type ContentEntry = { name: string; kind: string; sizeBytes: number; isDir: boolean; modifiedAt: number; disabled: boolean };
 export type SettingsInfo = {
   extraJvmArgs: string[];
   azureClientIdSet: boolean;
@@ -79,7 +79,7 @@ export type LwjglStatus = { installed: boolean; path: string };
 export type MsPrompt = { userCode: string; verificationUri: string; message?: string | null };
 export type MsResult = { ok: boolean; error?: string | null; account?: Account | null };
 
-export type Page = "home" | "download" | "instances" | "content" | "account" | "settings";
+export type Page = "home" | "download" | "instances" | "account" | "settings";
 
 export const KIND_LABELS: Record<string, string> = {
   release: "正式版",
@@ -97,6 +97,53 @@ export const STAGE_LABELS: Record<string, string> = {
   libraries: "依赖库",
   "asset-index": "资源索引",
   assets: "资源文件",
+  resolve: "解析依赖",
+  download: "下载",
+  deps: "依赖",
+  "modpack-download": "整合包下载",
+  "runtime-download": "运行时下载",
+  "unpack-runtime": "解包",
   done: "完成",
   error: "出错",
+};
+
+/* ---- Modrinth 内容生态（与 Rust modrinth.rs 契约一致，snake_case） ---- */
+export type SearchHit = {
+  project_id: string;
+  slug: string;
+  title: string;
+  description: string;
+  categories: string[];
+  display_categories: string[];
+  icon_url: string | null;
+  downloads: number;
+  author: string;
+  date_modified: string;
+};
+export type SearchResp = { hits: SearchHit[]; total_hits: number };
+export type VersionFile = {
+  url: string;
+  filename: string;
+  primary: boolean;
+  size: number;
+  hashes: Record<string, string>;
+};
+export type VersionDependency = {
+  version_id: string | null;
+  project_id: string | null;
+  file_name: string | null;
+  dependency_type: string;
+};
+export type ProjectVersion = {
+  id: string;
+  name: string;
+  version_number: string;
+  changelog: string;
+  game_versions: string[];
+  loaders: string[];
+  date_published: string;
+  featured: boolean;
+  downloads: number;
+  files: VersionFile[];
+  dependencies: VersionDependency[];
 };

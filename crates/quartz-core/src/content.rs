@@ -54,6 +54,8 @@ pub struct ContentEntry {
     pub is_dir: bool,
     /// 最后修改时间（epoch 秒；不可得为 0）。
     pub modified_at: u64,
+    /// 是否处于禁用态（FCL/ZL2 同款：文件以 .disabled 结尾）。
+    pub disabled: bool,
 }
 
 /// 内容目录解析：instance_dir 有值 -> <instance>/<dir>，否则全局 <mc>/<dir>。
@@ -87,12 +89,15 @@ pub fn list_content(kind: ContentKind, instance_dir: Option<&Path>) -> Result<Ve
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|d| d.as_secs())
             .unwrap_or(0);
+        let name = e.file_name().to_string_lossy().into_owned();
+        let disabled = name.ends_with(".disabled");
         out.push(ContentEntry {
-            name: e.file_name().to_string_lossy().into_owned(),
+            name,
             kind,
             size_bytes: size,
             is_dir,
             modified_at,
+            disabled,
         });
     }
     out.sort_by_key(|a| std::cmp::Reverse(a.modified_at));
@@ -101,12 +106,7 @@ pub fn list_content(kind: ContentKind, instance_dir: Option<&Path>) -> Result<Ve
 
 /// 删除内容项（文件或目录递归）；返回是否真正删除。
 pub fn delete_content(kind: ContentKind, name: &str, instance_dir: Option<&Path>) -> Result<bool> {
-    let dir = content_dir(kind, instance_dir);
-    // name 安全校验：拒绝路径穿越（../、绝对路径、分隔符）
-    if name.contains('/') || name.contains('\\') || name == ".." || name.is_empty() {
-        return Err(crate::error::Error::Other(format!("非法内容名：{name}")));
-    }
-    let path = dir.join(name);
+    let path = guard_name(kind, name, instance_dir)?;
     if !path.exists() {
         return Ok(false);
     }
@@ -116,6 +116,40 @@ pub fn delete_content(kind: ContentKind, name: &str, instance_dir: Option<&Path>
         std::fs::remove_file(&path)?;
     }
     Ok(true)
+}
+
+/// 同名安全解析（拒绝路径穿越），返回完整路径。
+fn guard_name(kind: ContentKind, name: &str, instance_dir: Option<&Path>) -> Result<PathBuf> {
+    if name.contains('/') || name.contains('\\') || name == ".." || name.is_empty() {
+        return Err(crate::error::Error::Other(format!("非法内容名：{name}")));
+    }
+    Ok(content_dir(kind, instance_dir).join(name))
+}
+
+/// 启用/禁用切换（FCL/ZL2 同款语义：改名 `.disabled` 后缀，不删文件）。
+/// 返回切换后的新文件名。
+pub fn toggle_content(
+    kind: ContentKind,
+    name: &str,
+    instance_dir: Option<&Path>,
+) -> Result<String> {
+    let path = guard_name(kind, name, instance_dir)?;
+    if !path.exists() {
+        return Err(crate::error::Error::Other(format!("内容不存在：{name}")));
+    }
+    let new_name = if let Some(stripped) = name.strip_suffix(".disabled") {
+        stripped.to_string()
+    } else {
+        format!("{name}.disabled")
+    };
+    let dest = path.with_file_name(&new_name);
+    if dest.exists() {
+        return Err(crate::error::Error::Other(format!(
+            "目标已存在：{new_name}"
+        )));
+    }
+    std::fs::rename(&path, &dest)?;
+    Ok(new_name)
 }
 
 fn dir_size(dir: &Path) -> u64 {
@@ -144,6 +178,32 @@ mod tests {
         assert_eq!(ContentKind::ShaderPacks.dir_name(), "shaderpacks");
         assert_eq!(ContentKind::Saves.dir_name(), "saves");
         assert_eq!(ContentKind::Screenshots.dir_name(), "screenshots");
+    }
+
+    #[test]
+    fn toggle_roundtrip_and_traversal_guard() {
+        let base = std::env::temp_dir().join(format!("qz-content-test-{}", std::process::id()));
+        let mods = base.join("mods");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&mods).unwrap();
+        std::fs::write(mods.join("a.jar"), b"x").unwrap();
+
+        // 禁用 -> .disabled
+        let n = toggle_content(ContentKind::Mods, "a.jar", Some(&base)).unwrap();
+        assert_eq!(n, "a.jar.disabled");
+        assert!(mods.join("a.jar.disabled").exists());
+        // 列表应带 disabled 标记
+        let list = list_content(ContentKind::Mods, Some(&base)).unwrap();
+        assert_eq!(list.len(), 1);
+        assert!(list[0].disabled);
+        // 再启用 -> 原名
+        let n2 = toggle_content(ContentKind::Mods, "a.jar.disabled", Some(&base)).unwrap();
+        assert_eq!(n2, "a.jar");
+        assert!(mods.join("a.jar").exists());
+        // 路径穿越拒绝
+        assert!(toggle_content(ContentKind::Mods, "../escape", Some(&base)).is_err());
+        assert!(delete_content(ContentKind::Mods, "../escape", Some(&base)).is_err());
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

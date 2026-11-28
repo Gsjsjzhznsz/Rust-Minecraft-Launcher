@@ -32,6 +32,39 @@ Prism Launcher、Amethyst-iOS（Pojav_iOS 继任），以及 Rust 侧先例 Modr
 - `apps/shell-tauri` —— Tauri 2 壳 + Web UI（桌面可 dev；浏览器预览走桩数据）
 - `docs/` —— 架构 / 路线图 / ui-pack 热更协议
 
+## 功能层 1:1 对标 ZL2 / FCL
+
+UI 视觉保持自有多设计语言体系（见 docs/UI-THEMES.md），**功能与操作逻辑对标
+ZalithLauncher2 与 Fold Craft Launcher**，删多补缺：
+
+**已对齐（本轮交付）**
+- 导航同构：主页 / 下载 / 实例(管理) / 账户 / 设置（原「内容」一级页并入实例页分区，
+  FCL ManageUI 7 Tab / ZL2 版本详情同款语义）
+- 主页操作逻辑：当前版本卡（只列已安装）+ 一键启动（ZL2 操作菜单 / FCL 右栏版本卡同款）
+- 下载页五分区：游戏 / 模组 / 资源包 / 光影 / 整合包；内容生态走 Modrinth API
+  （搜索 / 加载器与游戏版本筛选 / 排序 / 项目版本列表 / 一键安装含 REQUIRED
+  依赖闭包自动解析，文件已存在跳过 —— FCL ModDependenciesResolver / ZL2
+  QuickDownloadPlanner 同款语义）
+- 整合包双通道导入：应用内文件选择（raw IPC 字节流）+ **系统文件关联**
+  （文件管理器点开 .mrpack/.zip 自动导入，MainActivity ACTION_VIEW 接管，
+  ZL2 ImportModpackActivity / FCL ImportActivity 同款自动化）
+- 实例管理增强：重命名 / 复制（目录递归复制）/ 删除 / 选用 + 按实例覆盖
+  内存与渲染层（FCL VersionSettingPage 同款）
+- Mod 启用/禁用：`.disabled` 改名语义（FCL/ZL2 同款，不删文件）
+- 启动前自动化链：preflight → Java 运行时按需自动下载 → **资产缺失自动补全**
+  （ZL2 VERIFY_AND_REPAIR / FCL checkGameCompletion 同款）→ 自动续启动
+- Java 运行时管理分区：Java 8/17/21/25 状态一览 + 手动预下载
+  （ZL2 JavaManage / FCL JavaManageDialog 同款）
+- 微软设备码自动复制（ZL2 同款）；authlib-injector 外置登录保留
+- 日志上传 mclo.gs 生成分享链接（ZL2 LogsUpload / FCL logshare 同款）
+- BMCLAPI 镜像自适应下载（quartz-core mirror 层原有能力）
+
+**已删除（对标无此功能）**：设置页 Azure client_id 暴露卡（ZL2/FCL 内置凭据；
+本项目改为账户页首次使用微软登录时按需一次性配置）
+
+**后续差距（记录）**：CurseForge 双源、皮肤/衣柜、Terracotta 联机、控件编辑器、
+整合包导出、多游戏目录 —— 需后端新能力，按 roadmap 逐项补齐。
+
 ## 快速开始
 
 ```bash

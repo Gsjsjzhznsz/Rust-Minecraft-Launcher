@@ -578,6 +578,7 @@ input[type="range"]::-webkit-slider-thumb {
 .account-list { display: flex; flex-direction: column; gap: 10px; }
 .account-card {
   display: flex; align-items: center; gap: 14px;
+  flex-wrap: wrap; /* 展开的实例设置区独占一行 */
   padding: 16px 18px;
   transition:
     border-color var(--motion-fast) var(--ease-out),
@@ -1024,4 +1025,23 @@ input[type="range"]::-webkit-slider-thumb {
     animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
   }
+}
+
+/* ============ 内容生态 / 实例扩展（对标 ZL2/FCL 功能层） ============ */
+/* 禁用态内容项（.disabled 后缀文件，FCL/ZL2 同款语义） */
+.disabled-item {
+  color: var(--text-faint);
+  text-decoration: line-through;
+  text-decoration-color: var(--border);
+}
+/* Modrinth 搜索行内 MC 版本输入 */
+.gv-input {
+  max-width: 180px;
+}
+/* 实例展开设置区（内存滑条 + 渲染层按实例覆盖）：独占卡片一整行 */
+.instance-settings {
+  flex: 0 0 100%;
+  margin-top: 4px;
+  padding-top: 12px;
+  border-top: var(--border-w) solid var(--border);
 }

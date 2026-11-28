@@ -12,12 +12,13 @@
     stopGame,
     versionsState,
     envState,
+    showPage,
     isSelectedInstalled,
     refreshAssetsStatus,
   } from "../store.svelte";
-  import { KIND_LABELS, KIND_ORDER } from "../types";
 
-  /* 选中版本下拉（含恢复上次选择） */
+  /* 主页 = ZL2/FCL 同款操作逻辑：展示「当前选中版本」+ 一键启动。
+     版本选择只列已安装版本（未安装的可在下载页获取）；切版/下载去下载页。 */
   const selected = $derived(versionsState.selected);
   const installedBadge = $derived(
     !selected
@@ -45,37 +46,23 @@
     <p class="page-sub">选择版本，一键启动或下载</p>
   </div>
 
-  <!-- Hero：版本 + 启动 -->
+  <!-- Hero：当前版本卡 + 启动（ZL2 操作菜单 / FCL 右栏版本卡同款逻辑） -->
   <div class="card panel panel-accent hero-card rise" style="--i:1">
     <div class="hero-main">
       <div class="hero-select">
-        <label class="field-label" for="version-select">游戏版本</label>
-        {#if versionsState.list}
+        <label class="field-label" for="version-select">当前版本</label>
+        {#if versionsState.installed.length > 0}
           <select id="version-select" value={selected} onchange={onVersionChange}>
-            {#each KIND_ORDER as kind (kind)}
-              {#if versionsState.list!.filter((v) => v.type === kind).length > 0}
-                <optgroup label={KIND_LABELS[kind]}>
-                  {#each versionsState.list!.filter((v) => v.type === kind) as v (v.id)}
-                    <option value={v.id}>{v.id}</option>
-                  {/each}
-                </optgroup>
-              {/if}
-            {/each}
             {#each versionsState.installed as iv (iv)}
-              {#if !versionsState.list?.some((v) => v.id === iv)}
-                <option value={iv}>{iv}（已安装）</option>
-              {/if}
+              <option value={iv}>{iv}</option>
             {/each}
+            {#if selected && !versionsState.installed.includes(selected)}
+              <option value={selected}>{selected}（未安装）</option>
+            {/if}
           </select>
         {:else}
           <select disabled>
-            {#if versionsState.installed.length > 0}
-              {#each versionsState.installed as iv (iv)}
-                <option value={iv}>{iv}（已安装）</option>
-              {/each}
-            {:else}
-              <option value="">版本清单未获取，请前往「下载游戏」页</option>
-            {/if}
+            <option value="">还没有已安装版本</option>
           </select>
         {/if}
       </div>
@@ -87,8 +74,13 @@
     <div class="hero-meta">
       <span class="badge badge-{installedBadge.cls}">{installedBadge.text}</span>
       <span class="badge badge-{envState.runtimeBadge.cls}">{envState.runtimeBadge.text}</span>
-      <span class="hero-hint">M0 启动链路已接入：启动前自动准备 Java 运行时与游戏文件</span>
+      <button class="btn btn-sm btn-ghost" style="margin-left:auto" onclick={() => showPage("download")}>
+        获取更多版本 / 内容
+      </button>
     </div>
+    <p class="hint" style="margin-top:8px">
+      启动前自动链：Java 运行时按需下载 → 资源文件缺失自动补全 → 一键进世界
+    </p>
   </div>
 
   <!-- 游戏下载进度（home/dl 共享状态） -->

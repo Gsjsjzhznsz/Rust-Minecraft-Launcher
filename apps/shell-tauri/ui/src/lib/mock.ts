@@ -83,6 +83,82 @@ let renderers: DemoRenderer[] = [
 let authlibInstalled = false;
 let gameRunning = false;
 
+/* ============ Modrinth 演示数据集 ============ */
+
+interface DemoHit {
+  project_id: string;
+  slug: string;
+  title: string;
+  description: string;
+  categories: string[];
+  display_categories: string[];
+  icon_url: string | null;
+  downloads: number;
+  author: string;
+  date_modified: string;
+}
+
+const modrinthCatalog: Record<string, DemoHit[]> = {
+  mod: [
+    { project_id: "AABBCCDD", slug: "sodium", title: "Sodium", description: "现代化渲染优化，大幅提升帧率", categories: ["optimization", "performance"], display_categories: ["optimization"], icon_url: null, downloads: 4_800_000, author: "jaskarth", date_modified: "2025-11-20" },
+    { project_id: "DDEEFF00", slug: "lithium", title: "Lithium", description: "游戏逻辑与通用优化", categories: ["optimization"], display_categories: ["optimization"], icon_url: null, downloads: 2_100_000, author: "jellysquid3", date_modified: "2025-10-12" },
+    { project_id: "11223344", slug: "jei", title: "JEI", description: "物品管理器：合成表 / 用途查询", categories: ["utility"], display_categories: ["utility"], icon_url: null, downloads: 3_200_000, author: "mezz", date_modified: "2025-11-01" },
+    { project_id: "55667788", slug: "fabric-api", title: "Fabric API", description: "Fabric 模组前置库（多数模组依赖）", categories: ["library"], display_categories: ["library"], icon_url: null, downloads: 9_900_000, author: "FabricMC", date_modified: "2025-11-25" },
+  ],
+  resourcepack: [
+    { project_id: "RP000001", slug: "faithful-32x", title: "Faithful 32x", description: "经典高清材质包", categories: ["vanilla-like"], display_categories: ["vanilla-like"], icon_url: null, downloads: 1_400_000, author: "FaithfulTeam", date_modified: "2025-09-30" },
+  ],
+  shaderpack: [
+    { project_id: "SP000001", slug: "complementary", title: "Complementary Shaders", description: "高质量光照与天空（需 Zink/ANGLE）", categories: ["semi-realistic"], display_categories: ["semi-realistic"], icon_url: null, downloads: 3_800_000, author: "EminGT", date_modified: "2025-11-15" },
+  ],
+  modpack: [
+    { project_id: "MP000001", slug: "prominence", title: "Prominence II RPG", description: "RPG 探索整合包（Fabric）", categories: ["adventure", "rpg"], display_categories: ["adventure"], icon_url: null, downloads: 890_000, author: "prominence", date_modified: "2025-11-18" },
+    { project_id: "MP000002", slug: "simply-optimized", title: "Simply Optimized", description: "纯优化向轻量整合（性能拉满零冗余）", categories: ["optimization"], display_categories: ["optimization"], icon_url: null, downloads: 1_100_000, author: "RaptorClaws", date_modified: "2025-10-28" },
+  ],
+};
+
+function modrinthVersionsFor(projectId: string): Record<string, unknown>[] {
+  const hit = Object.values(modrinthCatalog).flat().find((h) => h.project_id === projectId);
+  const num = hit?.downloads ?? 0;
+  return [
+    {
+      id: `${projectId}-v2`,
+      name: hit?.title ?? projectId,
+      version_number: "2.1.0",
+      changelog: "性能优化与兼容性修复",
+      game_versions: ["1.20.4", "1.20.1"],
+      loaders: ["fabric"],
+      date_published: "2025-11-20",
+      featured: true,
+      downloads: num,
+      files: [{ url: "", filename: `${hit?.slug ?? "mod"}-2.1.0.jar`, primary: true, size: 1_024_000, hashes: {} }],
+      dependencies: [{ version_id: "55667788-v2", project_id: "55667788", file_name: null, dependency_type: projectId === "AABBCCDD" ? "required" : "optional" }],
+    },
+    {
+      id: `${projectId}-v1`,
+      name: hit?.title ?? projectId,
+      version_number: "2.0.2",
+      changelog: "稳定版",
+      game_versions: ["1.20.4"],
+      loaders: ["fabric"],
+      date_published: "2025-10-01",
+      featured: false,
+      downloads: Math.floor(num / 3),
+      files: [{ url: "", filename: `${hit?.slug ?? "mod"}-2.0.2.jar`, primary: true, size: 986_000, hashes: {} }],
+      dependencies: [],
+    },
+  ];
+}
+
+/* 演示内容库（安装/导入后追加，联动内容管理页） */
+const demoContent: Record<string, { name: string; kind: string; sizeBytes: number; isDir: boolean; modifiedAt: number; disabled: boolean }[]> = {
+  mods: [{ name: "sodium-0.6.0.jar", kind: "mods", sizeBytes: 1_024_000, isDir: false, modifiedAt: Math.floor(now / 1000) - 86400, disabled: false }],
+  resourcepacks: [{ name: "faithful-32x.zip", kind: "resourcepacks", sizeBytes: 21_000_000, isDir: false, modifiedAt: Math.floor(now / 1000) - 172800, disabled: false }],
+  shaderpacks: [{ name: "complementary-v5.zip", kind: "shaderpacks", sizeBytes: 4_600_000, isDir: false, modifiedAt: Math.floor(now / 1000) - 7200, disabled: false }],
+  saves: [{ name: "新世界", kind: "saves", sizeBytes: 88_000_000, isDir: true, modifiedAt: Math.floor(now / 1000) - 3600, disabled: false }],
+  screenshots: [{ name: "2025-11-24_12.00.png", kind: "screenshots", sizeBytes: 2_400_000, isDir: false, modifiedAt: Math.floor(now / 1000) - 600, disabled: false }],
+};
+
 /* ============ 事件总线（模拟 Rust 侧 emit） ============ */
 
 const callbacks = new Map<number, (ev: { event: string; id: number; payload: unknown }) => void>();
@@ -303,20 +379,146 @@ const commands: Record<string, Cmd> = {
     { version: "0.16.0-beta.1", stable: false },
   ],
 
+  /* --- 实例扩展操作（对标 ZL2/FCL） --- */
+  rename_instance_cmd: (a) => {
+    const inst = instances.find((x) => x.id === a?.id);
+    if (inst) inst.name = String(a?.name ?? inst.name);
+    return null;
+  },
+  duplicate_instance_cmd: (a) => {
+    const src = instances.find((x) => x.id === a?.id);
+    if (!src) throw new Error("mock: 实例不存在");
+    const newId = `${src.id}-copy-${Math.floor(Math.random() * 1e6)}`;
+    instances.push({ ...src, id: newId, name: `${src.name} 副本`, selected: false, createdAt: new Date().toISOString().slice(0, 10) });
+    return newId;
+  },
+  set_instance_memory: (a) => {
+    const inst = instances.find((x) => x.id === a?.id);
+    if (inst) inst.memoryMb = Number(a?.memoryMb ?? inst.memoryMb);
+    return null;
+  },
+  set_instance_renderer: (a) => {
+    const inst = instances.find((x) => x.id === a?.id);
+    if (inst) inst.renderer = (a?.renderer as string | null) ?? "zink";
+    return null;
+  },
+
+  /* --- Modrinth 内容生态 --- */
+  modrinth_search: (a) => {
+    const kind = String(a?.projectType ?? "mod");
+    const query = String(a?.query ?? "").toLowerCase();
+    let hits = modrinthCatalog[kind] ?? [];
+    if (query) hits = hits.filter((h) => h.title.toLowerCase().includes(query) || h.description.toLowerCase().includes(query));
+    const loaders = (a?.loaders as string[] | undefined) ?? [];
+    if (kind === "mod" && loaders.length && !loaders.includes("fabric")) hits = [];
+    return { hits, total_hits: hits.length };
+  },
+  modrinth_versions: (a) => modrinthVersionsFor(String(a?.projectId ?? "")),
+  modrinth_install: (a) => {
+    const versionId = String(a?.versionId ?? "");
+    const kind = String(a?.kind ?? "mod");
+    const projectId = versionId.replace(/-v[12]$/, "");
+    const hit = Object.values(modrinthCatalog).flat().find((h) => h.project_id === projectId);
+    const dirKind = kind === "modpack" ? null : kind === "resourcepack" ? "resourcepacks" : kind === "shaderpack" ? "shaderpacks" : "mods";
+    if (kind === "modpack") {
+      void (async () => {
+        await simProgress(
+          "modrinth://progress",
+          [
+            { stage: "resolve", weight: 10, file: versionId },
+            { stage: "modpack-download", weight: 40, file: `${hit?.slug ?? "modpack"}.mrpack` },
+          ],
+          2800,
+        );
+        await simProgress(
+          "mrpack://progress",
+          [
+            { stage: "libraries", weight: 40, file: `${hit?.title ?? "整合包"} 基版本+加载器` },
+            { stage: "modpack", weight: 60, file: "overrides 文件（共 214 个）" },
+          ],
+          4200,
+        );
+        const id = `mrpack-${Math.floor(Math.random() * 1e6)}`;
+        instances.push({ id, name: hit?.title ?? "演示整合包", mcVersion: "1.20.4", loaderDesc: "Fabric 0.15.11", javaMajor: 17, memoryMb, renderer: "zink", createdAt: new Date().toISOString().slice(0, 10), selected: false });
+      })();
+    } else {
+      const depCount = projectId === "AABBCCDD" ? 1 : 0;
+      const stages: SimStage[] = [
+        { stage: "resolve", weight: 15, file: hit?.title ?? versionId },
+      ];
+      if (depCount) stages.push({ stage: "download", weight: 25, file: "fabric-api-0.100.0.jar（依赖）" });
+      stages.push({ stage: "download", weight: 60, file: `${hit?.slug ?? "mod"}-2.1.0.jar` });
+      void simProgress("modrinth://progress", stages, 2600, () => {
+        if (dirKind) {
+          const list = demoContent[dirKind];
+          list?.unshift({ name: `${hit?.slug ?? "mod"}-2.1.0.jar`, kind: dirKind, sizeBytes: 1_024_000, isDir: false, modifiedAt: Math.floor(Date.now() / 1000), disabled: false });
+        }
+      });
+    }
+    return null;
+  },
+
+  /* --- 整合包导入 --- */
+  import_modpack_bytes: () => {
+    void simProgress(
+      "mrpack://progress",
+      [
+        { stage: "libraries", weight: 40, file: "演示整合包 基版本+加载器" },
+        { stage: "modpack", weight: 60, file: "overrides 文件（共 214 个）" },
+      ],
+      4200,
+      () => {
+        const id = `mrpack-${Math.floor(Math.random() * 1e6)}`;
+        instances.push({ id, name: "导入的演示整合包", mcVersion: "1.20.1", loaderDesc: "Fabric 0.15.11", javaMajor: 17, memoryMb, renderer: "zink", createdAt: new Date().toISOString().slice(0, 10), selected: false });
+      },
+    );
+    return null;
+  },
+  import_mrpack: () => {
+    void simProgress(
+      "mrpack://progress",
+      [
+        { stage: "libraries", weight: 40, file: "导入整合包 基版本+加载器" },
+        { stage: "modpack", weight: 60, file: "overrides 文件" },
+      ],
+      3600,
+      () => {
+        const id = `mrpack-${Math.floor(Math.random() * 1e6)}`;
+        instances.push({ id, name: "外部导入整合包", mcVersion: "1.20.1", loaderDesc: "Fabric 0.15.11", javaMajor: 17, memoryMb, renderer: "zink", createdAt: new Date().toISOString().slice(0, 10), selected: false });
+      },
+    );
+    return null;
+  },
+  take_pending_import: () => null,
+  consume_pending_import: () => true,
+
   /* --- 内容 --- */
   list_content_cmd: (a) => {
     const kind = String(a?.kind ?? "mods");
-    const name =
-      {
-        mods: "sodium.jar",
-        resourcepacks: "faithful32.zip",
-        shaderpacks: "complementary.zip",
-        saves: "新世界",
-        screenshots: "2025-11-24_12.00.png",
-      }[kind] ?? "item.jar";
-    return [{ name, kind, sizeBytes: 3_141_592, isDir: false, modifiedAt: Math.floor(now / 1000) - 86400 }];
+    const list = demoContent[kind];
+    return list ? list.map((x) => ({ ...x })) : [];
   },
-  delete_content_cmd: () => null,
+  delete_content_cmd: (a) => {
+    const kind = String(a?.kind ?? "mods");
+    const name = String(a?.name ?? "");
+    const list = demoContent[kind];
+    if (list) {
+      const idx = list.findIndex((x) => x.name === name);
+      if (idx >= 0) list.splice(idx, 1);
+    }
+    return true;
+  },
+  toggle_content_cmd: (a) => {
+    const kind = String(a?.kind ?? "mods");
+    const name = String(a?.name ?? "");
+    const list = demoContent[kind];
+    if (!list) throw new Error("mock: 内容不存在");
+    const item = list.find((x) => x.name === name);
+    if (!item) throw new Error("mock: 内容不存在");
+    item.disabled = !item.disabled;
+    item.name = item.disabled ? name.replace(/\.disabled$/, "") + ".disabled" : name.replace(/\.disabled$/, "");
+    return item.name;
+  },
 
   /* --- 启动 --- */
   launch_preflight: () => ({
@@ -346,7 +548,11 @@ const commands: Record<string, Cmd> = {
   },
 
   /* --- 运行时 / 渲染层 / LWJGL --- */
-  get_runtime_status: () => ({ installed: true, version: "17", path: "/jres/17", specAvailable: true }),
+  get_runtime_status: (a) => {
+    const major = Number(a?.javaMajor ?? 17);
+    const installed = major === 8 || major === 17;
+    return { installed, version: installed ? String(major) : null, path: `/jres/${major}`, specAvailable: major !== 25 };
+  },
   download_runtime: (a) => {
     const major = Number(a?.javaMajor ?? 17);
     void simProgress(

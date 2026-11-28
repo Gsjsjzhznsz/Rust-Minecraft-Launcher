@@ -194,6 +194,47 @@ impl InstanceStore {
     pub fn get(&self, id: &str) -> Result<Option<Instance>> {
         Ok(self.load()?.into_iter().find(|i| i.id == id))
     }
+
+    /// 复制实例（FCL「复制实例」/ ZL2「复制版本」同款）：克隆登记并递归复制实例目录。
+    /// 返回新实例。id 冲突 / 原实例不存在报错。
+    pub fn duplicate(&self, id: &str, new_id: &str, new_name: &str) -> Result<Instance> {
+        let src = self
+            .get(id)?
+            .ok_or_else(|| crate::error::Error::Other(format!("实例不存在：{id}")))?;
+        let inst = self.create(CreateInstance {
+            id: new_id.to_string(),
+            name: new_name.to_string(),
+            mc_version: src.mc_version.clone(),
+            loader: src.loader.clone(),
+            java_major: src.java_major,
+            memory_mb: src.memory_mb,
+        })?;
+        self.update(new_id, |i| {
+            i.renderer = src.renderer.clone();
+        })?;
+        let src_dir = self.instance_dir(id);
+        let dst_dir = self.instance_dir(new_id);
+        if src_dir.exists() {
+            copy_dir_recursive(&src_dir, &dst_dir)?;
+        }
+        Ok(inst)
+    }
+}
+
+/// 目录递归复制（复制实例用；符号链接按普通文件拷贝，避免逃逸）。
+fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for e in std::fs::read_dir(src)? {
+        let e = e?;
+        let from = e.path();
+        let to = dst.join(e.file_name());
+        if from.is_dir() {
+            copy_dir_recursive(&from, &to)?;
+        } else {
+            std::fs::copy(&from, &to)?;
+        }
+    }
+    Ok(())
 }
 
 /// 返回 ISO8601/UTC 风格时间戳（秒精度）。
