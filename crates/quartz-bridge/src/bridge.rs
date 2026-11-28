@@ -369,24 +369,28 @@ pub mod egl {
     pub const EGL_DEFAULT_DISPLAY: *mut c_void = ptr::null_mut();
     pub const EGL_OPENGL_ES_API: u32 = 0x30A0;
     pub const EGL_OPENGL_API: u32 = 0x30A2;
-    pub const EGL_SURFACE_TYPE: i32 = 0x1233;
+    // v0.2.25 颜色畸变终局修复：以下 8 个常量此前全部写错（0x12xx/0x3038，
+    // 疑似 GLX 系数值混入）。真实值以 Khronos EGL/egl.h 为准 —— ZL2 的
+    // egl_bridge.c/gl_bridge.c 就是用这组真值编译的。错值后果（game-1795863899976
+    // 实机实锤）：Mesa libEGL 严格校验属性 id，阶梯 #0-#6（含 ZL2 原版属性集）
+    // 全部 EGL_BAD_ATTRIBUTE(0x3004) 拒绝 → 落「垃圾属性」兜底拿到任意 config
+    // → kopper 按错配 config 选交换链格式 → MC 渲染颜色畸变。
+    pub const EGL_SURFACE_TYPE: i32 = 0x3033;
     pub const EGL_WINDOW_BIT: i32 = 0x0004;
     pub const EGL_PBUFFER_BIT: i32 = 0x0001;
-    pub const EGL_BLUE_SIZE: i32 = 0x1222;
-    pub const EGL_GREEN_SIZE: i32 = 0x1223;
-    pub const EGL_RED_SIZE: i32 = 0x1224;
-    pub const EGL_ALPHA_SIZE: i32 = 0x1221;
-    pub const EGL_DEPTH_SIZE: i32 = 0x1225;
-    pub const EGL_RENDERABLE_TYPE: i32 = 0x1240;
+    pub const EGL_BLUE_SIZE: i32 = 0x3022;
+    pub const EGL_GREEN_SIZE: i32 = 0x3023;
+    pub const EGL_RED_SIZE: i32 = 0x3024;
+    pub const EGL_ALPHA_SIZE: i32 = 0x3021;
+    pub const EGL_DEPTH_SIZE: i32 = 0x3025;
+    pub const EGL_RENDERABLE_TYPE: i32 = 0x3040;
     pub const EGL_OPENGL_ES2_BIT: i32 = 0x0004;
     pub const EGL_OPENGL_ES3_BIT: i32 = 0x0040;
-    pub const EGL_NONE: i32 = 0x3038;
+    pub const EGL_NONE: i32 = 0x3053;
     pub const EGL_CONTEXT_CLIENT_VERSION: i32 = 0x3098;
-    // EGL_KHR_create_context（桌面 GL 上下文：Zink/Mesa 真桌面 GL 路径）
-    pub const EGL_CONTEXT_MAJOR_VERSION_KHR: i32 = 0x30FB;
-    pub const EGL_CONTEXT_MINOR_VERSION_KHR: i32 = 0x30FC;
-    pub const EGL_CONTEXT_OPENGL_PROFILE_MASK_KHR: i32 = 0x30FD;
-    pub const EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT: i32 = 0x0001;
+    // v0.2.25：EGL_KHR_create_context 的 MAJOR/MINOR/PROFILE_MASK 常量随自造
+    // core 阶梯一并删除 —— ZL2 gl_bridge.c 不使用它们（0x3098 在
+    // EGL_OPENGL_API 绑定下即 EGL_CONTEXT_MAJOR_VERSION_KHR 语义）。
     pub const EGL_NATIVE_VISUAL_ID: i32 = 0x302E;
     pub const EGL_BAD_SURFACE: i32 = 0x300D;
     pub const EGL_WIDTH: i32 = 0x3057;
@@ -897,114 +901,186 @@ pub extern "C" fn pojav_create_context(share: *mut c_void) -> *mut c_void {
         let mut format: i32 = 0;
         let mut matched_es_bit: i32 = 0;
         let mut matched_tier: i32 = -1;
-        for (tier, lad) in ladders.iter().enumerate() {
+        // v0.2.25 颜色畸变终局：ZL2 gl_bridge.c 1:1 判定 —— 蓝本以 19 字符前缀
+        // "opengles3_desktopgl"（KopperZinkRenderer.getRendererId =
+        // opengles3_desktopgl_zink_kopper，game_bridge 注入同款值）决定桌面 GL
+        // 语义。命中即走 ZL2 单次 config + 单调用上下文；其余渲染层维持
+        // Quartz 阶梯语义不变（v0.2.22 同款分界：ZL2 本尊渲染器 1:1，
+        // 非本尊渲染器保留 Quartz 稳健层）。
+        let renderer_env = std::env::var("POJAV_RENDERER").unwrap_or_default();
+        let zl2_desktopgl = renderer_env.starts_with("opengles3_desktopgl");
+        if zl2_desktopgl {
+            // ---- ZL2 gl_bridge.c gl_init_context config 段 1:1 ----
+            // 属性顺序与值逐项对齐 ZL2（gl_bridge.c:79-89）：BLUE8 GREEN8 RED8
+            // ALPHA8 DEPTH24 SURFACE_TYPE WINDOW|PBUFFER RENDERABLE_TYPE ES2。
+            // 单次调用取首个 config + NATIVE_VISUAL_ID（gl_bridge.c:92-109）。
+            // 失败即 ZL2 同款放弃（蓝本返回 NULL = 游戏拿不到上下文退出），
+            // 绝不落「兜底 config」——错配 config 正是 v0.2.24 及之前颜色畸变的
+            // 根源（game-1795863899976：错值常量让 Mesa 0x3004 拒掉全部正经
+            // 属性档，落进垃圾属性拿到任意 config，kopper 按错配 config 选
+            // 交换链格式 → 颜色畸变）。
+            let zl2_attrs: [i32; 16] = [
+                egl::EGL_BLUE_SIZE,
+                8,
+                egl::EGL_GREEN_SIZE,
+                8,
+                egl::EGL_RED_SIZE,
+                8,
+                egl::EGL_ALPHA_SIZE,
+                8,
+                egl::EGL_DEPTH_SIZE,
+                24,
+                egl::EGL_SURFACE_TYPE,
+                egl::EGL_WINDOW_BIT | egl::EGL_PBUFFER_BIT,
+                egl::EGL_RENDERABLE_TYPE,
+                egl::EGL_OPENGL_ES2_BIT,
+                egl::EGL_NONE,
+                0,
+            ];
             let mut num_configs: i32 = 0;
-            let rc = (api.choose_config.unwrap())(
+            if (api.choose_config.unwrap())(
                 display,
-                lad.attrs.as_ptr(),
+                zl2_attrs.as_ptr(),
                 ptr::null_mut(),
                 0,
                 &mut num_configs,
-            );
-            if rc == egl::EGL_TRUE && num_configs > 0 {
-                let mut got: i32 = 0;
-                (api.choose_config.unwrap())(display, lad.attrs.as_ptr(), &mut config, 1, &mut got);
-                (api.get_config_attrib.unwrap())(
-                    display,
-                    config,
-                    egl::EGL_NATIVE_VISUAL_ID,
-                    &mut format,
-                );
-                matched_es_bit = lad.es_bit;
-                matched_tier = tier as i32;
-                if tier > 0 {
-                    log(&format!(
-                        "eglChooseConfig：使用回退阶梯 #{tier}（configs={num_configs}）"
-                    ));
-                }
-                break;
+            ) != egl::EGL_TRUE
+            {
+                let err = (api.get_error.unwrap())();
+                log(&format!("GLBridge: eglChooseConfig_p() failed: {err:#06x}"));
+                return;
             }
-            log(&format!(
+            if num_configs == 0 {
+                log("GLBridge: eglChooseConfig_p() found no matching config");
+                return;
+            }
+            let mut got: i32 = 0;
+            (api.choose_config.unwrap())(display, zl2_attrs.as_ptr(), &mut config, 1, &mut got);
+            (api.get_config_attrib.unwrap())(
+                display,
+                config,
+                egl::EGL_NATIVE_VISUAL_ID,
+                &mut format,
+            );
+            matched_es_bit = A_ES2;
+            matched_tier = 0;
+        }
+        if !zl2_desktopgl {
+            for (tier, lad) in ladders.iter().enumerate() {
+                let mut num_configs: i32 = 0;
+                let rc = (api.choose_config.unwrap())(
+                    display,
+                    lad.attrs.as_ptr(),
+                    ptr::null_mut(),
+                    0,
+                    &mut num_configs,
+                );
+                if rc == egl::EGL_TRUE && num_configs > 0 {
+                    let mut got: i32 = 0;
+                    (api.choose_config.unwrap())(
+                        display,
+                        lad.attrs.as_ptr(),
+                        &mut config,
+                        1,
+                        &mut got,
+                    );
+                    (api.get_config_attrib.unwrap())(
+                        display,
+                        config,
+                        egl::EGL_NATIVE_VISUAL_ID,
+                        &mut format,
+                    );
+                    matched_es_bit = lad.es_bit;
+                    matched_tier = tier as i32;
+                    if tier > 0 {
+                        log(&format!(
+                            "eglChooseConfig：使用回退阶梯 #{tier}（configs={num_configs}）"
+                        ));
+                    }
+                    break;
+                }
+                log(&format!(
                 "eglChooseConfig 阶梯 #{tier} 未命中：rc={rc} configs={num_configs} err={:#06x}",
                 (api.get_error.unwrap())()
             ));
-        }
-        if config.is_null() {
-            // v0.1.9-c 兜底：全阶梯未命中时 eglGetConfigs 取第一个 config。
-            // v9 增强：先扫描全部 config，选第一个「可渲染 ES2/ES3 且支持窗口
-            // 表面」的 —— 首个 config 常是 renderable=0 的无语义项
-            //（实机日志：MobileGlues 兜底拿到 renderable=0x0000，后续渲染
-            // 线程空指针 SIGSEGV），盲目取第一个就是踩雷。
-            log("eglChooseConfig 全阶梯未命中，eglGetConfigs 兜底");
-            let mut num_configs: i32 = 0;
-            if (api.get_configs.unwrap())(display, ptr::null_mut(), 0, &mut num_configs)
-                == egl::EGL_TRUE
-                && num_configs > 0
-            {
-                let n = num_configs.min(64) as usize;
-                let mut buf: Vec<egl::EGLConfig> = vec![ptr::null_mut(); n];
-                let mut got: i32 = 0;
-                (api.get_configs.unwrap())(display, buf.as_mut_ptr(), n as i32, &mut got);
-                let mut picked: Option<(egl::EGLConfig, i32)> = None;
-                let mut scanned: Vec<String> = Vec::new();
-                for cfg in buf.iter().take(got.max(0) as usize) {
-                    if cfg.is_null() {
-                        continue;
-                    }
-                    let mut renderable: i32 = 0;
-                    let mut surface_bits: i32 = 0;
-                    (api.get_config_attrib.unwrap())(
-                        display,
-                        *cfg,
-                        egl::EGL_RENDERABLE_TYPE,
-                        &mut renderable,
-                    );
-                    (api.get_config_attrib.unwrap())(
-                        display,
-                        *cfg,
-                        egl::EGL_SURFACE_TYPE,
-                        &mut surface_bits,
-                    );
-                    scanned.push(format!("{:#x}/{:#x}", renderable, surface_bits));
-                    if renderable & (egl::EGL_OPENGL_ES3_BIT | egl::EGL_OPENGL_ES2_BIT) != 0
-                        && surface_bits & egl::EGL_WINDOW_BIT != 0
-                        && picked.is_none()
-                    {
-                        picked = Some((*cfg, renderable));
-                    }
-                }
-                match picked {
-                    Some((cfg, renderable)) => {
-                        config = cfg;
-                        matched_es_bit = renderable;
-                        log(&format!(
-                            "eglGetConfigs 兜底选中可渲染 config（共 {} 个：{}）",
-                            scanned.len(),
-                            scanned.join(",")
-                        ));
-                    }
-                    None => {
-                        config = buf[0];
+            }
+            if config.is_null() {
+                // v0.1.9-c 兜底：全阶梯未命中时 eglGetConfigs 取第一个 config。
+                // v9 增强：先扫描全部 config，选第一个「可渲染 ES2/ES3 且支持窗口
+                // 表面」的 —— 首个 config 常是 renderable=0 的无语义项
+                //（实机日志：MobileGlues 兜底拿到 renderable=0x0000，后续渲染
+                // 线程空指针 SIGSEGV），盲目取第一个就是踩雷。
+                log("eglChooseConfig 全阶梯未命中，eglGetConfigs 兜底");
+                let mut num_configs: i32 = 0;
+                if (api.get_configs.unwrap())(display, ptr::null_mut(), 0, &mut num_configs)
+                    == egl::EGL_TRUE
+                    && num_configs > 0
+                {
+                    let n = num_configs.min(64) as usize;
+                    let mut buf: Vec<egl::EGLConfig> = vec![ptr::null_mut(); n];
+                    let mut got: i32 = 0;
+                    (api.get_configs.unwrap())(display, buf.as_mut_ptr(), n as i32, &mut got);
+                    let mut picked: Option<(egl::EGLConfig, i32)> = None;
+                    let mut scanned: Vec<String> = Vec::new();
+                    for cfg in buf.iter().take(got.max(0) as usize) {
+                        if cfg.is_null() {
+                            continue;
+                        }
+                        let mut renderable: i32 = 0;
+                        let mut surface_bits: i32 = 0;
                         (api.get_config_attrib.unwrap())(
                             display,
-                            config,
+                            *cfg,
                             egl::EGL_RENDERABLE_TYPE,
-                            &mut matched_es_bit,
+                            &mut renderable,
                         );
-                        log(&format!(
-                            "eglGetConfigs 兜底无可渲染 config，取第一个（共 {} 个：{}）",
-                            scanned.len(),
-                            scanned.join(",")
-                        ));
+                        (api.get_config_attrib.unwrap())(
+                            display,
+                            *cfg,
+                            egl::EGL_SURFACE_TYPE,
+                            &mut surface_bits,
+                        );
+                        scanned.push(format!("{:#x}/{:#x}", renderable, surface_bits));
+                        if renderable & (egl::EGL_OPENGL_ES3_BIT | egl::EGL_OPENGL_ES2_BIT) != 0
+                            && surface_bits & egl::EGL_WINDOW_BIT != 0
+                            && picked.is_none()
+                        {
+                            picked = Some((*cfg, renderable));
+                        }
                     }
+                    match picked {
+                        Some((cfg, renderable)) => {
+                            config = cfg;
+                            matched_es_bit = renderable;
+                            log(&format!(
+                                "eglGetConfigs 兜底选中可渲染 config（共 {} 个：{}）",
+                                scanned.len(),
+                                scanned.join(",")
+                            ));
+                        }
+                        None => {
+                            config = buf[0];
+                            (api.get_config_attrib.unwrap())(
+                                display,
+                                config,
+                                egl::EGL_RENDERABLE_TYPE,
+                                &mut matched_es_bit,
+                            );
+                            log(&format!(
+                                "eglGetConfigs 兜底无可渲染 config，取第一个（共 {} 个：{}）",
+                                scanned.len(),
+                                scanned.join(",")
+                            ));
+                        }
+                    }
+                    (api.get_config_attrib.unwrap())(
+                        display,
+                        config,
+                        egl::EGL_NATIVE_VISUAL_ID,
+                        &mut format,
+                    );
+                    matched_tier = -2;
                 }
-                (api.get_config_attrib.unwrap())(
-                    display,
-                    config,
-                    egl::EGL_NATIVE_VISUAL_ID,
-                    &mut format,
-                );
-                matched_tier = -2;
             }
         }
         if config.is_null() {
@@ -1015,15 +1091,17 @@ pub extern "C" fn pojav_create_context(share: *mut c_void) -> *mut c_void {
             return;
         }
 
-        let renderer_env = std::env::var("POJAV_RENDERER").unwrap_or_default();
-        let desktop_gl = renderer_env.contains("desktopgl");
-        let bind = if desktop_gl {
+        // v0.2.25：绑定语义 = ZL2 gl_bridge.c:114-123 1:1 —— 前缀
+        // "opengles3_desktopgl"（19 字符）绑定 EGL_OPENGL_API，否则 ES。
+        let bind = if zl2_desktopgl {
+            log("EGLBridge: Binding to OpenGL");
             (api.bind_api.unwrap())(egl::EGL_OPENGL_API)
         } else {
+            log("EGLBridge: Binding to OpenGL ES");
             (api.bind_api.unwrap())(egl::EGL_OPENGL_ES_API)
         };
         if bind != egl::EGL_TRUE {
-            log("eglBindAPI 失败");
+            log("EGLBridge: bind failed");
         }
 
         // 共享上下文（share 句柄查表；两分支共用）
@@ -1036,46 +1114,56 @@ pub extern "C" fn pojav_create_context(share: *mut c_void) -> *mut c_void {
                 None => egl::EGL_NO_CONTEXT,
             }
         };
-        // GLES 主版本：LIBGL_ES 显式指定优先；否则按匹配 config 的
-        // RENDERABLE_TYPE 位自适应（ES3 config 用 3，否则 2）—— MobileGlues
-        // 等仅暴露 ES3 config 的渲染层由此自动落对，不再硬编码 renderer 名。
-        // 桌面 GL（Zink/Kopper）：走 EGL_KHR_create_context 主/次版本阶梯，
-        // MC 1.17+ 需要核心 3.2+，从 4.6 逐级降档尝试。
-        // v9 兜底：桌面 GL 全阶梯未命中时不再直接放弃（返回空句柄会让 LWJGL
-        // 拿 NULL 函数指针，Render thread pc=0 SIGSEGV）—— 回退 GLES 上下文
-        //（zink 也支持 ES3.1），至少拿到可渲染路径并留下完整日志。
+        // GLES 主版本（非 ZL2 桌面层）：LIBGL_ES 显式指定优先；否则按匹配
+        // config 的 RENDERABLE_TYPE 位自适应（ES3 config 用 3，否则 2）——
+        // MobileGlues 等仅暴露 ES3 config 的渲染层由此自动落对。
+        // 桌面 GL（zink）：v0.2.25 改为 ZL2 gl_bridge.c:125-129 完全 1:1 ——
+        // 上下文属性仅 {EGL_CONTEXT_CLIENT_VERSION, LIBGL_ES}（0x3098 在
+        // EGL_OPENGL_API 绑定下被 Mesa 读作主版本，未指定 profile = compat
+        // 缺省，配合 MESA_GL_VERSION_OVERRIDE=4.6 即 ZL2 实际产出的桌面 GL
+        // 4.6 compat）。删除自造的 4.6/3.3/3.2 core 阶梯 —— ZL2 蓝本无此物，
+        // 且实机 0x3009×3 全败（game-1795863899976）。
+        // v9 兜底语义保留：ZL2 蓝本创建失败即返回 NULL（LWJGL 拿 NULL 函数
+        // 指针 pc=0 SIGSEGV）；Quartz 在其后接 ES 安全网，仅以日志区分。
         let (context, es_label): (egl::EGLContext, String) = {
             let mut got = egl::EGL_NO_CONTEXT;
             let mut label = String::new();
-            if desktop_gl {
-                const PROFILES: [(i32, i32); 3] = [(4, 6), (3, 3), (3, 2)];
-                for (major, minor) in PROFILES {
-                    let attrs = [
-                        egl::EGL_CONTEXT_MAJOR_VERSION_KHR,
-                        major,
-                        egl::EGL_CONTEXT_MINOR_VERSION_KHR,
-                        minor,
-                        egl::EGL_CONTEXT_OPENGL_PROFILE_MASK_KHR,
-                        egl::EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT,
-                        egl::EGL_NONE,
-                        0,
-                    ];
-                    let ctx =
-                        (api.create_context.unwrap())(display, config, share_ctx, attrs.as_ptr());
-                    if ctx != egl::EGL_NO_CONTEXT {
-                        got = ctx;
-                        label = format!("GL{major}.{minor} core");
-                        break;
-                    }
+            if zl2_desktopgl {
+                // ZL2 gl_bridge.c:125-127：LIBGL_ES 按 strtol(base 0) 语义
+                // 解析，缺省 2，越界（<0 || >INT16_MAX）回 2。
+                let es_zl2 = std::env::var("LIBGL_ES")
+                    .ok()
+                    .and_then(|v| {
+                        let t = v.trim();
+                        if let Some(h) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+                            i64::from_str_radix(h, 16).ok()
+                        } else {
+                            t.parse::<i64>().ok()
+                        }
+                    })
+                    .map(|v| {
+                        if (0..=i16::MAX as i64).contains(&v) {
+                            v
+                        } else {
+                            2i64
+                        }
+                    })
+                    .unwrap_or(2) as i32;
+                let ctx_attrs = [egl::EGL_CONTEXT_CLIENT_VERSION, es_zl2, egl::EGL_NONE];
+                got = (api.create_context.unwrap())(display, config, share_ctx, ctx_attrs.as_ptr());
+                if got != egl::EGL_NO_CONTEXT {
+                    label = format!("GL(desktopgl) cv={es_zl2}（ZL2 gl_bridge 1:1）");
+                } else {
                     let err = (api.get_error.unwrap())();
                     log(&format!(
-                        "桌面 GL {major}.{minor} 上下文创建失败：{err:#06x}，降档重试"
+                        "bridge_eglCreateContext() finished with error: {err:#06x}（ZL2 同款到此为止；接 Quartz ES 安全网防 LWJGL NULL 上下文 SIGSEGV）"
                     ));
                 }
             }
             if got == egl::EGL_NO_CONTEXT {
-                if desktop_gl {
-                    log("桌面 GL 全阶梯未命中（设备 Vulkan 驱动或 Mesa pack 异常），回退 GLES 上下文");
+                if zl2_desktopgl {
+                    // 安全网需要把当前 client API 从 GL 切回 ES（ZL2 蓝本无此步）
+                    (api.bind_api.unwrap())(egl::EGL_OPENGL_ES_API);
                 }
                 let es = std::env::var("LIBGL_ES")
                     .ok()
@@ -2465,4 +2553,76 @@ pub extern "C" fn quartz_bridge_is_grabbed() -> c_int {
 #[no_mangle]
 pub extern "C" fn quartz_bridge_api_version() -> c_int {
     1
+}
+
+// ---------------------------------------------------------------------------
+// v0.2.25：EGL 常量 spec 契约 —— 历史错值（0x12xx/0x3038）让 Mesa 严格实现
+// 把全部正经 config 属性档 EGL_BAD_ATTRIBUTE 拒掉，zink 落错配 config 颜色
+// 畸变（game-1795863899976 实机实锤）。此处把 Khronos EGL/egl.h 真值钉死，
+// 再写错一个字节先红。
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod egl_const_tests {
+    use super::egl;
+
+    /// ZL2 编译锚：egl_bridge.c/gl_bridge.c #include <EGL/egl.h>，其属性
+    /// 请求值即下表真值（Khronos EGL 1.5 头文件）。
+    #[test]
+    fn egl_constants_match_khronos_spec() {
+        // config 属性（eglChooseConfig / eglGetConfigAttrib）
+        assert_eq!(egl::EGL_SURFACE_TYPE, 0x3033);
+        assert_eq!(egl::EGL_BLUE_SIZE, 0x3022);
+        assert_eq!(egl::EGL_GREEN_SIZE, 0x3023);
+        assert_eq!(egl::EGL_RED_SIZE, 0x3024);
+        assert_eq!(egl::EGL_ALPHA_SIZE, 0x3021);
+        assert_eq!(egl::EGL_DEPTH_SIZE, 0x3025);
+        assert_eq!(egl::EGL_RENDERABLE_TYPE, 0x3040);
+        // 终止符（0x3038 是历史错值，非 EGL_NONE）
+        assert_eq!(egl::EGL_NONE, 0x3053);
+        // 位掩码
+        assert_eq!(egl::EGL_WINDOW_BIT, 0x0004);
+        assert_eq!(egl::EGL_PBUFFER_BIT, 0x0001);
+        assert_eq!(egl::EGL_OPENGL_ES2_BIT, 0x0004);
+        assert_eq!(egl::EGL_OPENGL_ES3_BIT, 0x0040);
+        // API 与上下文
+        assert_eq!(egl::EGL_OPENGL_ES_API, 0x30A0);
+        assert_eq!(egl::EGL_OPENGL_API, 0x30A2);
+        // 0x3098 = EGL_CONTEXT_CLIENT_VERSION = EGL_CONTEXT_MAJOR_VERSION_KHR
+        //（ZL2 gl_bridge.c:128 借同值语义在 EGL_OPENGL_API 下传主版本）
+        assert_eq!(egl::EGL_CONTEXT_CLIENT_VERSION, 0x3098);
+        assert_eq!(egl::EGL_NATIVE_VISUAL_ID, 0x302E);
+        assert_eq!(egl::EGL_BAD_SURFACE, 0x300D);
+        assert_eq!(egl::EGL_WIDTH, 0x3057);
+        assert_eq!(egl::EGL_HEIGHT, 0x3056);
+    }
+
+    /// 历史错值禁止回归：0x12xx 系与 0x3038 都不得出现在 quartz-bridge 代码
+    /// 中（egl_sim 的匹配键已同步真值）。剥注释后检查 —— 文档里可以讲历史，
+    /// 代码里不得再写。
+    #[test]
+    fn wrong_const_values_banned() {
+        fn strip_comments(src: &str) -> String {
+            let mut out = String::with_capacity(src.len());
+            for line in src.lines() {
+                match line.find("//") {
+                    Some(i) => out.push_str(&line[..i]),
+                    None => out.push_str(line),
+                }
+                out.push('\n');
+            }
+            out
+        }
+        let bridge = strip_comments(include_str!("bridge.rs"));
+        let sim = strip_comments(include_str!("egl_sim.rs"));
+        // 十进制字面量在运行时格式化为十六进制 —— 源码文本里不得出现禁值
+        // 字面量，否则本测试会被自己命中。
+        for v in [4672u32, 4659, 4642, 4643, 4644, 4641, 4645, 12344] {
+            let bad = format!("0x{v:04x}");
+            assert!(
+                !bridge.contains(&bad),
+                "bridge.rs 代码不得出现历史错值 {bad}"
+            );
+            assert!(!sim.contains(&bad), "egl_sim.rs 代码不得出现历史错值 {bad}");
+        }
+    }
 }

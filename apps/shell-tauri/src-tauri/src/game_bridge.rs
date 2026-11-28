@@ -1989,11 +1989,13 @@ unsafe fn run_game_from_spec(
     if sdl_egl.is_file() {
         std::env::set_var("SDL_EGL_LIBRARY", &sdl_egl);
     }
-    // Zink（Mesa GL4.6→Vulkan）走真桌面 GL 上下文（EGL_KHR_create_context）；
-    // 其余渲染层维持 GLES 语义。桥按 POJAV_RENDERER 是否含 "desktopgl" 分流。
+    // Zink（Mesa GL4.6→Vulkan）走真桌面 GL 上下文（ZL2 gl_bridge.c 1:1，
+    // v0.2.25：桥按 POJAV_RENDERER 19 字符前缀 "opengles3_desktopgl" 分流，
+    // 与 ZL2 gl_bridge.c:114 strncmp 逐字符同语义）；其余渲染层维持 GLES 语义。
     if active_renderer == "zink" {
-        // v0.2.12：POJAV_RENDERER 对齐 FCL 完整同款值。桥接层按
-        // contains("desktopgl") 分流（改值不影响）；尾部 _kopper 是
+        // v0.2.12：POJAV_RENDERER 对齐 FCL/ZL2 完整同款值（= ZL2
+        // KopperZinkRenderer.getRendererId）。桥接层按前缀分流（v0.2.25 起
+        // ZL2 gl_bridge 同款 19 字符前缀判断，改值不影响）；尾部 _kopper 是
         // Pojav 系 Mesa fork 的窗口层门控 —— kopper 用 Vulkan swapchain
         // 作窗口系统（绕过 DRM），设备发现走进程内 Vulkan loader。
         std::env::set_var("POJAV_RENDERER", "opengles3_desktopgl_zink_kopper");

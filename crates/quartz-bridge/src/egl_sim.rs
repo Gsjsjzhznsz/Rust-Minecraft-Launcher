@@ -188,17 +188,19 @@ unsafe extern "C" fn sim_get_config_attrib(
     attr: c_int,
     val: *mut i32,
 ) -> u32 {
-    // RENDERABLE_TYPE=ES3|OpenGL(0x2)|WINDOW|PBUFFER 等，宽泛给值满足桥的判断
     if val.is_null() {
         return 0;
     }
+    // v0.2.25：匹配键同步为 EGL spec 真值（bridge.rs egl 模块常量已修为
+    // 0x3040/0x3033；旧键 0x1240/0x1233 是历史错值，仅存在于此 sim 层）。
+    // 其余键为 host-sim 宽泛占位值，仅满足桥的分支判断。
     *val = match attr {
-        0x1240 => 0x2 | 0x0040,    // RENDERABLE_TYPE: OpenGL bit | ES3 bit
-        0x1233 => 0x0004 | 0x0001, // SURFACE_TYPE: WINDOW | PBUFFER
+        0x3040 => 0x2 | 0x0040,    // RENDERABLE_TYPE: OpenGL bit | ES3 bit
+        0x3033 => 0x0004 | 0x0001, // SURFACE_TYPE: WINDOW | PBUFFER
         0x302E => 0,               // NATIVE_VISUAL_ID
-        0x3025 => 1,               // BUFFER_SIZE
-        0x3028 => 1,               // DEPTH_SIZE
-        0x302B => 0,               // ALPHA_SIZE
+        0x3025 => 1,               // DEPTH_SIZE
+        0x3028 => 1,               // CONFIG_ID
+        0x302B => 0,               // LEVEL
         _ => 1,
     };
     EGL_TRUE

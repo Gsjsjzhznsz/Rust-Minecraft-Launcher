@@ -839,6 +839,144 @@ mod tests {
         );
     }
 
+    /// v0.2.25：zink EGL 上下文链必须与 ZL2 gl_bridge.c 完全 1:1。
+    ///
+    /// 颜色畸变根因（game-1795863899976 实机实锤）：quartz-bridge 的 EGL
+    /// 常量写错（0x12xx/0x3038），Mesa 严格实现把阶梯 #0-#6（含 ZL2 原版
+    /// 属性集）全部 EGL_BAD_ATTRIBUTE 拒掉 → 落「垃圾属性」拿到任意 config
+    /// → kopper 按错配 config 选交换链格式 → MC 颜色畸变。修复 = ①常量改
+    /// Khronos EGL/egl.h 真值；②zink 路径按 ZL2 gl_bridge.c 逐项对齐：
+    /// 19 字符前缀 "opengles3_desktopgl" 分流、单次 eglChooseConfig
+    /// （BLUE8 GREEN8 RED8 ALPHA8 DEPTH24 SURFACE_TYPE W|P RENDERABLE ES2）
+    /// 取首个 config、bind EGL_OPENGL_API、上下文仅
+    /// {EGL_CONTEXT_CLIENT_VERSION, LIBGL_ES}，删除自造 core 档阶梯。
+    /// 本测试从源码层钉死以上每一条。
+    #[test]
+    fn zl2_gl_bridge_1_1_contract() {
+        let bridge_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../crates/quartz-bridge/src/bridge.rs");
+        let raw = std::fs::read_to_string(&bridge_path)
+            .unwrap_or_else(|e| panic!("bridge.rs 缺失 {}：{e}", bridge_path.display()));
+        let sim_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../crates/quartz-bridge/src/egl_sim.rs");
+        let raw_sim = std::fs::read_to_string(&sim_path)
+            .unwrap_or_else(|e| panic!("egl_sim.rs 缺失 {}：{e}", sim_path.display()));
+
+        // ① EGL 常量 spec 真值（ZL2 经 <EGL/egl.h> 编译即为此值）
+        for (needle, why) in [
+            (
+                "pub const EGL_SURFACE_TYPE: i32 = 0x3033;",
+                "EGL_SURFACE_TYPE",
+            ),
+            ("pub const EGL_BLUE_SIZE: i32 = 0x3022;", "EGL_BLUE_SIZE"),
+            ("pub const EGL_GREEN_SIZE: i32 = 0x3023;", "EGL_GREEN_SIZE"),
+            ("pub const EGL_RED_SIZE: i32 = 0x3024;", "EGL_RED_SIZE"),
+            ("pub const EGL_ALPHA_SIZE: i32 = 0x3021;", "EGL_ALPHA_SIZE"),
+            ("pub const EGL_DEPTH_SIZE: i32 = 0x3025;", "EGL_DEPTH_SIZE"),
+            (
+                "pub const EGL_RENDERABLE_TYPE: i32 = 0x3040;",
+                "EGL_RENDERABLE_TYPE",
+            ),
+            ("pub const EGL_NONE: i32 = 0x3053;", "EGL_NONE"),
+        ] {
+            assert!(
+                raw.contains(needle),
+                "EGL 常量 {why} 必须是 Khronos spec 真值"
+            );
+        }
+
+        // ② ZL2 分流判定：19 字符前缀（gl_bridge.c:114 strncmp 同语义）
+        assert!(
+            raw.contains(r#"starts_with("opengles3_desktopgl")"#),
+            "必须按 ZL2 gl_bridge.c 同款 19 字符前缀 \"opengles3_desktopgl\" 分流桌面 GL"
+        );
+
+        // ③ ZL2 config 属性序列（gl_bridge.c:79-89，顺序与值逐项一致）
+        fn strip_comments(src: &str) -> String {
+            let mut out = String::with_capacity(src.len());
+            let mut in_block = false;
+            for line in src.lines() {
+                let mut out_line = String::new();
+                let mut rest = line;
+                while !rest.is_empty() {
+                    if in_block {
+                        match rest.find("*/") {
+                            Some(i) => {
+                                rest = &rest[i + 2..];
+                                in_block = false;
+                            }
+                            None => rest = "",
+                        }
+                    } else {
+                        let lc = rest.find("//");
+                        let bs = rest.find("/*");
+                        match (lc, bs) {
+                            (Some(a), Some(b)) if a < b => {
+                                out_line.push_str(&rest[..a]);
+                                rest = "";
+                            }
+                            (_, Some(b)) => {
+                                out_line.push_str(&rest[..b]);
+                                rest = &rest[b + 2..];
+                                in_block = true;
+                            }
+                            (Some(a), None) => {
+                                out_line.push_str(&rest[..a]);
+                                rest = "";
+                            }
+                            (None, None) => {
+                                out_line.push_str(rest);
+                                rest = "";
+                            }
+                        }
+                    }
+                }
+                out.push_str(&out_line);
+                out.push('\n');
+            }
+            out
+        }
+        let code = strip_comments(&raw);
+        let squashed: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+        let zl2_attrs_seq = "EGL_BLUE_SIZE,8,egl::EGL_GREEN_SIZE,8,egl::EGL_RED_SIZE,8,egl::EGL_ALPHA_SIZE,8,egl::EGL_DEPTH_SIZE,24,egl::EGL_SURFACE_TYPE,egl::EGL_WINDOW_BIT|egl::EGL_PBUFFER_BIT,egl::EGL_RENDERABLE_TYPE,egl::EGL_OPENGL_ES2_BIT,egl::EGL_NONE,0";
+        assert!(
+            squashed.contains(zl2_attrs_seq),
+            "pojavCreateContext 必须保留 ZL2 gl_bridge.c 原版 config 属性序列（顺序+值逐项一致）"
+        );
+
+        // ④ 自造 core 阶梯必须已删除（ZL2 蓝本无 profile mask / 版本降档）
+        assert!(
+            !code.contains("EGL_CONTEXT_OPENGL_PROFILE_MASK_KHR")
+                && !code.contains("EGL_CONTEXT_MAJOR_VERSION_KHR"),
+            "不得使用 EGL_KHR_create_context 的 profile/版本阶梯（ZL2 上下文属性仅 CLIENT_VERSION 一项）"
+        );
+
+        // ⑤ 历史错值禁止回归（剥注释后，代码不得出现 0x12xx/0x3038）
+        let code_sim = strip_comments(&raw_sim);
+        for bad in [
+            "0x1240", "0x1233", "0x1222", "0x1223", "0x1224", "0x1221", "0x1225", "0x3038",
+        ] {
+            assert!(
+                !code.contains(bad),
+                "bridge.rs 代码不得出现历史错值 {bad}（Mesa 会以 EGL_BAD_ATTRIBUTE 拒掉整条属性档）"
+            );
+            assert!(
+                !code_sim.contains(bad),
+                "egl_sim.rs 代码不得出现历史错值 {bad}"
+            );
+        }
+
+        // ⑥ sim 层查询键同步真值
+        assert!(
+            raw_sim.contains("0x3040 =>"),
+            "egl_sim 查询键必须同步 RENDERABLE_TYPE 真值 0x3040"
+        );
+        assert!(
+            raw_sim.contains("0x3033 =>"),
+            "egl_sim 查询键必须同步 SURFACE_TYPE 真值 0x3033"
+        );
+    }
+
     /// v0.2.24：游戏表面必须是 TextureView（ZalithLauncher2 2.8.2 完全 1:1）。
     ///
     /// zink 90° 反转根因：kopper swapchain 以 `preTransform = currentTransform`
